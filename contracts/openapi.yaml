@@ -2,12 +2,14 @@ openapi: 3.1.0
 info:
   title: Token Observability API
   version: 0.1.0
-  description: 'Phase 1 INFORM contract for the Token Observability dashboard and usage
+  description: 'Phase 1 INFORM contract for the Token Observability dashboard and
+    usage
 
     processor. Query responses contain token counts and metadata only. Prompt
 
-    and completion content are absent from usage queries. Authenticated image invocation accepts a transient
-    provider payload and returns an image without storing its content.
+    and completion content are absent from usage queries. Authenticated image invocation
+    accepts a transient provider payload and returns an image without storing its
+    content.
 
     '
 servers:
@@ -26,10 +28,11 @@ tags:
 - name: Budgets
   description: Monthly soft Token allocation, utilization, forecast, and audit history.
 - name: Application Access
-  description: APIM consumer inventory, attribution, Ledger-backed quotas, and Owner-managed lifecycle
-    metadata.
+  description: APIM consumer inventory, attribution, Ledger-backed quotas, and Owner-managed
+    lifecycle metadata.
 - name: GitHub Copilot
-  description: 'Organization Copilot subscription, usage metrics, AI-credit billing, explicit
+  description: 'Organization Copilot subscription, usage metrics, AI-credit billing,
+    explicit
 
     application-user identity mapping, and reviewed personal budget requests.
 
@@ -37,7 +40,8 @@ tags:
 - name: Anomaly Rules
   description: Authenticated rule visibility with Owner-managed configuration.
 - name: Assistant
-  description: 'Natural-language analysis over the same repository the dashboard reads, and the
+  description: 'Natural-language analysis over the same repository the dashboard reads,
+    and the
 
     pinned reports it produces. Charts are authored by tools, never by the model.
 
@@ -47,7 +51,8 @@ tags:
 - name: Model Gateway
   description: Authenticated, assigned and budget-governed internal model invocation.
 - name: Model Router
-  description: User-scoped model routing drafts, validation, version publication, and lifecycle.
+  description: User-scoped model routing drafts, validation, version publication,
+    and lifecycle.
 paths:
   /api/v1/assistant/ask:
     $ref: ./openapi/paths/assistant.yaml#/paths/~1api~1v1~1assistant~1ask
@@ -333,6 +338,42 @@ paths:
     $ref: ./openapi/paths/model-platform.yaml#/paths/~1api~1v1~1model-management~1publications~1{publication_id}~1archive
   /api/v1/model-management/self-hosted-gateways/{deployment_id}/node-enrollments:
     $ref: ./openapi/paths/model-platform.yaml#/paths/~1api~1v1~1model-management~1self-hosted-gateways~1{deployment_id}~1node-enrollments
+  /api/v1/model-routers:
+    $ref: ./openapi/paths/model-router.yaml#/paths/~1api~1v1~1model-routers
+  /api/v1/model-routers/catalog:
+    $ref: ./openapi/paths/model-router.yaml#/paths/~1api~1v1~1model-routers~1catalog
+  /api/v1/model-routers/decision-preview:
+    $ref: ./openapi/paths/model-router.yaml#/paths/~1api~1v1~1model-routers~1decision-preview
+  /api/v1/model-routers/decision-trial:
+    $ref: ./openapi/paths/model-router.yaml#/paths/~1api~1v1~1model-routers~1decision-trial
+  /api/v1/model-routers/assigned:
+    $ref: ./openapi/paths/model-router.yaml#/paths/~1api~1v1~1model-routers~1assigned
+  /api/v1/model-router-specs:
+    $ref: ./openapi/paths/model-router.yaml#/paths/~1api~1v1~1model-router-specs
+  /api/v1/model-router-specs/{router_id}:
+    $ref: ./openapi/paths/model-router.yaml#/paths/~1api~1v1~1model-router-specs~1{router_id}
+  /api/v1/model-router-specs/{router_id}/validate:
+    $ref: ./openapi/paths/model-router.yaml#/paths/~1api~1v1~1model-router-specs~1{router_id}~1validate
+  /api/v1/model-router-specs/{router_id}/publish:
+    $ref: ./openapi/paths/model-router.yaml#/paths/~1api~1v1~1model-router-specs~1{router_id}~1publish
+  /api/v1/model-router-specs/{router_id}/disable:
+    $ref: ./openapi/paths/model-router.yaml#/paths/~1api~1v1~1model-router-specs~1{router_id}~1disable
+  /api/v1/model-routers/{router_id}:
+    $ref: ./openapi/paths/model-router.yaml#/paths/~1api~1v1~1model-routers~1{router_id}
+  /api/v1/model-routers/{router_id}/duplicate:
+    $ref: ./openapi/paths/model-router.yaml#/paths/~1api~1v1~1model-routers~1{router_id}~1duplicate
+  /api/v1/model-routers/{router_id}/validate:
+    $ref: ./openapi/paths/model-router.yaml#/paths/~1api~1v1~1model-routers~1{router_id}~1validate
+  /api/v1/model-routers/{router_id}/publish:
+    $ref: ./openapi/paths/model-router.yaml#/paths/~1api~1v1~1model-routers~1{router_id}~1publish
+  /api/v1/model-routers/{router_id}/disable:
+    $ref: ./openapi/paths/model-router.yaml#/paths/~1api~1v1~1model-routers~1{router_id}~1disable
+  /api/v1/model-routers/{router_id}/assignees:
+    $ref: ./openapi/paths/model-router.yaml#/paths/~1api~1v1~1model-routers~1{router_id}~1assignees
+  /api/v1/model-routers/{router_id}/assignment:
+    $ref: ./openapi/paths/model-router.yaml#/paths/~1api~1v1~1model-routers~1{router_id}~1assignment
+  /api/v1/assistant/conversations/{conversation_id}/router-proposals/{proposal_id}/confirm:
+    $ref: ./openapi/paths/assistant.yaml#/paths/~1api~1v1~1assistant~1conversations~1{conversation_id}~1router-proposals~1{proposal_id}~1confirm
 components:
   securitySchemes:
     sessionCookie:
@@ -1128,6 +1169,126 @@ components:
       $ref: ./openapi/schemas/model-platform.yaml#/schemas/RouteSnapshot-Input
     RouteSnapshot-Output:
       $ref: ./openapi/schemas/model-platform.yaml#/schemas/RouteSnapshot-Output
+    RouterModelRefV3:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterModelRefV3
+    RouterIdentityV3:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterIdentityV3
+    RouterInputFieldV3:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterInputFieldV3
+    RouterCandidatePoolV3:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterCandidatePoolV3
+    RouterEligibilityV3:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterEligibilityV3
+    RouterPredicateV3:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterPredicateV3
+    RouterProfileRefV3:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterProfileRefV3
+    RouterQosWeightsV1:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterQosWeightsV1
+    RouterQosProfileConfigV1:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterQosProfileConfigV1
+    RouterProfileRegistrationV1:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterProfileRegistrationV1
+    RouterSelectModelActionV3:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterSelectModelActionV3
+    RouterExcludeModelsActionV3:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterExcludeModelsActionV3
+    RouterUseProfileActionV3:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterUseProfileActionV3
+    RouterRuleV3:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterRuleV3
+    RouterPrioritySelectorV3:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterPrioritySelectorV3
+    RouterWeightedAllocationV3:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterWeightedAllocationV3
+    RouterWeightedSelectorV3:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterWeightedSelectorV3
+    RouterQosSelectorV3:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterQosSelectorV3
+    RouterFoundrySemanticSelectorV3:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterFoundrySemanticSelectorV3
+    RouterEvaluatedCustomSelectorV3:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterEvaluatedCustomSelectorV3
+    RouterDeploymentRetryV3:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterDeploymentRetryV3
+    RouterCrossModelFallbackV3:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterCrossModelFallbackV3
+    RouterResilienceV3:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterResilienceV3
+    RouterStickinessV3:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterStickinessV3
+    RouterQosPolicyV3:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterQosPolicyV3
+    RouterSpecV3:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterSpecV3
+    RouterCompiledContextFieldV1:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterCompiledContextFieldV1
+    RouterModelFactsV1:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterModelFactsV1
+    RouterCompiledPlanV1:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterCompiledPlanV1
+    RouterCompilationIssue:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/RouterCompilationIssue
+    ModelRouterV3Write:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterV3Write
+    ModelRouterV3:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterV3
+    ModelRouterV3List:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterV3List
+    ModelRouterV3ValidationResult:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterV3ValidationResult
+    ModelRouterWrite:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterWrite
+    ModelRouterDuplicateWrite:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterDuplicateWrite
+    ModelRouterListResponse:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterListResponse
+    ModelRouterModelReference:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterModelReference
+    ModelRouterModelCatalog:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterModelCatalog
+    ModelRouterDecisionPreviewWrite:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterDecisionPreviewWrite
+    ModelRouterDecisionCandidatePreview:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterDecisionCandidatePreview
+    ModelRouterDecisionPreview:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterDecisionPreview
+    ModelRouterDecisionTrialWrite:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterDecisionTrialWrite
+    ModelRouterDecisionProbability:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterDecisionProbability
+    ModelRouterDecisionTrialResult:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterDecisionTrialResult
+    ModelRouterAssignedList:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterAssignedList
+    ModelRouterAssignmentWrite:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterAssignmentWrite
+    ModelRouterAssignment:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterAssignment
+    ModelRouterValidationIssue:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterValidationIssue
+    ModelRouterValidationResult:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterValidationResult
+    ModelRouter:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouter
+    ModelRouterCandidate:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterCandidate
+    ModelRouterCondition:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterCondition
+    ModelRouterDefinition:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterDefinition
+    ModelRouterEdge:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterEdge
+    ModelRouterNode:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterNode
+    ModelRouterPosition:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterPosition
+    ModelRouterStrategyModel:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterStrategyModel
+    AssistantRouterProposal:
+      $ref: ./openapi/schemas/assistant.yaml#/schemas/AssistantRouterProposal
+    AssistantRouterProposalModel:
+      $ref: ./openapi/schemas/assistant.yaml#/schemas/AssistantRouterProposalModel
 x-event-contracts:
   usage-event:
     transport: Azure Event Hubs

@@ -1592,6 +1592,12 @@ class ModelRuntimeService:
         user_id = request.metadata.user_id
         if not user_id:
             return
+        if (
+            isinstance(request, DecisionInvocationRequest)
+            and request.metadata.workflow
+            in {"model-router-decision", "model-router-decision-trial"}
+        ):
+            return
         if self._model_policy_allows(route, self._person_model_policy(user_id)):
             return
         self._deny(
@@ -1915,7 +1921,11 @@ class ModelRuntimeService:
         return self._invoke_resolved(request, route, request_id, timeout_ms=timeout_ms)
 
     def invoke_decision(
-        self, request: DecisionInvocationRequest, *, request_id: str | None = None,
+        self,
+        request: DecisionInvocationRequest,
+        *,
+        request_id: str | None = None,
+        timeout_ms: int | None = None,
     ) -> DecisionInvocationResponse:
         request_id = request_id or str(uuid4())
         route = self._invocation_route(request)
@@ -1929,7 +1939,12 @@ class ModelRuntimeService:
         self._assert_model_allowed(request, route, request_id)
         self._prepare_budget_delegation(request, route)
         self._assert_budget_available(request, route, request_id)
-        return self._invoke_resolved(request, self._decrypt_route(route), request_id)
+        return self._invoke_resolved(
+            request,
+            self._decrypt_route(route),
+            request_id,
+            timeout_ms=timeout_ms,
+        )
 
     @overload
     def _invoke_resolved(

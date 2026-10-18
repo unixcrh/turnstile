@@ -85,10 +85,10 @@ export const finopsKeys = {
   entities: ["reference", "enterprise-entities"] as const,
   registry: ["reference", "model-registry"] as const,
   modelAvailability: ["model-platform", "model-availability"] as const,
-
-
-
-
+  modelRouters: ["model-platform", "model-routers"] as const,
+  modelRouterCatalog: ["model-platform", "model-router-catalog"] as const,
+  assignedModelRouters: (userId: string) => ["model-platform", "assigned-model-routers", userId] as const,
+  modelRouter: (id: string) => ["model-platform", "model-router", id] as const,
   modelBackendPool: (id: string) => ["model-platform", "model-backend-pool", id] as const,
   gatewayPublications: ["control-plane", "gateway-publications"] as const,
   gatewayPublication: (id: string) => ["control-plane", "gateway-publication", id] as const,
@@ -216,10 +216,28 @@ export const finopsQueries = {
     refetchOnWindowFocus: true,
     refetchInterval: (query) => availabilityRefetchInterval(query.state.data?.items, query.state.error),
   }),
-
-
-
-
+  modelRouters: () => queryOptions({
+    queryKey: finopsKeys.modelRouters,
+    queryFn: dataSource.modelRouters,
+    ...cachePolicies.aggregate,
+  }),
+  modelRouterCatalog: () => queryOptions({
+    queryKey: finopsKeys.modelRouterCatalog,
+    queryFn: dataSource.modelRouterCatalog,
+    ...cachePolicies.aggregate,
+  }),
+  assignedModelRouters: (userId: string) => queryOptions({
+    queryKey: finopsKeys.assignedModelRouters(userId),
+    queryFn: () => dataSource.assignedModelRouters(userId),
+    enabled: Boolean(userId),
+    ...cachePolicies.aggregate,
+  }),
+  modelRouter: (id: string | null) => queryOptions({
+    queryKey: finopsKeys.modelRouter(id ?? ""),
+    queryFn: () => dataSource.modelRouter(id!),
+    enabled: Boolean(id),
+    ...cachePolicies.aggregate,
+  }),
   modelBackendPool: (id: string | null) => queryOptions({
     queryKey: finopsKeys.modelBackendPool(id ?? ""),
     queryFn: () => dataSource.modelBackendPool(id!),
@@ -471,6 +489,7 @@ export type PrefetchablePage =
   | "finops-requests"
   | "finops-invoke"
   | "budgets"
+  | "model-router"
   | "apim-native-routes"
   | "applications"
   | "models"
@@ -482,6 +501,11 @@ export function prefetchPage(
 ) {
   void queryClient.prefetchQuery(finopsQueries.entities())
   void queryClient.prefetchQuery(finopsQueries.registry())
+
+  if (page === "model-router") {
+    void queryClient.prefetchQuery(finopsQueries.modelRouters())
+    void queryClient.prefetchQuery(finopsQueries.modelRouterCatalog())
+  }
 
   if (page === "applications") {
     void queryClient.prefetchQuery(finopsQueries.gatewayApplications())

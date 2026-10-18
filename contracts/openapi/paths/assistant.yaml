@@ -11,7 +11,8 @@ paths:
         required: true
       responses:
         '200':
-          description: Answer, the charts behind it, and the tool calls that produced them
+          description: Answer, the charts behind it, and the tool calls that produced
+            them
           content:
             application/json:
               schema:
@@ -28,9 +29,11 @@ paths:
           $ref: ../../openapi.yaml#/components/responses/ErrorResponse
       security:
       - sessionCookie: []
-      description: 'The model chooses which tool to call and writes the prose; it never emits chart
+      description: 'The model chooses which tool to call and writes the prose; it
+        never emits chart
 
-        rows. Every chart is authored by the tool that fetched its data, so a figure in
+        rows. Every chart is authored by the tool that fetched its data, so a figure
+        in
 
         the reply equals the figure the corresponding dashboard page shows.
 
@@ -54,7 +57,8 @@ paths:
           $ref: ../../openapi.yaml#/components/responses/ErrorResponse
       security:
       - sessionCookie: []
-      description: 'Titles only. The transcripts, and therefore the charts inside them, are fetched
+      description: 'Titles only. The transcripts, and therefore the charts inside
+        them, are fetched
 
         one conversation at a time so opening the history dropdown does not download
 
@@ -94,9 +98,11 @@ paths:
           $ref: ../../openapi.yaml#/components/responses/ErrorResponse
       security:
       - sessionCookie: []
-      description: 'Each exchange carries the reply exactly as it was shown, charts included. Replies
+      description: 'Each exchange carries the reply exactly as it was shown, charts
+        included. Replies
 
-        are not re-derived on read: re-running the tools would spend tokens to redraw a
+        are not re-derived on read: re-running the tools would spend tokens to redraw
+        a
 
         chart the reader has already seen, and could produce numbers the stored prose
 
@@ -141,7 +147,8 @@ paths:
           $ref: ../../openapi.yaml#/components/responses/ErrorResponse
       security:
       - sessionCookie: []
-      description: 'A conversation is named after its first question. Renaming replaces that; later
+      description: 'A conversation is named after its first question. Renaming replaces
+        that; later
 
         turns never rewrite a name the caller has chosen.
 
@@ -191,18 +198,22 @@ paths:
           $ref: ../../openapi.yaml#/components/responses/ErrorResponse
       security:
       - sessionCookie: []
-      description: 'Workspace-level, not per reader: the model decides what every question costs, so
+      description: 'Workspace-level, not per reader: the model decides what every
+        question costs, so
 
         two administrators disagreeing about it in separate browsers would be a budget
 
         variance nobody could explain. Theme, language and timezone remain cookies.
 
 
-        The response carries both the configuration and what it resolves to now. A pinned
+        The response carries both the configuration and what it resolves to now. A
+        pinned
 
-        model that is later disabled, or moved to a runtime that cannot carry tool calls,
+        model that is later disabled, or moved to a runtime that cannot carry tool
+        calls,
 
-        stops qualifying and the assistant falls back to automatic selection rather than
+        stops qualifying and the assistant falls back to automatic selection rather
+        than
 
         refusing to answer; `model_available` is false in exactly that case.
 
@@ -241,7 +252,8 @@ paths:
       - sessionCookie: []
       description: 'Owner role only. This is budget administration rather than registry
 
-        administration -- it changes what the workspace spends, not a credential -- so it
+        administration -- it changes what the workspace spends, not a credential --
+        so it
 
         does not require the management bearer token.
 
@@ -250,7 +262,8 @@ paths:
 
         than a missing one. A model that does not qualify is rejected with 409 rather
 
-        than stored: read-time fallback exists for a model that stopped qualifying later,
+        than stored: read-time fallback exists for a model that stopped qualifying
+        later,
 
         not as a licence to save one that never did.
 
@@ -278,11 +291,14 @@ paths:
       - Assistant
     post:
       summary: Pin a chart, starting a report or adding to one
-      description: '`report_id` decides between the two cases: absent starts a new report and requires
+      description: '`report_id` decides between the two cases: absent starts a new
+        report and requires
 
-        a title, present adds to that report. A relative time range is frozen onto the
+        a title, present adds to that report. A relative time range is frozen onto
+        the
 
-        dates the chart covered, so a kept report answers the question it was pinned for
+        dates the chart covered, so a kept report answers the question it was pinned
+        for
 
         rather than re-resolving its preset on every refresh.
 
@@ -495,7 +511,8 @@ paths:
           $ref: ../../openapi.yaml#/components/responses/ErrorResponse
       security:
       - sessionCookie: []
-      description: 'Only the authenticated report creator may save a layout. Widths use the report''s
+      description: 'Only the authenticated report creator may save a layout. Widths
+        use the report''s
 
         twelve-column grid and heights belong to row positions, so every viewer receives
 
@@ -551,9 +568,11 @@ paths:
           $ref: ../../openapi.yaml#/components/responses/ErrorResponse
       security:
       - sessionCookie: []
-      description: 'Each stored `ChartQuery` is replayed through the same validation the assistant
+      description: 'Each stored `ChartQuery` is replayed through the same validation
+        the assistant
 
-        used, so a pinned report can never read more than the question that created it.
+        used, so a pinned report can never read more than the question that created
+        it.
 
         A chart whose tool no longer exists is skipped rather than failing the report;
 
@@ -599,11 +618,14 @@ paths:
           $ref: ../../openapi.yaml#/components/responses/ErrorResponse
       security:
       - sessionCookie: []
-      description: 'The request must name every chart in the report exactly once. A partial list is
+      description: 'The request must name every chart in the report exactly once.
+        A partial list is
 
-        rejected rather than partially applied: the omitted charts would keep their old
+        rejected rather than partially applied: the omitted charts would keep their
+        old
 
-        positions, and because the read breaks ties on `created_at` the result would be
+        positions, and because the read breaks ties on `created_at` the result would
+        be
 
         an order the caller never asked for.
 
@@ -650,9 +672,11 @@ paths:
           $ref: ../../openapi.yaml#/components/responses/ErrorResponse
       security:
       - sessionCookie: []
-      description: 'Removing the last chart is refused with 409. A report with no charts is a nav item
+      description: 'Removing the last chart is refused with 409. A report with no
+        charts is a nav item
 
-        that opens an empty page, so deleting the report is the operation being asked for.
+        that opens an empty page, so deleting the report is the operation being asked
+        for.
 
         '
       tags:
@@ -677,9 +701,11 @@ paths:
               $ref: ../../openapi.yaml#/components/schemas/ConversationTitleRequest
       responses:
         '200':
-          description: 'The conversation summary. `title_source` says whether this call produced the
+          description: 'The conversation summary. `title_source` says whether this
+            call produced the
 
-            title; a failed summary leaves the placeholder rather than raising, because a
+            title; a failed summary leaves the placeholder rather than raising, because
+            a
 
             missing name is worth less than the conversation it belongs to.
 
@@ -702,19 +728,23 @@ paths:
           $ref: ../../openapi.yaml#/components/responses/ErrorResponse
       security:
       - sessionCookie: []
-      description: 'A conversation starts out labelled with its first question, truncated. This asks
+      description: 'A conversation starts out labelled with its first question, truncated.
+        This asks
 
         the model for a real title instead, in one small tool-free call.
 
 
-        It is a separate call rather than a step inside `ask` because the answer is the
+        It is a separate call rather than a step inside `ask` because the answer is
+        the
 
-        product: naming the thread inside the ask would delay every first question by a
+        product: naming the thread inside the ask would delay every first question
+        by a
 
         round trip. Callers make it once, after the first answer is on screen.
 
 
-        Safe to repeat. The server replaces a `question` title only, so a title the model
+        Safe to repeat. The server replaces a `question` title only, so a title the
+        model
 
         already wrote is never re-summarised and a title a person typed is never lost.
 
@@ -723,3 +753,45 @@ paths:
         '
       tags:
       - Assistant
+  /api/v1/assistant/conversations/{conversation_id}/router-proposals/{proposal_id}/confirm:
+    post:
+      tags:
+      - Assistant
+      operationId: confirmAssistantRouterProposal
+      summary: Create a model Router Draft from a persisted Assistant proposal
+      description: 'Owner-only explicit confirmation. The request has no body: the
+        server loads the
+
+        proposal from the authenticated caller''s saved conversation and creates exactly
+
+        that backend-authored graph as a Draft. Confirmation never publishes, assigns,
+
+        or invokes the Router, and a browser cannot substitute arbitrary graph data.
+
+        '
+      parameters:
+      - $ref: ../../openapi.yaml#/components/parameters/ConversationId
+      - $ref: ../../openapi.yaml#/components/parameters/ProposalId
+      responses:
+        '200':
+          description: The unchanged Draft previously created from this proposal
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/ModelRouter
+        '201':
+          description: The newly created model Router Draft
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/ModelRouter
+        '403':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '404':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '409':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '422':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse

@@ -1,4 +1,9 @@
-
+import type {
+  ModelRouterConditionOperator,
+  ModelRouterDefinition,
+  ModelRouterFallbackEvent,
+  ModelRouterStrategyType,
+} from "../../data-sources/apim/types"
 
 export type ChartKind = "bar" | "line" | "table" | "kpi"
 export type ChartSeries = { key: string; label: string }
@@ -33,15 +38,37 @@ export type AssistantStep = {
 export type AssistantTurn = { role: "user" | "assistant"; content: string }
 export type AssistantSource = "apim" | "github-copilot"
 
+export type AssistantRouterProposalModel = {
+  model_id: string
+  display_name: string
+  provider_name: string
+  capabilities: string[]
+  branch: "primary" | "else"
+  priority: number
+  weight: number
+}
 
-
-
+export type AssistantRouterProposal = {
+  id: string
+  name: string
+  description: string
+  strategy_type: ModelRouterStrategyType
+  else_strategy_type: ModelRouterStrategyType | null
+  condition: {
+    field: string
+    operator: ModelRouterConditionOperator
+    value: string | number | boolean | null
+  } | null
+  fallback_on: ModelRouterFallbackEvent[]
+  models: AssistantRouterProposalModel[]
+  definition: ModelRouterDefinition
+}
 
 export type AssistantReply = {
   conversation_id: string
   message: string
   charts: ChartSpec[]
-
+  router_proposals?: AssistantRouterProposal[]
   steps: AssistantStep[]
   latency_ms: number
   model: string

@@ -1062,8 +1062,8 @@ export const ENGLISH_CORE_PHRASES: Record<string, string> = {
   "AI 用量治理": "AI Usage Governance",
   "模型平台": "Model Platform",
   "模型管理": "Model Management",
-
-
+  "模型智能路由": "Model Intelligent Router",
+  "模型路由器": "Model routers",
   "调用目标": "Invocation target",
   "直接模型": "Direct models",
   "最终模型": "Selected model",
@@ -1084,11 +1084,11 @@ export const ENGLISH_CORE_PHRASES: Record<string, string> = {
   "历史优先级策略": "Legacy priority strategy",
   "成本约束": "Cost constraint",
   "搜索路由器人员": "Search router users",
-
+  "模型路由器人员访问": "Model router people access",
   "候选模型访问由保存时一并校验": "Candidate model access is validated when saved",
   "正在加载人员访问": "Loading people access",
-
-
+  "正在读取人员路由器": "Loading the user's model routers",
+  "模型路由器尝试链": "Model router attempt chain",
   "未发起模型请求": "No model request was sent",
   "没有匹配的人员": "No matching people",
   "画布": "Canvas",
@@ -1133,6 +1133,33 @@ export const ENGLISH_CORE_PHRASES: Record<string, string> = {
   "安全回退": "Safe fallback",
   "复用首轮模型": "Reused first-turn model",
   "Fallback 命中": "Fallback selected",
+  "包含任一关键词": "Matches any keyword",
+  "多个关键词用逗号分隔，如：证明, 算法, theorem": "Comma-separated keywords, e.g.: prove, theorem, algorithm",
+  "代码重构": "Code refactor",
+  "日常翻译": "Translation",
+  "算法证明": "Algorithm proof",
+  "重构这段 TypeScript 异步任务队列，修复高并发下的竞态条件并补充边界单元测试。": "Refactor this TypeScript async task queue, fix the high-concurrency race condition, and add edge-case unit tests.",
+  "把下面这段发布说明翻译成简洁自然的中文：Added multi-region failover for API gateways.": "Translate this release note into concise Chinese: Added multi-region failover for API gateways.",
+  "请严格证明 Dijkstra 算法在带负权边图上为什么会失效，并给出反例与 Bellman-Ford 复杂度对比。": "Rigorously prove why Dijkstra's algorithm fails on graphs with negative-weight edges, provide a counterexample, and compare complexity with Bellman-Ford.",
+  "默认（跟随模型）": "Default (follow model)",
+  "关闭思考（none · 最快）": "No thinking (none · fastest)",
+  "低强度（low）": "Low effort (low)",
+  "中强度（medium）": "Medium effort (medium)",
+  "高强度（high）": "High effort (high)",
+  "System One 极速决策协议 · 输出 0 Token 计费 · 原生返回候选概率分布": "System One fast decision protocol · 0 output token billing · native candidate probabilities",
+  "LLM JSON 分类协议 · 由判路由模型输出候选 ID 与理由": "LLM JSON classification protocol · routing model outputs candidate ID and rationale",
+  "判路由指令": "Routing decision instructions",
+  "留空使用内置 System One 选择指令；候选模型用途说明将自动映射为 Choice 判据": "Leave blank to use built-in System One instructions; candidate descriptions map to Choice criteria",
+  "判路由推理强度": "Routing reasoning effort",
+  "选择判路由推理强度": "Select routing reasoning effort",
+  "样例请求预设": "Sample request presets",
+  "输入一段样例请求，检查实际系统提示词或直接实测判路由结果": "Enter a sample request to inspect the actual system prompt or run a live routing trial",
+  "实测判路由": "Test routing decision",
+  "实测判路由结果": "Live routing decision result",
+  "判路由模型": "Routing model",
+  "置信度": "Confidence",
+  "候选模型概率分布": "Candidate model probabilities",
+  "决策协议": "Decision protocol",
   "大于或等于": "Greater than or equal to",
   "小于或等于": "Less than or equal to",
   "常规配置选择 Routing Model": "Select Routing Model in regular configuration",
@@ -1140,16 +1167,16 @@ export const ENGLISH_CORE_PHRASES: Record<string, string> = {
   "已不可用的模型": "Unavailable model",
   "问题长度": "Prompt length",
   "模型决策": "Model decision",
-
+  "智能模型路由提案": "Intelligent model Router proposal",
   "Match 分支": "Match branch",
   "Else 分支": "Else branch",
   "失败转移": "Fallback on",
   "已创建草稿": "Draft created",
   "创建草稿": "Create draft",
   "正在创建…": "Creating…",
-
-
-
+  "打开模型智能路由": "Open Intelligent Model Routing",
+  "仅 Owner 可创建路由器草稿": "Only Owners can create Router drafts",
+  "帮我创建一个按优先级路由的智能模型路由草稿。": "Create an intelligent model Router draft that routes by priority.",
   "不限": "No limit",
   "节点": "Nodes",
   "连线": "Connections",
@@ -1168,7 +1195,7 @@ export const ENGLISH_CORE_PHRASES: Record<string, string> = {
   "限流": "Rate limited",
   "Fallback 策略": "Fallback policy",
   "候选模型配置": "Candidate model configuration",
-
+  "调整模型路由器列表宽度": "Resize model router list",
   "拖动调整宽度，双击复位": "Drag to resize; double-click to reset",
   "调整节点属性面板宽度": "Resize node properties panel",
   "名称": "Name",
@@ -1176,9 +1203,9 @@ export const ENGLISH_CORE_PHRASES: Record<string, string> = {
   "草稿": "Draft",
   "已发布": "Published",
   "新建路由器": "New router",
-
+  "新建模型路由器": "New model router",
   "创建路由器": "Create router",
-
+  "创建第一个模型路由器": "Create your first model router",
   "定义用途，并选择首批候选模型。": "Define its purpose and choose the initial candidate models.",
   "从可用模型中选择候选池，并在画布上连接条件、优先级和 Fallback。": "Choose a candidate pool from available models, then connect conditions, priority, and Fallback on the canvas.",
   "例如：客服问答路由": "For example: Customer support Q&A router",
@@ -1199,14 +1226,14 @@ export const ENGLISH_CORE_PHRASES: Record<string, string> = {
   "通过下方排序定义模型优先级；失败时按顺序继续。": "Define model priority by ordering the list below; on failure, continue in order.",
   "搜索候选模型": "Search candidate models",
   "搜索模型或提供方...": "Search models or providers...",
-
-
+  "搜索模型路由器": "Search model routers",
+  "搜索模型路由器...": "Search model routers...",
   "没有匹配的可用模型。": "No matching available models.",
   "没有匹配的路由器": "No matching routers",
   "当前用户没有可用于模型路由的模型。": "The current user has no models available for model routing.",
   "当前用户没有可用于路由的模型。": "The current user has no models available for routing.",
-
-
+  "加载模型路由器": "Loading model routers",
+  "无法加载模型路由服务": "Unable to load the model router service",
   "操作失败": "Operation failed",
   "刚刚更新": "Updated just now",
   "未命名路由器": "Untitled router",
@@ -1655,8 +1682,8 @@ export const ENGLISH_CORE_PHRASES: Record<string, string> = {
   "编辑基础信息": "Edit basic information",
   "复制路由器": "Duplicate router",
   "创建副本": "Create copy",
-
-
+  "停用模型路由器": "Disable model router",
+  "删除模型路由器": "Delete model router",
   "删除路由器": "Delete router",
   "放弃未保存的修改？": "Discard unsaved changes?",
   "当前画布有尚未保存的更改。切换路由器将丢失这些更改。": "The current canvas has unsaved changes. Switching routers will discard them.",

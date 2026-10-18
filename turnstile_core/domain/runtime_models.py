@@ -978,14 +978,21 @@ class DecisionInvocationRequest(DecisionInput):
 
 class ModelInvocationRequest(StrictModel):
     metadata: InvocationMetadata
+    router_id: UUID | None = None
     runtime_id: UUID | None = None
     model_id: UUID | None = None
     gateway_profile_id: UUID | None = None
     gateway_deployment_id: UUID | None = None
+    router_context: dict[str, str | float | bool] = Field(
+        default_factory=dict, max_length=50
+    )
     messages: list[ChatMessage] = Field(min_length=1, max_length=100)
     tools: list[ToolDefinition] | None = Field(default=None, max_length=32)
     temperature: float | None = Field(default=None, ge=0, le=2)
     max_output_tokens: int | None = Field(default=None, ge=1, le=1_000_000)
+    reasoning_effort: Literal["none", "low", "medium", "high"] | None = Field(
+        default=None, exclude_if=lambda value: value is None,
+    )
     response_format: Literal["json_object"] | None = None
     stream: bool = False
 
@@ -993,7 +1000,7 @@ class ModelInvocationRequest(StrictModel):
     def validate_gateway_selection(self) -> ModelInvocationRequest:
         if (self.gateway_profile_id is None) != (self.gateway_deployment_id is None):
             raise ValueError("APIM instance and Gateway must be selected together")
-        if self.gateway_profile_id is not None and self.model_id is None:
+        if self.gateway_profile_id is not None and (self.model_id is None or self.router_id):
             raise ValueError(
                 "Gateway selection requires a specific model without automatic routing"
             )
@@ -1030,8 +1037,12 @@ class ModelInvocationResponse(StrictModel):
     latency_ms: int = Field(ge=0)
     usage: InvocationUsage | None
     estimated_cost: float | None = Field(default=None, ge=0)
+    router_id: UUID | None = None
+    router_name: str | None = None
+    router_version: int | None = Field(default=None, ge=1)
     selected_model_id: UUID | None = None
     selected_model_name: str | None = None
+    router_attempts: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class DecisionInvocationResponse(StrictModel):

@@ -50,6 +50,8 @@ from turnstile_core.services.model_availability import (
 from ..services.anomaly_service import AnomalyRuleService
 from ..services.assistant import AssistantService
 from ..services.budget_service import TokenBudgetService
+from ..services.model_router_service import ModelRouterExecutionService, ModelRouterService
+from ..services.model_router_v3_service import ModelRouterV3Service
 from ..services.runtime_service import ModelRuntimeService
 from .dependencies import Repository
 
@@ -320,16 +322,34 @@ AnomalyRuleServiceDependency = Annotated[
 ]
 
 
+def model_router_service(repository: Repository) -> ModelRouterService:
+    return ModelRouterService(repository)
 
 
+ModelRouterServiceDependency = Annotated[
+    ModelRouterService, Depends(model_router_service)
+]
 
 
+def model_router_v3_service(repository: Repository) -> ModelRouterV3Service:
+    return ModelRouterV3Service(repository)
 
 
+ModelRouterV3ServiceDependency = Annotated[
+    ModelRouterV3Service, Depends(model_router_v3_service)
+]
 
 
+def model_router_execution_service(
+    repository: Repository,
+    runtime: RuntimeService,
+) -> ModelRouterExecutionService:
+    return ModelRouterExecutionService(repository, runtime)
 
 
+ModelRouterExecutionServiceDependency = Annotated[
+    ModelRouterExecutionService, Depends(model_router_execution_service)
+]
 
 
 def assistant_service(repository: Repository) -> AssistantService:

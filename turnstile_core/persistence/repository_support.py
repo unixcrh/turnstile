@@ -754,3 +754,110 @@ def conversation_for_creator(conversation: Mapping[str, Any]) -> dict[str, Any]:
     row = dict(conversation)
     row["owner_id"] = str(row.pop("created_by", row["owner_id"]))
     return row
+
+
+def model_router_view(router: Mapping[str, Any]) -> dict[str, Any]:
+    row = dict(router)
+    draft = deepcopy(row.pop("draft_config"))
+    published = row.pop("published_config", None)
+    row.pop("owner_id", None)
+    row.pop("deleted_at", None)
+    row["definition"] = draft
+    row["has_unpublished_changes"] = published is None or published != draft
+    return row
+
+
+def published_model_router_view(router: Mapping[str, Any]) -> dict[str, Any]:
+    row = model_router_view(router)
+    row["definition"] = deepcopy(router["published_config"])
+    row["has_unpublished_changes"] = router["published_config"] != router["draft_config"]
+    return row
+
+
+def model_router_v3_view(router: Mapping[str, Any]) -> dict[str, Any]:
+    row = dict(router)
+    draft = deepcopy(row.pop("draft_spec"))
+    published = row.pop("published_spec", None)
+    plan = row.pop("published_plan", None)
+    row.pop("alias", None)
+    row.pop("owner_id", None)
+    row.pop("deleted_at", None)
+    row["spec"] = draft
+    row["compiled_plan"] = deepcopy(plan)
+    row["has_unpublished_changes"] = published is None or published != draft
+    return row
+
+
+ROUTER_ATTEMPT_USAGE_FIELDS = (
+    "input_tokens",
+    "cached_tokens",
+    "cache_write_tokens",
+    "output_tokens",
+    "total_tokens",
+    "estimated_cost",
+)
+
+
+def enrich_router_attempts(
+    attempts: Sequence[Mapping[str, Any]],
+    usage_by_request: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    enriched = [dict(item) for item in attempts]
+    for index, attempt in enumerate(enriched):
+        if attempt.get("attempt_role") is None:
+            attempt["attempt_role"] = "candidate"
+        if attempt.get("strategy_type") is None:
+            attempt["strategy_type"] = "priority"
+        if attempt.get("priority") is None and attempt["attempt_role"] == "candidate":
+            attempt["priority"] = attempt.get("sequence")
+        if (
+            attempt.get("decision_basis") is None
+            and attempt["attempt_role"] == "candidate"
+        ):
+            outcome = str(attempt.get("outcome") or "")
+            attempt["decision_basis"] = {
+                "unavailable": "candidate_unavailable",
+                "cost_limit_exceeded": "cost_limit_exceeded",
+                "failed": "provider_error",
+                "latency_exceeded": "latency_limit_exceeded",
+                "succeeded": (
+                    "fallback_success" if index > 0 else "highest_priority_success"
+                ),
+            }.get(outcome)
+        usage = usage_by_request.get(str(attempt.get("request_id") or ""))
+        if usage is None:
+            continue
+        for field in ROUTER_ATTEMPT_USAGE_FIELDS:
+            if attempt.get(field) is None:
+                attempt[field] = usage[field]
+    return enriched
+
+
+def apply_router_totals(row: dict[str, Any], attempts: Sequence[Mapping[str, Any]]) -> None:
+    measured = [attempt for attempt in attempts if attempt.get("request_id")]
+    if not measured:
+        return
+    row["prompt_tokens"] = sum(int(item.get("input_tokens") or 0) for item in measured)
+    if "cached_tokens" in row:
+        row["cached_tokens"] = sum(
+            int(item.get("cached_tokens") or 0) for item in measured
+        )
+    if "cache_write_tokens" in row:
+        row["cache_write_tokens"] = sum(
+            int(item.get("cache_write_tokens") or 0) for item in measured
+        )
+    row["completion_tokens"] = sum(
+        int(item.get("output_tokens") or 0) for item in measured
+    )
+    row["total_tokens"] = sum(int(item.get("total_tokens") or 0) for item in measured)
+    row["latency_ms"] = sum(int(item.get("latency_ms") or 0) for item in measured)
+    row["estimated_cost"] = round(
+        sum(float(item.get("estimated_cost") or 0) for item in measured), 8
+    )
+    if any(item.get("total_tokens") is not None for item in measured):
+        row["usage_available"] = True
+        if row.get("ingest_error") == "platform_usage_unavailable":
+            row["ingest_error"] = None
+            row["estimated"] = False
+        if any(item.get("estimated_cost") is not None for item in measured):
+            row["cost_available"] = True

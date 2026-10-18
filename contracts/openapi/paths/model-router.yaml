@@ -1,0 +1,525 @@
+paths:
+  /api/v1/model-routers:
+    get:
+      tags:
+      - Model Router
+      operationId: listModelRouters
+      summary: List model routers owned by the current user
+      responses:
+        '200':
+          description: Routers ordered by most recent edit
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/ModelRouterListResponse
+        '401':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+    post:
+      tags:
+      - Model Router
+      operationId: createModelRouter
+      summary: Create a model router draft
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../../openapi.yaml#/components/schemas/ModelRouterWrite
+      responses:
+        '201':
+          description: Created model router draft
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/ModelRouter
+        '409':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '422':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+  /api/v1/model-routers/catalog:
+    get:
+      tags:
+      - Model Router
+      operationId: getModelRouterCatalog
+      summary: List model IDs the current user may place in a router
+      responses:
+        '200':
+          description: Enabled and assigned model IDs after role and route checks
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/ModelRouterModelCatalog
+        '401':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+  /api/v1/model-routers/decision-preview:
+    post:
+      tags:
+      - Model Router
+      operationId: previewModelRouterDecision
+      summary: Preview the exact model-based routing prompt for an unsaved definition
+      description: Builds the authorized candidate catalog and rendered prompt without invoking a routing
+        model or persisting user content.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../../openapi.yaml#/components/schemas/ModelRouterDecisionPreviewWrite
+      responses:
+        '200':
+          description: Rendered model-based routing prompt and authorized candidate catalog
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/ModelRouterDecisionPreview
+        '401':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '409':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '422':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+  /api/v1/model-routers/decision-trial:
+    post:
+      tags:
+      - Model Router
+      operationId: trialModelRouterDecision
+      summary: Execute a live routing decision trial for an unsaved definition
+      description: Invokes only the configured Routing Model (System One choice or LLM JSON)
+        against the authorized candidate pool and sample prompt without persisting traces.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../../openapi.yaml#/components/schemas/ModelRouterDecisionTrialWrite
+      responses:
+        '200':
+          description: Live routing decision result with selected model, probabilities, and latency
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/ModelRouterDecisionTrialResult
+        '401':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '409':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '422':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+  /api/v1/model-routers/assigned:
+    get:
+      tags:
+      - Model Router
+      operationId: listAssignedModelRouters
+      summary: List published model routers assigned to one callable user
+      description: Members can read only their own assignments. Owners may select a user for the invocation
+        console.
+      parameters:
+      - name: user_id
+        in: query
+        required: false
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 320
+      responses:
+        '200':
+          description: Assigned routers with their immutable active published definitions
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/ModelRouterAssignedList
+        '401':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+  /api/v1/model-router-specs:
+    get:
+      tags:
+      - Model Router
+      operationId: listModelRoutersV3
+      summary: List typed v3 Router drafts owned by the current user
+      responses:
+        '200':
+          description: Typed v3 Routers ordered by most recent edit
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/ModelRouterV3List
+        '401':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+    post:
+      tags:
+      - Model Router
+      operationId: createModelRouterV3
+      summary: Create a typed v3 Router draft
+      description: Saves a typed specification but does not claim that it is compilable or callable.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../../openapi.yaml#/components/schemas/ModelRouterV3Write
+      responses:
+        '201':
+          description: Created typed Router draft
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/ModelRouterV3
+        '409':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '422':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+  /api/v1/model-router-specs/{router_id}:
+    get:
+      tags:
+      - Model Router
+      operationId: getModelRouterV3
+      summary: Read one typed v3 Router owned by the current user
+      parameters:
+      - $ref: ../../openapi.yaml#/components/parameters/RouterId
+      responses:
+        '200':
+          description: Typed draft and active immutable compiled plan
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/ModelRouterV3
+        '404':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+    put:
+      tags:
+      - Model Router
+      operationId: updateModelRouterV3
+      summary: Save a typed v3 Router draft
+      description: A stable alias cannot change after the first successful publication.
+      parameters:
+      - $ref: ../../openapi.yaml#/components/parameters/RouterId
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../../openapi.yaml#/components/schemas/ModelRouterV3Write
+      responses:
+        '200':
+          description: Updated typed draft
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/ModelRouterV3
+        '404':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '409':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '422':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+    delete:
+      tags:
+      - Model Router
+      operationId: deleteModelRouterV3
+      summary: Remove a typed v3 Router from the current user's workspace
+      parameters:
+      - $ref: ../../openapi.yaml#/components/parameters/RouterId
+      responses:
+        '204':
+          description: Router removed; immutable revisions remain retained
+        '404':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+  /api/v1/model-router-specs/{router_id}/validate:
+    post:
+      tags:
+      - Model Router
+      operationId: validateModelRouterV3
+      summary: Compile a typed v3 Router without publishing it
+      description: Resolves only explicitly pinned context, model-facts, profile, and evaluation versions.
+      parameters:
+      - $ref: ../../openapi.yaml#/components/parameters/RouterId
+      responses:
+        '200':
+          description: Compilation issues or the exact candidate immutable plan
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/ModelRouterV3ValidationResult
+        '404':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '409':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+  /api/v1/model-router-specs/{router_id}/publish:
+    post:
+      tags:
+      - Model Router
+      operationId: publishModelRouterV3
+      summary: Compile and publish an immutable typed v3 Router revision
+      description: Persists the exact specification, registry snapshots, and content-addressed compiled
+        plan. It does not create a public data-plane alias yet.
+      parameters:
+      - $ref: ../../openapi.yaml#/components/parameters/RouterId
+      responses:
+        '200':
+          description: Published typed Router and active compiled plan
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/ModelRouterV3
+        '404':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '409':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+  /api/v1/model-router-specs/{router_id}/disable:
+    post:
+      tags:
+      - Model Router
+      operationId: disableModelRouterV3
+      summary: Disable a published typed v3 Router
+      parameters:
+      - $ref: ../../openapi.yaml#/components/parameters/RouterId
+      responses:
+        '200':
+          description: Disabled typed Router with its retained plan and revisions
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/ModelRouterV3
+        '404':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '409':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+  /api/v1/model-routers/{router_id}:
+    get:
+      tags:
+      - Model Router
+      operationId: getModelRouter
+      summary: Read one model router owned by the current user
+      parameters:
+      - $ref: ../../openapi.yaml#/components/parameters/RouterId
+      responses:
+        '200':
+          description: Model router draft and publication metadata
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/ModelRouter
+        '404':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+    put:
+      tags:
+      - Model Router
+      operationId: updateModelRouter
+      summary: Save a model router draft
+      description: Editing a published router keeps its current published configuration active until the
+        next publish.
+      parameters:
+      - $ref: ../../openapi.yaml#/components/parameters/RouterId
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../../openapi.yaml#/components/schemas/ModelRouterWrite
+      responses:
+        '200':
+          description: Updated draft
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/ModelRouter
+        '404':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '409':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '422':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+    delete:
+      tags:
+      - Model Router
+      operationId: deleteModelRouter
+      summary: Remove a model router from the current user's workspace
+      description: Soft-deletes the router while retaining immutable published revisions for audit.
+      parameters:
+      - $ref: ../../openapi.yaml#/components/parameters/RouterId
+      responses:
+        '204':
+          description: Router removed
+        '404':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+  /api/v1/model-routers/{router_id}/duplicate:
+    post:
+      tags:
+      - Model Router
+      operationId: duplicateModelRouter
+      summary: Copy a model router into a new version-zero draft
+      parameters:
+      - $ref: ../../openapi.yaml#/components/parameters/RouterId
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../../openapi.yaml#/components/schemas/ModelRouterDuplicateWrite
+      responses:
+        '201':
+          description: Independent copied draft
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/ModelRouter
+        '404':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '409':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '422':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+  /api/v1/model-routers/{router_id}/validate:
+    post:
+      tags:
+      - Model Router
+      operationId: validateModelRouter
+      summary: Validate a persisted model router draft
+      parameters:
+      - $ref: ../../openapi.yaml#/components/parameters/RouterId
+      responses:
+        '200':
+          description: Structured graph and model-access validation result
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/ModelRouterValidationResult
+        '404':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+  /api/v1/model-routers/{router_id}/publish:
+    post:
+      tags:
+      - Model Router
+      operationId: publishModelRouter
+      summary: Validate and publish the current model router draft
+      description: Atomically snapshots an immutable revision, increments the version, and replaces the
+        active published definition.
+      parameters:
+      - $ref: ../../openapi.yaml#/components/parameters/RouterId
+      responses:
+        '200':
+          description: Published model router
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/ModelRouter
+        '404':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '409':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+  /api/v1/model-routers/{router_id}/disable:
+    post:
+      tags:
+      - Model Router
+      operationId: disableModelRouter
+      summary: Disable a published model router
+      parameters:
+      - $ref: ../../openapi.yaml#/components/parameters/RouterId
+      responses:
+        '200':
+          description: Disabled model router with retained draft and revisions
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/ModelRouter
+        '404':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '409':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+  /api/v1/model-routers/{router_id}/assignees:
+    get:
+      tags:
+      - Model Router
+      operationId: listModelRouterAssignees
+      summary: List people assigned to an owned model router
+      parameters:
+      - $ref: ../../openapi.yaml#/components/parameters/RouterId
+      responses:
+        '200':
+          description: Sorted user IDs with explicit Router access
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+        '403':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '404':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+  /api/v1/model-routers/{router_id}/assignment:
+    put:
+      tags:
+      - Model Router
+      operationId: setModelRouterAssignment
+      summary: Grant or revoke one person's access to a published model router
+      description: Candidate-model access is checked before a grant. Only Owners may mutate assignments.
+      parameters:
+      - $ref: ../../openapi.yaml#/components/parameters/RouterId
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../../openapi.yaml#/components/schemas/ModelRouterAssignmentWrite
+      responses:
+        '200':
+          description: Applied assignment state
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/ModelRouterAssignment
+        '403':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '404':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '409':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '422':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse

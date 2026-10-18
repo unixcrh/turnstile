@@ -35,30 +35,51 @@ from .repository_gateway_targets import PostgreSqlGatewayTargetRepositoryMixin
 from .repository_model_availability import PostgreSqlModelAvailabilityRepositoryMixin
 from .repository_publications import PostgreSqlPublicationRepositoryMixin
 from .repository_registry import PostgreSqlRegistryRepositoryMixin
+from .repository_router import PostgreSqlRouterRepositoryMixin
 from .repository_support import (
     CACHE_DIMENSION_FIELDS,
     BudgetConstraintViolation,
     UsageFilters,
     _activation_runtime_config,
+    apply_router_totals,
     attach_charts,
     cache_distribution_supported,
     cache_scope_for_filters,
     conversation_for_creator,
+    enrich_router_attempts,
     report_for_viewer,
+)
+from .repository_support import (
+    ROUTER_ATTEMPT_USAGE_FIELDS as ROUTER_ATTEMPT_USAGE_FIELDS,
+)
+from .repository_support import (
+    model_router_v3_view as model_router_v3_view,
+)
+from .repository_support import (
+    model_router_view as model_router_view,
+)
+from .repository_support import (
+    published_model_router_view as published_model_router_view,
 )
 
 __all__ = (
     "CACHE_DIMENSION_FIELDS",
+    "ROUTER_ATTEMPT_USAGE_FIELDS",
     "BudgetConstraintViolation",
     "OpsDbProxy",
     "PostgreSqlOpsDbProxy",
     "QueryRepository",
     "UsageFilters",
     "_activation_runtime_config",
+    "apply_router_totals",
     "attach_charts",
     "cache_distribution_supported",
     "cache_scope_for_filters",
     "conversation_for_creator",
+    "enrich_router_attempts",
+    "model_router_v3_view",
+    "model_router_view",
+    "published_model_router_view",
     "report_for_viewer",
 )
 
@@ -77,6 +98,7 @@ class PostgreSqlOpsDbProxy(
     PostgreSqlGatewayTargetRepositoryMixin,
     PostgreSqlRegistryRepositoryMixin,
     PostgreSqlPublicationRepositoryMixin,
+    PostgreSqlRouterRepositoryMixin,
     QueryRepository,
 ):
     def begin_platform_invocation(self, attempt: PlatformInvocationAttempt) -> None:
@@ -1207,19 +1229,27 @@ class PostgreSqlOpsDbProxy(
         return rows
 
     def list_usage_requests(
-        self, from_: datetime, to: datetime, filters: UsageFilters, limit: int,
+        self,
+        from_: datetime,
+        to: datetime,
+        filters: UsageFilters,
+        limit: int,
         after: tuple[datetime, str] | None = None,
     ) -> Sequence[dict[str, Any]]:
-        filter_sql, filter_parameters = self._filter_sql(filters)
-        cursor_sql = " AND (usage.ts, usage.trace_id) < (%s, %s)" if after is not None else ""
-        cursor_parameters = list(after) if after is not None else []
+        filter_sql, filter_parameters = self._filter_sql(filters, trace=True)
+        cursor_sql = ""
+        if after is not None:
+            cursor_sql = " AND (usage.ts, usage.trace_id) < (%s, %s)"
+            filter_parameters.extend(after)
         with self._connection() as connection:
             rows = connection.execute(
                 f"""SELECT
                         usage.request_id, usage.correlation_id,
-                        usage.trace_id, usage.usage_available, usage.platform_outcome,
+                        usage.trace_id,
+                        (usage.usage_available OR COALESCE(routed.usage_available, FALSE))
+                            AS usage_available,
+                        usage.platform_outcome,
                         usage.gateway_status_code, usage.upstream_request_id,
-                        usage.apim_target_id, usage.gateway_deployment_id, usage.native_gateway_id,
                         usage.ts AS timestamp,
                         usage.organization_id,
                         usage.organization AS organization_name,
@@ -1230,21 +1260,106 @@ class PostgreSqlOpsDbProxy(
                         usage.user_id, usage.user_ref AS user_name,
                         usage.model_id, usage.model AS model_name,
                         usage.request_source, usage.runtime,
-                        usage.input_tokens AS prompt_tokens,
-                        usage.output_tokens AS completion_tokens,
-                        (usage.input_tokens + usage.cached_tokens
-                            + usage.output_tokens)::BIGINT AS total_tokens,
-                        usage.latency_ms, usage.status_code,
-                        usage.estimated_cost::DOUBLE PRECISION,
-                        (usage.usage_available AND (usage.estimated_cost > 0
-                         OR (usage.input_price_per_million IS NOT NULL
-                             AND usage.output_price_per_million IS NOT NULL))) AS cost_available,
-                        usage.error_message
+                        usage.apim_target_id,
+                        usage.gateway_deployment_id,
+                        usage.native_gateway_id,
+                        usage.native_instance_id
+                            AS native_gateway_instance_id,
+                        usage.is_managed AS gateway_is_managed,
+                        usage.apim_region,
+                        usage.api_revision,
+                        COALESCE(routed.input_tokens, usage.input_tokens)
+                            AS prompt_tokens,
+                        COALESCE(routed.output_tokens, usage.output_tokens)
+                            AS completion_tokens,
+                        COALESCE(
+                            routed.total_tokens,
+                            usage.input_tokens + usage.cached_tokens + usage.output_tokens
+                        )::BIGINT AS total_tokens,
+                        COALESCE(routed.latency_ms, usage.latency_ms)::BIGINT
+                            AS latency_ms,
+                        usage.status_code,
+                        COALESCE(
+                            routed.estimated_cost,
+                            usage.estimated_cost
+                        )::DOUBLE PRECISION AS estimated_cost,
+                        ((usage.usage_available OR COALESCE(routed.usage_available, FALSE))
+                         AND (COALESCE(routed.cost_available, FALSE)
+                          OR COALESCE(routed.estimated_cost, usage.estimated_cost) > 0
+                          OR (usage.input_price_per_million IS NOT NULL
+                              AND usage.output_price_per_million IS NOT NULL))) AS cost_available,
+                        usage.error_message, decision.router_id,
+                        decision.router_name, decision.router_version,
+                        decision.selected_model_id,
+                        decision.selected_model_name
                     FROM invocation_request_trace usage
+                    LEFT JOIN model_router_invocation decision
+                      ON decision.request_id = usage.request_id
+                    LEFT JOIN LATERAL (
+                        SELECT
+                        SUM(
+                            COALESCE(
+                                attempt_usage.input_tokens,
+                                (attempt->>'input_tokens')::BIGINT
+                            )
+                        )::BIGINT AS input_tokens,
+                        SUM(
+                            COALESCE(
+                                attempt_usage.output_tokens,
+                                (attempt->>'output_tokens')::BIGINT
+                            )
+                        )::BIGINT AS output_tokens,
+                        SUM(
+                            COALESCE(
+                                attempt_usage.input_tokens
+                                + attempt_usage.cached_tokens
+                                + attempt_usage.output_tokens,
+                                (attempt->>'total_tokens')::BIGINT
+                            )
+                        )::BIGINT AS total_tokens,
+                        SUM(
+                            COALESCE(
+                                attempt_usage.latency_ms,
+                                (attempt->>'latency_ms')::BIGINT
+                            )
+                        )::BIGINT AS latency_ms,
+                        SUM(
+                            COALESCE(
+                                attempt_usage.estimated_cost,
+                                (attempt->>'estimated_cost')::NUMERIC
+                            )
+                        )::DOUBLE PRECISION
+                            AS estimated_cost,
+                        BOOL_OR(
+                            attempt_usage.request_id IS NOT NULL
+                            OR attempt->>'total_tokens' IS NOT NULL
+                        ) AS usage_available,
+                        BOOL_OR(
+                            attempt_usage.estimated_cost IS NOT NULL
+                            OR attempt->>'estimated_cost' IS NOT NULL
+                        ) AS cost_available
+                        FROM jsonb_array_elements(decision.attempts) attempt
+                        LEFT JOIN token_usage attempt_usage
+                          ON attempt_usage.request_id
+                             = attempt->>'request_id'
+                             AND attempt_usage.usage_domain = 'apim'
+                        WHERE attempt->>'request_id' IS NOT NULL
+                    ) routed ON decision.request_id IS NOT NULL
                     WHERE usage.ts >= %s AND usage.ts < %s{filter_sql}{cursor_sql}
                         AND usage.usage_domain = 'apim'
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM model_router_invocation logical_decision
+                            CROSS JOIN LATERAL jsonb_array_elements(
+                                logical_decision.attempts
+                            ) logical_attempt
+                            WHERE logical_decision.request_id
+                                <> usage.request_id
+                              AND logical_attempt->>'request_id'
+                                = usage.request_id
+                        )
                     ORDER BY usage.ts DESC, usage.trace_id DESC LIMIT %s""",
-                [from_, to, *filter_parameters, *cursor_parameters, limit],
+                [from_, to, *filter_parameters, limit],
             ).fetchall()
         return cast(Sequence[dict[str, Any]], rows)
 
@@ -1255,7 +1370,6 @@ class PostgreSqlOpsDbProxy(
                         usage.request_id, usage.correlation_id,
                         usage.trace_id, usage.usage_available, usage.platform_outcome,
                         usage.gateway_status_code, usage.upstream_request_id,
-                        usage.apim_target_id, usage.gateway_deployment_id, usage.native_gateway_id,
                         usage.ts AS timestamp,
                         usage.organization_id,
                         usage.organization AS organization_name,
@@ -1266,25 +1380,48 @@ class PostgreSqlOpsDbProxy(
                         usage.user_id, usage.user_ref AS user_name,
                         usage.model_id, usage.model AS model_name,
                         usage.request_source, usage.runtime,
+                        usage.apim_target_id,
+                        usage.gateway_deployment_id,
+                        usage.native_gateway_id,
+                        usage.native_instance_id
+                            AS native_gateway_instance_id,
+                        usage.is_managed
+                            AS gateway_is_managed,
+                        usage.apim_region,
+                        usage.api_revision,
                         usage.input_tokens AS prompt_tokens,
                         usage.output_tokens AS completion_tokens,
-                        (usage.input_tokens + usage.cached_tokens
-                            + usage.output_tokens)::BIGINT AS total_tokens,
+                        (
+                            usage.input_tokens + usage.cached_tokens
+                            + usage.output_tokens
+                        )::BIGINT AS total_tokens,
                         usage.latency_ms, usage.status_code,
                         usage.estimated_cost::DOUBLE PRECISION,
-                            (usage.usage_available AND (usage.estimated_cost > 0
+                        (usage.usage_available AND (usage.estimated_cost > 0
                          OR (usage.input_price_per_million IS NOT NULL
-                                AND usage.output_price_per_million IS NOT NULL))) AS cost_available,
+                             AND usage.output_price_per_million IS NOT NULL)))
+                            AS cost_available,
                         usage.error_message, usage.provider, usage.workflow,
                         usage.run_id, usage.turn_index, usage.cached_tokens,
                         usage.cache_write_tokens, usage.estimated,
-                        usage.input_price_per_million, usage.cached_price_per_million,
-                        usage.cache_write_price_per_million, usage.output_price_per_million,
-                        usage.price_context_tier, usage.price_context_snapshot,
+                        usage.input_price_per_million,
+                        usage.cached_price_per_million,
+                        usage.cache_write_price_per_million,
+                        usage.output_price_per_million,
+                        usage.price_context_tier,
+                        usage.price_context_snapshot,
                         usage.ingest_source, usage.ingest_error,
                         usage.reconciled_at, usage.budget_admission,
-                        usage.model_admission
+                        usage.model_admission, decision.router_id,
+                        decision.router_name, decision.router_version,
+                        decision.selected_model_id,
+                        decision.selected_model_name,
+                        COALESCE(
+                            decision.attempts, '[]'::jsonb
+                        ) AS router_attempts
                     FROM invocation_request_trace usage
+                    LEFT JOIN model_router_invocation decision
+                        ON decision.request_id = usage.request_id
                     WHERE (usage.correlation_id = %s OR usage.request_id = %s
                         OR usage.trace_id = %s OR usage.id = %s)
                         AND usage.usage_domain = 'apim'
@@ -1294,7 +1431,28 @@ class PostgreSqlOpsDbProxy(
                     LIMIT 1""",
                 (request_id, request_id, request_id, request_id, request_id, request_id),
             ).fetchone()
-        return dict(row) if row is not None else None
+            if row is None:
+                return None
+            result = dict(row)
+            attempts = [dict(item) for item in result.get("router_attempts") or []]
+            attempt_ids = [item["request_id"] for item in attempts if item.get("request_id")]
+            usage_by_request: dict[str, Mapping[str, Any]] = {}
+            if attempt_ids:
+                usage_rows = connection.execute(
+                    """SELECT request_id, input_tokens, cached_tokens,
+                              cache_write_tokens, output_tokens,
+                              (input_tokens + cached_tokens + output_tokens)::BIGINT
+                                  AS total_tokens,
+                              estimated_cost::DOUBLE PRECISION AS estimated_cost
+                       FROM token_usage
+                       WHERE request_id = ANY(%s) AND usage_domain = 'apim'""",
+                    (attempt_ids,),
+                ).fetchall()
+                usage_by_request = {str(item["request_id"]): item for item in usage_rows}
+            attempts = enrich_router_attempts(attempts, usage_by_request)
+            apply_router_totals(result, attempts)
+            result["router_attempts"] = attempts
+        return result
 
     def observed_users(self) -> Sequence[dict[str, Any]]:
         """People who actually called the gateway, newest attribution wins.

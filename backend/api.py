@@ -28,6 +28,7 @@ from .http.model_platform import (
 from .http.model_platform import (
     publication_router as model_platform_publication_router,
 )
+from .http.model_router import router as model_router_router
 from .http.observability import router as observability_router
 from .http.service_dependencies import (
     application_access_service as _application_access_service,
@@ -89,6 +90,7 @@ def health() -> dict[str, str]:
 
 protected.routes.extend(assistant_router.routes)
 protected.routes.extend(governance_router.routes)
+protected.routes.extend(model_router_router.routes)
 protected.routes.extend(budgets_router.routes)
 protected.routes.extend(model_platform_protected_router.routes)
 protected.routes.extend(observability_router.routes)

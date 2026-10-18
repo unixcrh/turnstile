@@ -1197,6 +1197,7 @@ function RequestTrace({
       item.upstream_request_id,
       item.agent_name,
       item.model_name,
+      item.router_name,
       item.selected_model_name,
       item.user_name,
       item.project_name,
@@ -1296,7 +1297,7 @@ function RequestTrace({
             <ErrorState error={detail.error} />
           ) : (
             pricedDetail && (
-              <RequestTraceDetail request={pricedDetail} costAvailable={estimateRequestCost(pricedDetail, models) !== null} />
+              <RequestTraceDetail request={pricedDetail} costAvailable={estimateRequestCost(pricedDetail, models) !== null} models={models} />
             )
           )}
         </section>
@@ -1363,6 +1364,7 @@ const conditionOperatorLabels: Record<string, string> = {
   equals: "=",
   not_equals: "≠",
   contains: "contains",
+  matches_any: "matches_any",
   greater_than: ">",
   greater_than_or_equal: "≥",
   less_than: "<",
@@ -1373,17 +1375,22 @@ const conditionOperatorLabels: Record<string, string> = {
 function RequestTraceDetail({
   request,
   costAvailable,
+  models = [],
 }: {
   request: UsageRequestDetail;
   costAvailable: boolean;
+  models?: ManagedModel[];
 }) {
   const { user: sessionUser } = useAuth();
-  const selectedModelId = request.selected_model_id ?? request.model_id;
+  const selectedModelId = request.selected_model_id ?? (request.router_name ? request.model_id : null);
   const backendPool = useQuery({
     ...finopsQueries.modelBackendPool(selectedModelId),
-    enabled: Boolean(selectedModelId),
+    enabled: Boolean(request.router_name && selectedModelId),
   });
-
+  const routerConfig = useQuery({
+    ...finopsQueries.modelRouter(request.router_id),
+    enabled: Boolean(request.router_id && sessionUser?.role === "owner"),
+  });
   const errorMessage = request.ingest_source === "policy"
     ? request.error_message === "API policy denied: Model is not assigned to this user"
       ? "该人员无权使用此模型"
@@ -1432,14 +1439,34 @@ function RequestTraceDetail({
   // identical to one that was actually checked against a budget.
   const admissionWarning = budgetAdmissionWarnings[request.budget_admission ?? ""];
   const modelWarning = modelAdmissionWarnings[request.model_admission ?? ""];
-
-
-
-
-
-
-
-
+  const routerTotalLatency = request.router_attempts.reduce(
+    (total, attempt) => total + (attempt.latency_ms ?? 0), 0,
+  );
+  const routerTotalTokens = request.router_attempts.reduce(
+    (total, attempt) => total + (attempt.total_tokens ?? 0), 0,
+  );
+  const routerTotalCost = request.router_attempts.reduce(
+    (total, attempt) => total + (attempt.estimated_cost ?? 0), 0,
+  );
+  const routerStrategy = request.router_attempts[0]?.strategy_type;
+  const routerCandidateAttempts = request.router_attempts.filter(
+    (attempt) => attempt.attempt_role !== "routing_decision",
+  );
+  const conditionEvaluations = request.router_attempts.flatMap(
+    (attempt) => attempt.condition_evaluations ?? [],
+  ).filter((evaluation, index, all) =>
+    all.findIndex((candidate) => candidate.node_id === evaluation.node_id) === index
+  );
+  const tracedRouterDefinition = routerConfig.data
+    && routerConfig.data.version === request.router_version
+    && !routerConfig.data.has_unpublished_changes
+    ? routerConfig.data.definition
+    : null;
+  const tracedConditions = new Map(
+    (tracedRouterDefinition?.nodes ?? [])
+      .filter((node) => node.type === "condition" && node.condition)
+      .map((node) => [node.id, node.condition!]),
+  );
   const poolMembers = backendPool.data?.members ?? [];
   const poolPriorities = new Set(poolMembers.map((member) => member.priority));
   const poolWeights = new Set(poolMembers.map((member) => member.weight));
@@ -1460,9 +1487,9 @@ function RequestTraceDetail({
     ? selectedPoolMember.priority === primaryPoolPriority ? "主 Runtime" : "备用 Runtime"
     : null;
   return <div className="trace-detail-content">
-    <div className="trace-detail-hero">
+    <div className={`trace-detail-hero ${request.router_name ? "has-router" : ""}`}>
       <span className={request.status_code == null ? "" : requestTraceFailed(request) ? "failed" : "success"}>{request.status_code ?? "未知"}</span>
-
+      {request.router_name && <div className="trace-detail-router"><small>Router</small><b>{request.router_name} · v{request.router_version}</b></div>}
       <div><b>{request.model_name}</b><small>{new Date(request.timestamp).toLocaleString(getIntlLocale())}</small></div>
       <strong>{formatLatency(request.latency_ms)}</strong>
     </div>
@@ -1473,7 +1500,70 @@ function RequestTraceDetail({
       ["Turnstile", request.platform_outcome === "failed" ? "失败" : request.platform_outcome === "succeeded" ? "成功" : "未知"],
       ["Gateway", request.gateway_status_code == null ? request.ingest_source === "platform" ? "网关记录未匹配" : "未知" : String(request.gateway_status_code)],
     ]} />}
-
+    {request.router_name && <section className="trace-detail-section trace-router-decision">
+      <div className="trace-section-heading"><h3>Router 决策</h3><strong>{request.router_name} · v{request.router_version}</strong></div>
+      <div className="trace-routing-chain" aria-label="两阶段路由执行链">
+        <div className="trace-routing-stage" data-layer="router">
+          <div className="trace-routing-stage-label"><span>1</span><small>TURNSTILE</small></div>
+          <div className="trace-routing-stage-body">
+            <div><Workflow size={15} /><b>Router 选择逻辑模型</b><strong>请求证据</strong></div>
+            <p>{routerStrategyLabels[routerStrategy ?? ""] ?? "历史优先级策略"} → {request.selected_model_name ?? request.model_name}</p>
+            {conditionEvaluations.length > 0 && <div className="trace-routing-conditions">
+              {conditionEvaluations.map((evaluation) => {
+                const configuredCondition = tracedConditions.get(evaluation.node_id);
+                const comparisonValue = configuredCondition?.value;
+                return <span key={evaluation.node_id} data-matched={evaluation.matched}>
+                  <code>{evaluation.field} {conditionOperatorLabels[evaluation.operator] ?? evaluation.operator}{comparisonValue == null ? "" : ` ${String(comparisonValue)}`}</code>
+                  <b>{evaluation.matched ? "命中" : "未命中"}</b>
+                </span>;
+              })}
+            </div>}
+          </div>
+        </div>
+        <div className="trace-routing-stage" data-layer="apim">
+          <div className="trace-routing-stage-label"><span>2</span><small>AZURE APIM</small></div>
+          <div className="trace-routing-stage-body">
+            <div><Network size={15} /><b>{backendPool.data ? "原生 Pool 选择物理 Runtime" : "APIM 选择物理 Runtime"}</b><strong>{backendPool.data ? "当前 Pool 映射" : "请求证据"}</strong></div>
+            <p>{request.selected_model_name ?? request.model_name} → {request.runtime}</p>
+            <dl className="trace-routing-pool-facts">
+              <div><dt>部署模式</dt><dd>{backendPool.isLoading ? "正在读取" : poolMode ?? "无生效 Pool"}</dd></div>
+              <div><dt>成员角色</dt><dd>{selectedPoolRole ?? "—"}</dd></div>
+              <div><dt>APIM 优先级</dt><dd>{selectedPoolMember ? selectedPoolMember.priority + 1 : "—"}</dd></div>
+            </dl>
+            <small>物理 Runtime 来自该请求的 Event Hub 记录；模式与优先级来自当前生效的 APIM 后端池配置。</small>
+          </div>
+        </div>
+      </div>
+      <dl className="trace-router-summary">
+        <div><dt>最终模型</dt><dd>{request.selected_model_name ?? request.model_name}</dd></div>
+        <div><dt>选择策略</dt><dd>{routerStrategyLabels[routerStrategy ?? ""] ?? "历史优先级策略"}</dd></div>
+        <div><dt>尝试次数</dt><dd>{routerCandidateAttempts.length}</dd></div>
+        <div><dt>总决策耗时</dt><dd>{formatLatency(routerTotalLatency)}</dd></div>
+        <div><dt>总 Token</dt><dd>{routerTotalTokens.toLocaleString(getIntlLocale())}</dd></div>
+        <div><dt>总估算费用</dt><dd>{costAvailable ? currency.format(routerTotalCost) : "未计价"}</dd></div>
+      </dl>
+      <div className="trace-router-attempts" role="list" aria-label="模型路由器尝试链">
+        {request.router_attempts.map((attempt) => <div key={`${attempt.sequence}-${attempt.request_id ?? attempt.model_id}`} role="listitem" data-outcome={attempt.outcome}>
+          <span>{attempt.sequence}</span>
+          <div className="trace-router-attempt-identity"><b>{attempt.attempt_role === "routing_decision" ? "判路由调用" : attempt.outcome === "succeeded" ? "最终选中" : "候选调用"} · {attempt.model_name}</b><code>{attempt.request_id ?? "未发起模型请求"}</code>{attempt.decision_basis && routerDecisionLabels[attempt.decision_basis] && <small>{routerDecisionLabels[attempt.decision_basis]}</small>}{attempt.outcome !== "succeeded" && attempt.reason && <em>{attempt.reason}</em>}</div>
+          <dl className="trace-router-attempt-metrics"><div><dt>优先级</dt><dd>{attempt.priority ?? "—"}</dd></div><div><dt>权重</dt><dd>{attempt.weight ?? "—"}</dd></div><div><dt>Token</dt><dd>{attempt.total_tokens == null ? "—" : attempt.total_tokens.toLocaleString(getIntlLocale())}</dd></div><div><dt>费用</dt><dd>{attempt.estimated_cost == null ? "—" : currency.format(attempt.estimated_cost)}</dd></div><div><dt>状态</dt><dd>{attempt.status_code ? `HTTP ${attempt.status_code}` : attempt.outcome === "cost_limit_exceeded" ? "成本约束" : attempt.outcome === "unavailable" ? "不可用" : "未调用"}</dd></div><div><dt>耗时</dt><dd>{attempt.latency_ms == null ? "—" : formatLatency(attempt.latency_ms)}</dd></div></dl>
+          {attempt.attempt_role === "routing_decision" && attempt.decision_system && <details className="trace-router-decision-evidence">
+            <summary>判路由证据</summary>
+            <dl>
+              <div><dt>System SHA-256</dt><dd>{attempt.decision_system_sha256 ?? "—"}</dd></div>
+              <div><dt>输入</dt><dd>{attempt.decision_input_chars ?? 0} 字符 · {attempt.decision_input_sha256 ?? "—"}</dd></div>
+              <div><dt>输出</dt><dd>{attempt.decision_response_chars ?? 0} 字符 · {attempt.decision_response_sha256 ?? "—"}</dd></div>
+              {attempt.decision_protocol && <div><dt>决策协议</dt><dd>{attempt.decision_protocol === "system_one" ? "System One" : "LLM JSON"}</dd></div>}
+              {attempt.decision_confidence != null && <div><dt>置信度</dt><dd>{`${(attempt.decision_confidence * 100).toFixed(1)}%`}</dd></div>}
+            </dl>
+            {attempt.decision_probabilities && Object.keys(attempt.decision_probabilities).length > 0 && <dl>
+              {Object.entries(attempt.decision_probabilities).map(([candidateId, prob]) => <div key={candidateId}><dt>{models.find((item) => item.id === candidateId)?.display_name ?? candidateId.slice(0, 8)}</dt><dd>{(prob * 100).toFixed(1)}%</dd></div>)}
+            </dl>}
+            <pre>{attempt.decision_system}</pre>
+          </details>}
+        </div>)}
+      </div>
+    </section>}
     <section className="trace-detail-section">
       <h3>处理链路</h3>
       <div className="trace-path">
@@ -1515,7 +1605,7 @@ function RequestTraceDetail({
 
 export function RequestCostCalculation({ request }: { request: UsageRequestDetail }) {
   const calculation = requestCostCalculation(request);
-  if (!calculation) return <span className="trace-cost-unavailable"></span>;
+  if (!calculation) return <span className="trace-cost-unavailable">{request.router_attempts.length ? "多次调用费用见路由明细" : request.input_price_per_million === undefined ? "当前后端未提供历史单价" : "历史单价不可用"}</span>;
   const number = (value: number) => value.toLocaleString(getIntlLocale(), { maximumFractionDigits: 0 });
   const rate = (value: number) => value.toLocaleString(getIntlLocale(), { minimumFractionDigits: 2, maximumFractionDigits: 20 });
   const amount = (value: number) => value.toLocaleString(getIntlLocale(), { minimumFractionDigits: 8, maximumFractionDigits: 8 });
@@ -1578,7 +1668,7 @@ export function TraceRow({
         {item.status_code ?? "未知"}
       </span>
       <div>
-        <b>{item.model_name}</b>
+        <b>{item.router_name ? `${item.router_name} · v${item.router_version} · ${item.selected_model_name ?? item.model_name}` : item.model_name}</b>
         <code title={`Correlation ID: ${item.correlation_id ?? "未知"}`}>{attempt && attempt.total > 1 ? `#${attempt.index}/${attempt.total} · ${item.request_id}` : item.request_id}</code>
       </div>
       <small>{state === "measured" ? `${compact.format(item.total_tokens)} tokens` : placeholder}</small>

@@ -30,22 +30,22 @@ def test_invocation_console_preserves_owner_directory_and_current_selection() ->
     assert 'sessionUser.role === "owner"' in source
     assert 'useState(sessionUser?.email ?? users[0]?.id ?? "")' in source
     assert "if (users.some((person) => person.id === userId)) return" in source
-    assert "assignedModelRouters" not in source
+    assert "finopsQueries.assignedModelRouters(userId)" in source
     assert 'items={users}' in source
 
 
 def test_invocation_and_request_trace_use_direct_models() -> None:
     source = read_apim_dashboard_source()
 
-    assert "runtime_id: explicitGateway ? undefined : model.runtime_id" in source
-    assert "model_id: model.id" in source
+    assert "runtime_id: explicitGateway ? undefined : model!.runtime_id" in source
+    assert "model_id: model!.id" in source
     assert "gateway_profile_id: explicitGateway ? gatewaySelection.targetId! : undefined" in source
     assert (
         "gateway_deployment_id: explicitGateway ? gatewaySelection.deploymentId! : undefined"
         in source
     )
-    assert "assignedModelRouters" not in source
-    assert "router_id" not in source
+    assert "finopsQueries.assignedModelRouters(userId)" in source
+    assert "router_id: routerId" in source
 
 
 def test_request_trace_kpis_are_diagnostic_not_executive_duplicates() -> None:
@@ -122,7 +122,10 @@ def test_request_trace_cost_formula_uses_the_recorded_request() -> None:
     assert 'role="math"' in calculation
     assert "calculation.matchesRecordedCost" in calculation
     assert (
-        'if (!calculation) return <span className="trace-cost-unavailable"></span>' in calculation
+        'if (!calculation) return <span className="trace-cost-unavailable">'
+        '{request.router_attempts.length ? "多次调用费用见路由明细" : '
+        'request.input_price_per_million === undefined ? "当前后端未提供历史单价" : '
+        '"历史单价不可用"}</span>' in calculation
     )
     css = read_frontend_styles()
     assert ".trace-cost-expression { display: flex; flex-wrap: wrap;" in css

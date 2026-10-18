@@ -27,7 +27,8 @@ New forward-only product upgrades are `017_budget_terminal_observation`,
 `020_failed_publication_spec`, `021_usd_budget_reservations`, `022_subscription_tags`,
 `023_usd_reservation_resolution`, `024_gateway_usage_attribution`,
 `025_usage_cost_component_prices`, `026_invocation_trace_service_identity`,
-`027_product_schema_alignment` and `028_product_index_alignment`. They preserve applied migration
+`027_product_schema_alignment`, `028_product_index_alignment` and
+`029_model_intelligent_router`. They preserve applied migration
 bytes and existing usage, financial/audit history and routing identities. The first two add
 immutable admission-bound observations and explicit Owner approval records; elapsed time or
 an HTTP failure alone is not permission to refund unknown usage. Display names no longer
@@ -38,7 +39,7 @@ Run the migration-source and schema-documentation tests locally. On an accuratel
 PostgreSQL target, additionally verify parsing, unchanged old checksums/rows, immutable/FK
 constraints, same-approval idempotency, concurrent claims and the ordinary API outcomes.
 SQL source checks do not prove applied migrations, isolation, request attribution or refunds.
-Do not initialize a shared database or import model intelligent-routing schema.
+Do not initialize a shared database.
 
 USD upgrades add exact `NUMERIC(30,14)` reservations, immutable admission prices and formal
 price-bound charges. Missing/estimated prices remain unknown, not zero. Owner-approved releases

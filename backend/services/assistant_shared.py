@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from turnstile_core.domain.assistant_models import ChartSpec
+from turnstile_core.domain.assistant_models import AssistantRouterProposal, ChartSpec
 
 HISTORY_LIMIT = 50
 TITLE_LENGTH = 60
@@ -40,5 +40,6 @@ def clean_title(raw: str) -> str | None:
 class ToolOutcome:
     payload: dict[str, Any]
     chart: ChartSpec | None = None
+    router_proposal: AssistantRouterProposal | None = None
     summary: str = ""
     row_count: int = 0

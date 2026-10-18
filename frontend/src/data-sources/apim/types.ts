@@ -140,9 +140,9 @@ export type UsageRequestSummary = {
   estimated_cost: number
   cost_available?: boolean | null
   error_message: string | null
-
-
-
+  router_id: string | null
+  router_name: string | null
+  router_version: number | null
   selected_model_id: string | null
   selected_model_name: string | null
 }
@@ -173,7 +173,7 @@ export type UsageRequestDetail = UsageRequestSummary & {
   ingest_source: "eventhub" | "backfill" | "gateway" | "policy" | "platform"
   budget_admission: string | null
   model_admission: string | null
-
+  router_attempts: ModelRouterAttempt[]
 }
 
 export type UsageAnomaly = {
@@ -882,39 +882,197 @@ export type ModelAvailabilityCommand = {
 export type ModelAvailabilityList = { items: ModelAvailabilityReadback[] }
 export type ModelAvailabilityAccepted = { operation: ModelAvailabilityOperation; status_url: string }
 
+export type ModelRouterStatus = "draft" | "published" | "disabled"
+export type ModelRouterNodeType = "start" | "condition" | "candidate_models" | "strategy" | "priority" | "fallback" | "output"
+export type ModelRouterStrategyType = "priority" | "weighted" | "model_based"
+export type ModelRouterDecisionProtocol = "chat_json" | "system_one"
+export type ModelRouterReasoningEffort = "none" | "low" | "medium" | "high"
+export type ModelRouterConditionOperator = "equals" | "not_equals" | "contains" | "matches_any" | "greater_than" | "greater_than_or_equal" | "less_than" | "less_than_or_equal" | "exists"
+export type ModelRouterFallbackEvent = "error" | "timeout" | "rate_limit" | "quality"
 
+export type ModelRouterCandidate = {
+  model_id: string
+}
 
+export type ModelRouterStrategyModel = {
+  model_id: string
+  priority: number
+  weight: number
+  max_latency_ms: number | null
+  max_cost_per_million: number | null
+  description: string
+}
 
+export type ModelRouterNode = {
+  id: string
+  type: ModelRouterNodeType
+  label: string
+  position: { x: number; y: number }
+  condition: {
+    field: string
+    operator: ModelRouterConditionOperator
+    value: string | number | boolean | null
+  } | null
+  candidates: ModelRouterCandidate[]
+  strategy_type: ModelRouterStrategyType | null
+  model_configs: ModelRouterStrategyModel[]
+  routing_model_id: string | null
+  decision_prompt: string | null
+  max_prompt_chars: number
+  decision_reasoning_effort?: ModelRouterReasoningEffort | null
+  fallback_on: ModelRouterFallbackEvent[]
+  timeout_ms: number | null
+}
 
+export type ModelRouterEdge = {
+  id: string
+  source: string
+  target: string
+  source_handle: string | null
+  label: string
+}
 
+export type ModelRouterDefinition = {
+  schema_version: 2
+  presentation_version: number
+  default_model_id: string | null
+  nodes: ModelRouterNode[]
+  edges: ModelRouterEdge[]
+}
 
+export type ModelRouterWrite = {
+  name: string
+  description: string
+  definition: ModelRouterDefinition
+}
 
+export type ModelRouter = ModelRouterWrite & {
+  id: string
+  status: ModelRouterStatus
+  version: number
+  has_unpublished_changes: boolean
+  created_at: string
+  updated_at: string
+  published_at: string | null
+  created_by: string
+  updated_by: string
+}
 
+export type ModelRouterModelReference = Pick<ManagedModel,
+  "id" | "model_key" | "display_name" | "provider_name" | "family_key"
+> & { status: "available" | "disabled" | "removed" }
+export type ModelRouterList = { items: ModelRouter[]; model_references?: ModelRouterModelReference[] }
+export type ModelRouterModelCatalog = { model_ids: string[] }
+export type ModelRouterDecisionPreview = {
+  system: string
+  user: string
+  sample_truncated: boolean
+  candidates: Array<{
+    model_id: string
+    display_name: string
+    provider_name: string
+    description: string
+    capabilities: string[]
+    context_window: number | null
+    input_cost_per_million: number | null
+    output_cost_per_million: number | null
+    priority: number
+    weight: number
+    max_latency_ms: number | null
+    max_cost_per_million: number | null
+  }>
+  routing_model_id: string
+  routing_model_name: string
+  decision_protocol?: ModelRouterDecisionProtocol
+  decision_reasoning_effort?: ModelRouterReasoningEffort | null
+  is_default_prompt: boolean
+  has_placeholder: boolean
+  models_without_description: string[]
+  chars: number
+}
+export type ModelRouterDecisionTrialResult = {
+  routing_model_id: string
+  routing_model_name: string
+  decision_protocol: ModelRouterDecisionProtocol
+  selected_model_id: string
+  selected_model_name: string
+  fallback_used: boolean
+  rationale: string | null
+  confidence: number | null
+  probabilities: Array<{
+    model_id: string
+    display_name: string
+    probability: number
+  }>
+  latency_ms: number
+  input_tokens: number | null
+  output_tokens: number | null
+  total_tokens: number | null
+  estimated_cost: number | null
+  sample_truncated: boolean
+  decision_input_chars: number
+}
+export type ModelRouterAssignedList = { items: ModelRouter[] }
 
+export type ModelRouterAssignment = {
+  router_id: string
+  user_id: string
+  assigned: boolean
+}
 
+export type ModelRouterAttempt = {
+  sequence: number
+  attempt_role?: "routing_decision" | "candidate"
+  model_id: string
+  model_name: string
+  request_id: string | null
+  outcome: "unavailable" | "cost_limit_exceeded" | "failed" | "latency_exceeded" | "succeeded"
+  status_code: number | null
+  latency_ms: number | null
+  reason: string | null
+  priority: number | null
+  weight: number | null
+  max_latency_ms: number | null
+  max_cost_per_million: number | null
+  strategy_type: ModelRouterStrategyType
+  fallback_trigger: string | null
+  decision_basis: string | null
+  input_tokens: number | null
+  cached_tokens: number | null
+  cache_write_tokens: number | null
+  output_tokens: number | null
+  total_tokens: number | null
+  estimated_cost: number | null
+  decision_protocol?: ModelRouterDecisionProtocol | null
+  decision_candidates?: string[]
+  selected_candidate_model_id?: string | null
+  prompt_truncated?: boolean | null
+  decision_system?: string | null
+  decision_system_sha256?: string | null
+  decision_input_chars?: number | null
+  decision_input_sha256?: string | null
+  decision_response_chars?: number | null
+  decision_response_sha256?: string | null
+  decision_confidence?: number | null
+  decision_probabilities?: Record<string, number> | null
+  condition_evaluations?: Array<{
+    node_id: string
+    field: string
+    operator: ModelRouterConditionOperator
+    matched: boolean
+  }>
+}
 
+export type ModelRouterValidationIssue = {
+  code: string
+  message: string
+  node_id: string | null
+}
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+export type ModelRouterValidation = {
+  valid: boolean
+  issues: ModelRouterValidationIssue[]
+}
 
 export type ModelConnectionCreate = {
   gateway_profile_id: string
@@ -1654,12 +1812,12 @@ export type ModelInvocationResponse = {
     estimated: boolean
   } | null
   estimated_cost: number | null
-
-
-
+  router_id: string | null
+  router_name: string | null
+  router_version: number | null
   selected_model_id: string | null
   selected_model_name: string | null
-
+  router_attempts: ModelRouterAttempt[]
 }
 
 export type DecisionQuestion =

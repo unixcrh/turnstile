@@ -144,6 +144,7 @@ from .service_dependencies import (
     Authorization,
     ControlPlaneService,
     ModelAvailabilityServiceDependency,
+    ModelRouterExecutionServiceDependency,
     RuntimeService,
 )
 from .session import (
@@ -1777,11 +1778,14 @@ def invoke_decision(
 def invoke_model(
     request: ModelInvocationRequest,
     service: RuntimeService,
+    router_service: ModelRouterExecutionServiceDependency,
     identity: CurrentSession,
     repository: Repository,
     settings: Config,
 ) -> ModelInvocationResponse:
     request = _bind_invocation_identity(request, identity, repository, settings)
+    if request.router_id is not None:
+        return router_service.invoke(request)
     return service.invoke(request)
 
 

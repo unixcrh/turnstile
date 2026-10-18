@@ -56,14 +56,15 @@ import type {
   MultiTargetPublicationCreate,
   MultiTargetRollout,
   MultiTargetRolloutList,
-
-
-
-
-
-
-
-
+  ModelRouter,
+  ModelRouterAssignedList,
+  ModelRouterAssignment,
+  ModelRouterDecisionPreview,
+  ModelRouterDecisionTrialResult,
+  ModelRouterList,
+  ModelRouterModelCatalog,
+  ModelRouterValidation,
+  ModelRouterWrite,
   OptimizationEvent,
   PeopleBudgetFilter,
   RunDetail,
@@ -251,11 +252,103 @@ function normalizeApimTargetTopologies(
   }
 }
 
+type LegacyModelRouterCandidate = {
+  model_id: string
+  priority: number
+  weight: number
+  max_latency_ms: number | null
+  max_cost_per_million: number | null
+  enabled: boolean
+  note: string
+}
 
+function legacyModelRouterWrite(value: ModelRouterWrite) {
+  const nodesById = new Map(value.definition.nodes.map((node) => [node.id, node]))
+  const strategyByCandidateId = new Map<string, ModelRouterWrite["definition"]["nodes"][number]>()
+  for (const edge of value.definition.edges) {
+    const source = nodesById.get(edge.source)
+    const target = nodesById.get(edge.target)
+    if (source?.type === "candidate_models" && target?.type === "strategy") {
+      strategyByCandidateId.set(source.id, target)
+    }
+  }
+  for (const node of value.definition.nodes) {
+    if (node.type !== "strategy") continue
+    if (node.strategy_type !== "priority") {
+      throw new ApiError(
+        409,
+        "The connected API supports only Priority Router drafts. Upgrade the API before saving Weighted or Model-based strategies.",
+      )
+    }
+  }
 
+  return {
+    name: value.name,
+    description: value.description,
+    definition: {
+      schema_version: 1,
+      default_model_id: value.definition.default_model_id,
+      nodes: value.definition.nodes.map((node) => {
+        const strategy = node.type === "candidate_models"
+          ? strategyByCandidateId.get(node.id)
+          : undefined
+        const configs = new Map(
+          (strategy?.model_configs ?? []).map((config) => [config.model_id, config]),
+        )
+        const candidates: LegacyModelRouterCandidate[] = node.type === "candidate_models"
+          ? node.candidates.map((candidate, index) => {
+              const config = configs.get(candidate.model_id)
+              return {
+                model_id: candidate.model_id,
+                priority: config?.priority ?? index + 1,
+                weight: config?.weight ?? 100,
+                max_latency_ms: config?.max_latency_ms ?? null,
+                max_cost_per_million: config?.max_cost_per_million ?? null,
+                enabled: true,
+                note: "",
+              }
+            })
+          : []
+        return {
+          id: node.id,
+          type: node.type === "strategy" ? "priority" : node.type,
+          label: node.label,
+          position: node.position,
+          condition: node.condition,
+          candidates,
+          fallback_on: node.fallback_on,
+          timeout_ms: node.timeout_ms,
+        }
+      }),
+      edges: value.definition.edges,
+    },
+  }
+}
 
-
-
+function isLegacyModelRouterSchemaError(error: unknown) {
+  if (!(error instanceof ApiError) || error.status !== 422) return false
+  const payloadStart = error.message.indexOf("{")
+  if (payloadStart < 0) return false
+  try {
+    const payload = JSON.parse(error.message.slice(payloadStart)) as {
+      detail?: Array<{
+        type?: string
+        loc?: unknown[]
+        input?: unknown
+        ctx?: { expected?: unknown }
+      }>
+    }
+    return payload.detail?.some((issue) =>
+      issue.type === "literal_error"
+      && issue.input === 2
+      && issue.ctx?.expected === "1"
+      && issue.loc?.at(-2) === "definition"
+      && issue.loc?.at(-1) === "schema_version",
+    ) ?? false
+  } catch {
+    return false
+  }
+}
 
 function isUnsupportedOpenAICompatibleSchema(error: unknown) {
   if (!(error instanceof ApiError) || error.status !== 422) return false
@@ -298,7 +391,17 @@ async function requireOpenAICompatibleApi<T>(operation: Promise<T>) {
   }
 }
 
-
+async function saveModelRouter(value: ModelRouterWrite, id?: string) {
+  const path = `/api/v1/model-routers${id ? `/${encodeURIComponent(id)}` : ""}`
+  const method = id ? "PUT" : "POST"
+  try {
+    return await writeJson<ModelRouter>(path, value, method)
+  } catch (error) {
+    if (!isLegacyModelRouterSchemaError(error)) throw error
+    const router = await writeJson<ModelRouter>(path, legacyModelRouterWrite(value), method)
+    return { ...router, definition: value.definition }
+  }
+}
 
 const normalizeGatewayPublication = (publication: GatewayPublication): GatewayPublication => ({
   ...publication,
@@ -477,19 +580,70 @@ export const dataSource = {
   retryApimOnboarding: (id: string) => request<GatewayReleaseOperationAccepted>(
     `/api/v1/model-management/apim-onboarding/${encodeURIComponent(id)}/retry`, { method: "POST" },
   ),
-
-
-
-
-
-
-
-
-
-
-
-
-
+  modelRouters: () => request<ModelRouterList>("/api/v1/model-routers"),
+  modelRouterCatalog: () => request<ModelRouterModelCatalog>(
+    "/api/v1/model-routers/catalog",
+  ),
+  previewModelRouterDecision: (
+    definition: ModelRouterWrite["definition"],
+    strategyNodeId: string,
+    samplePrompt: string,
+  ) => writeJson<ModelRouterDecisionPreview>(
+    "/api/v1/model-routers/decision-preview",
+    {
+      definition,
+      strategy_node_id: strategyNodeId,
+      sample_prompt: samplePrompt,
+    },
+  ),
+  trialModelRouterDecision: (
+    definition: ModelRouterWrite["definition"],
+    strategyNodeId: string,
+    samplePrompt: string,
+  ) => writeJson<ModelRouterDecisionTrialResult>(
+    "/api/v1/model-routers/decision-trial",
+    {
+      definition,
+      strategy_node_id: strategyNodeId,
+      sample_prompt: samplePrompt,
+    },
+  ),
+  assignedModelRouters: (userId?: string) => request<ModelRouterAssignedList>(
+    `/api/v1/model-routers/assigned${userId ? `?${new URLSearchParams({ user_id: userId })}` : ""}`,
+  ),
+  modelRouterAssignees: (id: string) => request<string[]>(
+    `/api/v1/model-routers/${encodeURIComponent(id)}/assignees`,
+  ),
+  setModelRouterAssignment: (id: string, userId: string, assigned: boolean) =>
+    writeJson<ModelRouterAssignment>(
+      `/api/v1/model-routers/${encodeURIComponent(id)}/assignment`,
+      { user_id: userId, assigned },
+      "PUT",
+    ),
+  modelRouter: (id: string) => request<ModelRouter>(
+    `/api/v1/model-routers/${encodeURIComponent(id)}`,
+  ),
+  saveModelRouter: saveModelRouter,
+  duplicateModelRouter: (id: string, name: string) => writeJson<ModelRouter>(
+    `/api/v1/model-routers/${encodeURIComponent(id)}/duplicate`,
+    { name },
+  ),
+  validateModelRouter: (id: string) => writeJson<ModelRouterValidation>(
+    `/api/v1/model-routers/${encodeURIComponent(id)}/validate`,
+    {},
+  ),
+  publishModelRouter: (id: string) => writeJson<ModelRouter>(
+    `/api/v1/model-routers/${encodeURIComponent(id)}/publish`,
+    {},
+  ),
+  disableModelRouter: (id: string) => writeJson<ModelRouter>(
+    `/api/v1/model-routers/${encodeURIComponent(id)}/disable`,
+    {},
+  ),
+  deleteModelRouter: (id: string) => request<void>(
+    `/api/v1/model-routers/${encodeURIComponent(id)}`,
+    { method: "DELETE" },
+  ),
   saveGateway: (value: Record<string, unknown>, id?: string) => saveRegistry("/api/v1/model-management/gateways", value, id),
   renameGateway: (id: string, name: string) => request<ModelRegistry | undefined>(
     `/api/v1/model-management/gateways/${encodeURIComponent(id)}/name`,

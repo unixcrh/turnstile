@@ -14,7 +14,7 @@ import {
 import { useAuth } from "../../providers/auth-provider"
 import { useTimezone } from "../../providers/timezone-provider"
 import { finopsKeys } from "../../data-sources/apim/queries"
-
+import type { ModelRouter } from "../../data-sources/apim/types"
 import type {
   AssistantReply,
   AssistantSource,
@@ -30,7 +30,9 @@ export type Exchange = {
   error: string | null
 }
 
-
+export type RouterProposalResult =
+  | { status: "created"; router: ModelRouter }
+  | { status: "error"; message: string }
 
 /** Only the text turns go back to the model. Charts are rebuilt by tools, never replayed
  *  through the context window, which keeps a long conversation from growing unboundedly. */
@@ -78,7 +80,9 @@ export function useAssistantController({
   const [conversationTitle, setConversationTitle] = useState<string | undefined>()
   const [loadingConversation, setLoadingConversation] = useState<string | null>(null)
   const [pinTarget, setPinTarget] = useState<{ chart: ChartSpec; question: string } | null>(null)
-
+  const [routerProposalResults, setRouterProposalResults] = useState<
+    Record<string, RouterProposalResult>
+  >({})
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const queryClient = useQueryClient()
   const { user } = useAuth()
@@ -136,14 +140,36 @@ export function useAssistantController({
     },
   })
 
-
+  const confirmRouterProposal = useMutation({
+    mutationFn: ({ conversationId: proposalConversationId, proposalId }: {
+      conversationId: string
+      proposalId: string
+    }) => assistantApi.confirmRouterProposal(proposalConversationId, proposalId),
+    onSuccess: (router, variables) => {
+      setRouterProposalResults((current) => ({
+        ...current,
+        [variables.proposalId]: { status: "created", router },
+      }))
+      void queryClient.invalidateQueries({ queryKey: finopsKeys.modelRouters })
+      queryClient.setQueryData(finopsKeys.modelRouter(router.id), router)
+    },
+    onError: (error, variables) => {
+      setRouterProposalResults((current) => ({
+        ...current,
+        [variables.proposalId]: {
+          status: "error",
+          message: error instanceof Error ? error.message : "创建路由器草稿失败",
+        },
+      }))
+    },
+  })
 
   const reset = useCallback(() => {
     setExchanges([])
     setConversationId(undefined)
     setConversationTitle(undefined)
     setQuestion("")
-
+    setRouterProposalResults({})
     inputRef.current?.focus()
   }, [])
 
@@ -239,8 +265,8 @@ export function useAssistantController({
     openConversation, loadingConversation,
     removeConversation,
     pin, pinTarget, setPinTarget, pinnedReports,
-
-
+    canManageRouters: source === "apim" && user?.role === "owner",
+    confirmRouterProposal, routerProposalResults,
     inputRef,
   }
 }

@@ -60,4 +60,4 @@ The independently gated v2 policy selects complete formal evidence, application 
 
 The deployment creates Turnstile infrastructure. It does not create Azure AI Foundry projects or provider model deployments. Provider resources remain customer-owned and are connected after installation.
 
-APIM native backend pools provide failover, balanced, and weighted distribution. Model Intelligent Router is outside the current release.
+APIM native backend pools provide failover, balanced, and weighted distribution, and Model Intelligent Router provides rule-based, weighted, and model-based logical routing.

@@ -45,7 +45,8 @@ schemas:
           $ref: ../../openapi.yaml#/components/schemas/AssistantTurn
         type: array
         maxItems: 20
-        description: 'Prior text turns only. Charts are deliberately not replayed through the context
+        description: 'Prior text turns only. Charts are deliberately not replayed
+          through the context
 
           window, so a long conversation does not grow unboundedly.
 
@@ -126,7 +127,8 @@ schemas:
         type: integer
         minimum: 0.0
         default: 0
-        description: 'The assistant''s own spend. It calls the same gateway as every other caller and
+        description: 'The assistant''s own spend. It calls the same gateway as every
+          other caller and
 
           is attributed in the dashboard it analyses.
 
@@ -172,9 +174,11 @@ schemas:
     - tool
     - arguments
     title: ChartQuery
-    description: 'Everything needed to reproduce a chart, and nothing else. `arguments` has already
+    description: 'Everything needed to reproduce a chart, and nothing else. `arguments`
+      has already
 
-      been validated against the tool''s own argument model, so replaying it cannot widen
+      been validated against the tool''s own argument model, so replaying it cannot
+      widen
 
       what the original question was allowed to read. No SQL is ever persisted.
 
@@ -235,9 +239,11 @@ schemas:
         - string
         - 'null'
         format: date
-        description: 'The first calendar day this chart covered. Present so pinning can freeze a
+        description: 'The first calendar day this chart covered. Present so pinning
+          can freeze a
 
-          relative preset onto the window the reader saw; absent on charts stored before
+          relative preset onto the window the reader saw; absent on charts stored
+          before
 
           it existed, which keep resolving their preset on every refresh.
 
@@ -312,7 +318,8 @@ schemas:
     description: 'A row in the history dropdown.
 
 
-      Carries no turns: the dropdown lists conversations and would otherwise download every
+      Carries no turns: the dropdown lists conversations and would otherwise download
+      every
 
       transcript, including their charts, to render a list of titles.'
   ConversationExchange:
@@ -422,7 +429,8 @@ schemas:
         maxLength: 16
         minLength: 2
         default: en
-        description: 'The language to write the title in. This is the reader''s current UI locale,
+        description: 'The language to write the title in. This is the reader''s current
+          UI locale,
 
           not the one the conversation was held in, because the title is read now.
 
@@ -433,7 +441,8 @@ schemas:
     description: 'Ask the model to name a conversation.
 
 
-      The locale is the reader''s current one rather than the one the conversation was held
+      The locale is the reader''s current one rather than the one the conversation
+      was held
 
       in, because the title is read now, in the sidebar they are looking at now.'
   Error:
@@ -627,9 +636,11 @@ schemas:
     description: 'One turn in an OpenAI-shaped conversation.
 
 
-      `content` is optional because an assistant turn that only calls tools carries no
+      `content` is optional because an assistant turn that only calls tools carries
+      no
 
-      text, and a `tool` turn carries the result of exactly one call. The validator below
+      text, and a `tool` turn carries the result of exactly one call. The validator
+      below
 
       is what keeps that from degrading into "any field may be missing".'
   ChoiceQuestion:
@@ -676,9 +687,9 @@ schemas:
           discriminator:
             propertyName: type
             mapping:
-                choice: ../../openapi.yaml#/components/schemas/ChoiceQuestion
-                noul: ../../openapi.yaml#/components/schemas/NoulQuestion
-                score: ../../openapi.yaml#/components/schemas/ScoreQuestion
+              choice: ../../openapi.yaml#/components/schemas/ChoiceQuestion
+              noul: ../../openapi.yaml#/components/schemas/NoulQuestion
+              score: ../../openapi.yaml#/components/schemas/ScoreQuestion
         type: object
         minProperties: 1
         title: Questions
@@ -826,12 +837,15 @@ schemas:
     - total_tokens
     - total_requests
     title: DistributionBreakdown
-    description: 'One slice of a ranking row, used to stack a second dimension inside the first.
+    description: 'One slice of a ranking row, used to stack a second dimension inside
+      the first.
 
 
-      Deliberately narrower than `DistributionItem`: a stacked bar needs volume, not tail
+      Deliberately narrower than `DistributionItem`: a stacked bar needs volume, not
+      tail
 
-      latency or a failure split, and computing percentiles for every parent-child pair would
+      latency or a failure split, and computing percentiles for every parent-child
+      pair would
 
       cost far more than the chart can show.'
   DistributionItem:
@@ -940,9 +954,11 @@ schemas:
     - name
     - share_percent
     title: DistributionItem
-    description: 'One ranking row. Inherits the window metrics so a dimension carries the same tail
+    description: 'One ranking row. Inherits the window metrics so a dimension carries
+      the same tail
 
-      latency and failure split as the window total, and so adding a metric is one edit
+      latency and failure split as the window total, and so adding a metric is one
+      edit
 
       rather than two that can drift apart. The frontend type has always been
 
@@ -2405,6 +2421,16 @@ schemas:
           minimum: 1.0
         - type: 'null'
         title: Max Output Tokens
+      reasoning_effort:
+        anyOf:
+        - type: string
+          enum:
+          - none
+          - low
+          - medium
+          - high
+        - type: 'null'
+        title: Reasoning Effort
       response_format:
         anyOf:
         - type: string
@@ -2415,6 +2441,21 @@ schemas:
         type: boolean
         title: Stream
         default: false
+      router_id:
+        anyOf:
+        - type: string
+          format: uuid
+        - type: 'null'
+        title: Router Id
+      router_context:
+        additionalProperties:
+          anyOf:
+          - type: string
+          - type: number
+          - type: boolean
+        type: object
+        maxProperties: 50
+        title: Router Context
     additionalProperties: false
     type: object
     required:
@@ -2500,6 +2541,29 @@ schemas:
         - type: string
         - type: 'null'
         title: Selected Model Name
+      router_id:
+        anyOf:
+        - type: string
+          format: uuid
+        - type: 'null'
+        title: Router Id
+      router_name:
+        anyOf:
+        - type: string
+        - type: 'null'
+        title: Router Name
+      router_version:
+        anyOf:
+        - type: integer
+          minimum: 1.0
+        - type: 'null'
+        title: Router Version
+      router_attempts:
+        items:
+          additionalProperties: true
+          type: object
+        type: array
+        title: Router Attempts
     additionalProperties: false
     type: object
     required:
@@ -2657,7 +2721,8 @@ schemas:
     additionalProperties: false
     type: object
     title: PendingListPrice
-    description: A published price waiting for a person, in the same four buckets as the accepted one.
+    description: A published price waiting for a person, in the same four buckets
+      as the accepted one.
   PriceCatalogContextTier:
     properties:
       group_key:
@@ -2747,7 +2812,8 @@ schemas:
     - product
     - source
     title: PriceCatalogModel
-    description: One priceable model in a vendor's published list, named the way that vendor names it.
+    description: One priceable model in a vendor's published list, named the way that
+      vendor names it.
   PriceCatalogModelsResponse:
     properties:
       models:
@@ -2816,9 +2882,11 @@ schemas:
     description: 'How one model is priced under one deployment shape.
 
 
-      `regions` lists every region charging exactly these rates. `region_required` is false when
+      `regions` lists every region charging exactly these rates. `region_required`
+      is false when
 
-      the shape charges one figure everywhere -- Global always does -- because asking for a region
+      the shape charges one figure everywhere -- Global always does -- because asking
+      for a region
 
       that cannot change the answer is asking someone to guess at nothing.'
   PriceCatalogOptionsResponse:
@@ -2912,11 +2980,14 @@ schemas:
     description: 'Where a model''s charged rates come from.
 
 
-      `MANUAL` is what every model did before this existed: a person typed four numbers and they
+      `MANUAL` is what every model did before this existed: a person typed four numbers
+      and they
 
-      stay until that person changes them. The other two derive the rates as list price times
+      stay until that person changes them. The other two derive the rates as list
+      price times
 
-      discount and keep them current, which only works because the discount is stored separately
+      discount and keep them current, which only works because the discount is stored
+      separately
 
       -- a published list price is a fact, the discount is a contract term.'
   PriceSyncDetail:
@@ -2955,7 +3026,8 @@ schemas:
     additionalProperties: false
     type: object
     title: PriceSyncRequest
-    description: Which models to sync. Omitting the list syncs everything that follows a list price.
+    description: Which models to sync. Omitting the list syncs everything that follows
+      a list price.
   PriceSyncResponse:
     properties:
       considered:
@@ -2995,14 +3067,18 @@ schemas:
     - details
     - registry
     title: PriceSyncResponse
-    description: 'What a sync run did, reported per outcome rather than as a single count.
+    description: 'What a sync run did, reported per outcome rather than as a single
+      count.
 
 
-      `updated` counts rows whose charged rates changed. The rest is why the others did not, which
+      `updated` counts rows whose charged rates changed. The rest is why the others
+      did not, which
 
-      is the part worth reading: a sync that silently prices nothing looks identical to one that
+      is the part worth reading: a sync that silently prices nothing looks identical
+      to one that
 
-      prices everything unless the skips are named. The refreshed registry rides along so the
+      prices everything unless the skips are named. The refreshed registry rides along
+      so the
 
       dashboard can show the new rates without a second round trip.'
   PriceSyncStatus:

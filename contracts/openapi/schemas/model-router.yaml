@@ -1,0 +1,1601 @@
+schemas:
+  RouterModelRefV3:
+    type: object
+    additionalProperties: false
+    required:
+    - model_id
+    - facts_version
+    properties:
+      model_id:
+        type: string
+        format: uuid
+      facts_version:
+        type: integer
+        minimum: 1
+  RouterIdentityV3:
+    type: object
+    additionalProperties: false
+    required:
+    - alias
+    - description
+    - supported_operations
+    - streaming
+    - tools
+    properties:
+      alias:
+        type: string
+        pattern: ^[a-z][a-z0-9-]{2,62}$
+      description:
+        type: string
+        maxLength: 500
+      supported_operations:
+        type: array
+        minItems: 1
+        maxItems: 2
+        items:
+          type: string
+          enum:
+          - chat_completions
+          - responses
+      streaming:
+        type: string
+        enum:
+        - disabled
+        - allowed
+        - required
+      tools:
+        type: string
+        enum:
+        - disabled
+        - allowed
+        - required
+  RouterInputFieldV3:
+    type: object
+    additionalProperties: false
+    required:
+    - name
+    - value_type
+    - source
+    - registry_version
+    - required
+    properties:
+      name:
+        type: string
+        pattern: ^[a-z][a-z0-9_]{0,63}$
+      value_type:
+        type: string
+        enum:
+        - string
+        - integer
+        - number
+        - boolean
+      source:
+        type: string
+        enum:
+        - authenticated_identity
+        - server_derived
+        - client_claim
+      registry_version:
+        type: integer
+        minimum: 1
+      required:
+        type: boolean
+  RouterCandidatePoolV3:
+    type: object
+    additionalProperties: false
+    required:
+    - candidates
+    properties:
+      candidates:
+        type: array
+        minItems: 1
+        maxItems: 50
+        items:
+          $ref: ../../openapi.yaml#/components/schemas/RouterModelRefV3
+  RouterEligibilityV3:
+    type: object
+    additionalProperties: false
+    required:
+    - required_capabilities
+    - minimum_context_window
+    - allowed_provider_ids
+    - allowed_data_zones
+    properties:
+      required_capabilities:
+        type: array
+        maxItems: 50
+        items:
+          type: string
+      minimum_context_window:
+        type:
+        - integer
+        - 'null'
+        minimum: 1
+      allowed_provider_ids:
+        type: array
+        maxItems: 50
+        items:
+          type: string
+          format: uuid
+      allowed_data_zones:
+        type: array
+        maxItems: 50
+        items:
+          type: string
+  RouterPredicateV3:
+    type: object
+    additionalProperties: false
+    required:
+    - field
+    - operator
+    - value
+    properties:
+      field:
+        type: string
+        pattern: ^[a-z][a-z0-9_]{0,63}$
+      operator:
+        type: string
+        enum:
+        - equals
+        - not_equals
+        - contains
+        - in
+        - greater_than
+        - greater_than_or_equal
+        - less_than
+        - less_than_or_equal
+        - exists
+      value:
+        oneOf:
+        - type: string
+        - type: integer
+        - type: number
+        - type: boolean
+        - type: array
+          items:
+            oneOf:
+            - type: string
+            - type: integer
+            - type: number
+            - type: boolean
+        - type: 'null'
+  RouterProfileRefV3:
+    type: object
+    additionalProperties: false
+    required:
+    - id
+    - version
+    properties:
+      id:
+        type: string
+        format: uuid
+      version:
+        type: integer
+        minimum: 1
+  RouterQosWeightsV1:
+    type: object
+    additionalProperties: false
+    required:
+    - quality
+    - cost
+    - latency
+    - reliability
+    properties:
+      quality:
+        type: number
+        minimum: 0
+        maximum: 1
+      cost:
+        type: number
+        minimum: 0
+        maximum: 1
+      latency:
+        type: number
+        minimum: 0
+        maximum: 1
+      reliability:
+        type: number
+        minimum: 0
+        maximum: 1
+  RouterQosProfileConfigV1:
+    type: object
+    additionalProperties: false
+    required:
+    - weights
+    - latency_slo_ms
+    - cost_reference_per_million
+    - minimum_success_rate
+    properties:
+      weights:
+        $ref: ../../openapi.yaml#/components/schemas/RouterQosWeightsV1
+      latency_slo_ms:
+        type: integer
+        minimum: 1
+        maximum: 300000
+      cost_reference_per_million:
+        type: number
+        exclusiveMinimum: 0
+      quality_floor:
+        type:
+        - number
+        - 'null'
+        minimum: 0
+        maximum: 1
+        default: null
+      minimum_success_rate:
+        type: number
+        minimum: 0
+        maximum: 1
+  RouterProfileRegistrationV1:
+    type: object
+    additionalProperties: false
+    required:
+    - id
+    - version
+    - name
+    - kind
+    - config
+    - enabled
+    properties:
+      id:
+        type: string
+        format: uuid
+      version:
+        type: integer
+        minimum: 1
+      name:
+        type: string
+        minLength: 1
+        maxLength: 120
+      kind:
+        type: string
+        const: qos
+      config:
+        $ref: ../../openapi.yaml#/components/schemas/RouterQosProfileConfigV1
+      enabled:
+        type: boolean
+  RouterSelectModelActionV3:
+    type: object
+    additionalProperties: false
+    required:
+    - type
+    - model_id
+    properties:
+      type:
+        type: string
+        const: select_model
+      model_id:
+        type: string
+        format: uuid
+  RouterExcludeModelsActionV3:
+    type: object
+    additionalProperties: false
+    required:
+    - type
+    - model_ids
+    properties:
+      type:
+        type: string
+        const: exclude_models
+      model_ids:
+        type: array
+        minItems: 1
+        maxItems: 50
+        items:
+          type: string
+          format: uuid
+  RouterUseProfileActionV3:
+    type: object
+    additionalProperties: false
+    required:
+    - type
+    - profile
+    properties:
+      type:
+        type: string
+        const: use_profile
+      profile:
+        $ref: ../../openapi.yaml#/components/schemas/RouterProfileRefV3
+  RouterRuleV3:
+    type: object
+    additionalProperties: false
+    required:
+    - id
+    - predicate
+    - action
+    properties:
+      id:
+        type: string
+        pattern: ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$
+      predicate:
+        $ref: ../../openapi.yaml#/components/schemas/RouterPredicateV3
+      action:
+        oneOf:
+        - $ref: ../../openapi.yaml#/components/schemas/RouterSelectModelActionV3
+        - $ref: ../../openapi.yaml#/components/schemas/RouterExcludeModelsActionV3
+        - $ref: ../../openapi.yaml#/components/schemas/RouterUseProfileActionV3
+        discriminator:
+          propertyName: type
+          mapping:
+            select_model: ../../openapi.yaml#/components/schemas/RouterSelectModelActionV3
+            exclude_models: ../../openapi.yaml#/components/schemas/RouterExcludeModelsActionV3
+            use_profile: ../../openapi.yaml#/components/schemas/RouterUseProfileActionV3
+  RouterPrioritySelectorV3:
+    type: object
+    additionalProperties: false
+    required:
+    - kind
+    - model_order
+    properties:
+      kind:
+        type: string
+        const: priority
+      model_order:
+        type: array
+        minItems: 1
+        maxItems: 50
+        items:
+          type: string
+          format: uuid
+  RouterWeightedAllocationV3:
+    type: object
+    additionalProperties: false
+    required:
+    - model_id
+    - basis_points
+    properties:
+      model_id:
+        type: string
+        format: uuid
+      basis_points:
+        type: integer
+        minimum: 1
+        maximum: 10000
+  RouterWeightedSelectorV3:
+    type: object
+    additionalProperties: false
+    required:
+    - kind
+    - allocations
+    properties:
+      kind:
+        type: string
+        const: weighted_split
+      allocations:
+        type: array
+        minItems: 1
+        maxItems: 50
+        items:
+          $ref: ../../openapi.yaml#/components/schemas/RouterWeightedAllocationV3
+  RouterQosSelectorV3:
+    type: object
+    additionalProperties: false
+    required:
+    - kind
+    - profile
+    properties:
+      kind:
+        type: string
+        const: qos
+      profile:
+        $ref: ../../openapi.yaml#/components/schemas/RouterProfileRefV3
+  RouterFoundrySemanticSelectorV3:
+    type: object
+    additionalProperties: false
+    required:
+    - kind
+    - routing_model
+    - mode
+    - model_ids
+    properties:
+      kind:
+        type: string
+        const: foundry_semantic
+      routing_model:
+        $ref: ../../openapi.yaml#/components/schemas/RouterModelRefV3
+      mode:
+        type: string
+        enum:
+        - balanced
+        - cost
+        - quality
+      model_ids:
+        type: array
+        minItems: 1
+        maxItems: 50
+        items:
+          type: string
+          format: uuid
+  RouterEvaluatedCustomSelectorV3:
+    type: object
+    additionalProperties: false
+    required:
+    - kind
+    - routing_model
+    - evaluation_id
+    - model_ids
+    properties:
+      kind:
+        type: string
+        const: evaluated_custom
+      routing_model:
+        $ref: ../../openapi.yaml#/components/schemas/RouterModelRefV3
+      evaluation_id:
+        type: string
+        format: uuid
+      model_ids:
+        type: array
+        minItems: 1
+        maxItems: 50
+        items:
+          type: string
+          format: uuid
+  RouterDeploymentRetryV3:
+    type: object
+    additionalProperties: false
+    required:
+    - max_attempts_per_request
+    - retryable_events
+    - respect_retry_after
+    properties:
+      max_attempts_per_request:
+        type: integer
+        minimum: 1
+        maximum: 30
+      retryable_events:
+        type: array
+        maxItems: 5
+        items:
+          type: string
+          enum:
+          - transport_error
+          - timeout
+          - rate_limit
+          - server_error
+          - deployment_unavailable
+      respect_retry_after:
+        type: boolean
+  RouterCrossModelFallbackV3:
+    type: object
+    additionalProperties: false
+    required:
+    - model_order
+    - retryable_events
+    properties:
+      model_order:
+        type: array
+        maxItems: 50
+        items:
+          type: string
+          format: uuid
+      retryable_events:
+        type: array
+        maxItems: 5
+        items:
+          type: string
+          enum:
+          - transport_error
+          - timeout
+          - rate_limit
+          - server_error
+          - deployment_unavailable
+  RouterResilienceV3:
+    type: object
+    additionalProperties: false
+    required:
+    - equivalent_deployment_retry
+    - cross_model_fallback
+    - streaming_failover
+    properties:
+      equivalent_deployment_retry:
+        $ref: ../../openapi.yaml#/components/schemas/RouterDeploymentRetryV3
+      cross_model_fallback:
+        $ref: ../../openapi.yaml#/components/schemas/RouterCrossModelFallbackV3
+      streaming_failover:
+        type: string
+        enum:
+        - disabled
+        - before_first_byte_only
+  RouterStickinessV3:
+    type: object
+    additionalProperties: false
+    required:
+    - scope
+    - ttl_seconds
+    properties:
+      scope:
+        type: string
+        enum:
+        - none
+        - interaction
+        - conversation
+      ttl_seconds:
+        type:
+        - integer
+        - 'null'
+        minimum: 1
+        maximum: 31536000
+  RouterQosPolicyV3:
+    type: object
+    additionalProperties: false
+    required:
+    - profile
+    - freshness_seconds
+    - minimum_samples
+    - hysteresis_margin
+    - missing_data_behavior
+    - fallback_model_order
+    properties:
+      profile:
+        $ref: ../../openapi.yaml#/components/schemas/RouterProfileRefV3
+      freshness_seconds:
+        type: integer
+        minimum: 1
+        maximum: 604800
+      minimum_samples:
+        type: integer
+        minimum: 1
+      hysteresis_margin:
+        type: number
+        minimum: 0
+        maximum: 1
+      missing_data_behavior:
+        type: string
+        enum:
+        - static_priority
+        - fail_closed
+      fallback_model_order:
+        type: array
+        maxItems: 50
+        items:
+          type: string
+          format: uuid
+  RouterSpecV3:
+    type: object
+    additionalProperties: false
+    required:
+    - identity
+    - input_contract
+    - candidate_pool
+    - eligibility
+    - rules
+    - selector
+    - resilience
+    - stickiness
+    - qos_policy
+    properties:
+      schema_version:
+        type: integer
+        const: 3
+        default: 3
+      identity:
+        $ref: ../../openapi.yaml#/components/schemas/RouterIdentityV3
+      input_contract:
+        type: array
+        items:
+          $ref: ../../openapi.yaml#/components/schemas/RouterInputFieldV3
+      candidate_pool:
+        $ref: ../../openapi.yaml#/components/schemas/RouterCandidatePoolV3
+      eligibility:
+        $ref: ../../openapi.yaml#/components/schemas/RouterEligibilityV3
+      rules:
+        type: array
+        items:
+          $ref: ../../openapi.yaml#/components/schemas/RouterRuleV3
+      selector:
+        oneOf:
+        - $ref: ../../openapi.yaml#/components/schemas/RouterPrioritySelectorV3
+        - $ref: ../../openapi.yaml#/components/schemas/RouterWeightedSelectorV3
+        - $ref: ../../openapi.yaml#/components/schemas/RouterQosSelectorV3
+        - $ref: ../../openapi.yaml#/components/schemas/RouterFoundrySemanticSelectorV3
+        - $ref: ../../openapi.yaml#/components/schemas/RouterEvaluatedCustomSelectorV3
+        discriminator:
+          propertyName: kind
+          mapping:
+            priority: ../../openapi.yaml#/components/schemas/RouterPrioritySelectorV3
+            weighted_split: ../../openapi.yaml#/components/schemas/RouterWeightedSelectorV3
+            qos: ../../openapi.yaml#/components/schemas/RouterQosSelectorV3
+            foundry_semantic: ../../openapi.yaml#/components/schemas/RouterFoundrySemanticSelectorV3
+            evaluated_custom: ../../openapi.yaml#/components/schemas/RouterEvaluatedCustomSelectorV3
+      resilience:
+        $ref: ../../openapi.yaml#/components/schemas/RouterResilienceV3
+      stickiness:
+        $ref: ../../openapi.yaml#/components/schemas/RouterStickinessV3
+      qos_policy:
+        oneOf:
+        - $ref: ../../openapi.yaml#/components/schemas/RouterQosPolicyV3
+        - type: 'null'
+  RouterCompiledContextFieldV1:
+    type: object
+    additionalProperties: false
+    required:
+    - name
+    - value_type
+    - source
+    - required
+    - registry_version
+    properties:
+      name:
+        type: string
+        pattern: ^[a-z][a-z0-9_]{0,63}$
+      value_type:
+        type: string
+        enum:
+        - string
+        - integer
+        - number
+        - boolean
+      source:
+        type: string
+        enum:
+        - authenticated_identity
+        - server_derived
+        - client_claim
+      required:
+        type: boolean
+      registry_version:
+        type: integer
+        minimum: 1
+  RouterModelFactsV1:
+    type: object
+    additionalProperties: false
+    required:
+    - model_id
+    - facts_version
+    - logical_model_key
+    - enabled
+    - supported_operations
+    - capabilities
+    - foundry_router_eligible
+    - context_window
+    - provider_id
+    - data_zone
+    properties:
+      model_id:
+        type: string
+        format: uuid
+      facts_version:
+        type: integer
+        minimum: 1
+      logical_model_key:
+        type: string
+        minLength: 1
+        maxLength: 200
+      enabled:
+        type: boolean
+      supported_operations:
+        type: array
+        maxItems: 2
+        items:
+          type: string
+          enum:
+          - chat_completions
+          - responses
+      capabilities:
+        type: array
+        maxItems: 50
+        items:
+          type: string
+      foundry_router_eligible:
+        type: boolean
+      context_window:
+        type:
+        - integer
+        - 'null'
+        minimum: 1
+      provider_id:
+        type: string
+        format: uuid
+      data_zone:
+        type: string
+        minLength: 1
+        maxLength: 100
+  RouterCompiledPlanV1:
+    type: object
+    additionalProperties: false
+    required:
+    - spec_sha256
+    - identity
+    - context_contract
+    - candidates
+    - selector_model
+    - profiles
+    - eligibility
+    - rules
+    - selector
+    - resilience
+    - stickiness
+    - qos_policy
+    - plan_sha256
+    properties:
+      plan_schema_version:
+        type: integer
+        const: 1
+        default: 1
+      source_schema_version:
+        type: integer
+        const: 3
+        default: 3
+      compiler_version:
+        type: string
+        const: 1.0.0
+        default: 1.0.0
+      spec_sha256:
+        type: string
+        pattern: ^[0-9a-f]{64}$
+      identity:
+        $ref: ../../openapi.yaml#/components/schemas/RouterIdentityV3
+      context_contract:
+        type: array
+        items:
+          $ref: ../../openapi.yaml#/components/schemas/RouterCompiledContextFieldV1
+      candidates:
+        type: array
+        items:
+          $ref: ../../openapi.yaml#/components/schemas/RouterModelFactsV1
+      selector_model:
+        oneOf:
+        - $ref: ../../openapi.yaml#/components/schemas/RouterModelFactsV1
+        - type: 'null'
+      profiles:
+        type: array
+        items:
+          $ref: ../../openapi.yaml#/components/schemas/RouterProfileRegistrationV1
+      eligibility:
+        $ref: ../../openapi.yaml#/components/schemas/RouterEligibilityV3
+      rules:
+        type: array
+        items:
+          $ref: ../../openapi.yaml#/components/schemas/RouterRuleV3
+      selector:
+        oneOf:
+        - $ref: ../../openapi.yaml#/components/schemas/RouterPrioritySelectorV3
+        - $ref: ../../openapi.yaml#/components/schemas/RouterWeightedSelectorV3
+        - $ref: ../../openapi.yaml#/components/schemas/RouterQosSelectorV3
+        - $ref: ../../openapi.yaml#/components/schemas/RouterFoundrySemanticSelectorV3
+        - $ref: ../../openapi.yaml#/components/schemas/RouterEvaluatedCustomSelectorV3
+        discriminator:
+          propertyName: kind
+      resilience:
+        $ref: ../../openapi.yaml#/components/schemas/RouterResilienceV3
+      stickiness:
+        $ref: ../../openapi.yaml#/components/schemas/RouterStickinessV3
+      qos_policy:
+        oneOf:
+        - $ref: ../../openapi.yaml#/components/schemas/RouterQosPolicyV3
+        - type: 'null'
+      plan_sha256:
+        type: string
+        pattern: ^[0-9a-f]{64}$
+  RouterCompilationIssue:
+    type: object
+    additionalProperties: false
+    required:
+    - code
+    - path
+    - message
+    properties:
+      code:
+        type: string
+      path:
+        type: string
+      message:
+        type: string
+  ModelRouterV3Write:
+    type: object
+    additionalProperties: false
+    required:
+    - name
+    - description
+    - spec
+    properties:
+      name:
+        type: string
+        minLength: 1
+        maxLength: 120
+      description:
+        type: string
+        maxLength: 500
+      spec:
+        $ref: ../../openapi.yaml#/components/schemas/RouterSpecV3
+  ModelRouterV3:
+    type: object
+    additionalProperties: false
+    required:
+    - id
+    - name
+    - description
+    - status
+    - version
+    - spec
+    - compiled_plan
+    - has_unpublished_changes
+    - created_at
+    - updated_at
+    - published_at
+    - created_by
+    - updated_by
+    properties:
+      id:
+        type: string
+        format: uuid
+      name:
+        type: string
+      description:
+        type: string
+      status:
+        type: string
+        enum:
+        - draft
+        - published
+        - disabled
+      version:
+        type: integer
+        minimum: 0
+      spec:
+        $ref: ../../openapi.yaml#/components/schemas/RouterSpecV3
+      compiled_plan:
+        oneOf:
+        - $ref: ../../openapi.yaml#/components/schemas/RouterCompiledPlanV1
+        - type: 'null'
+      has_unpublished_changes:
+        type: boolean
+      created_at:
+        type: string
+        format: date-time
+      updated_at:
+        type: string
+        format: date-time
+      published_at:
+        type:
+        - string
+        - 'null'
+        format: date-time
+      created_by:
+        type: string
+      updated_by:
+        type: string
+  ModelRouterV3List:
+    type: object
+    additionalProperties: false
+    required:
+    - items
+    properties:
+      items:
+        type: array
+        items:
+          $ref: ../../openapi.yaml#/components/schemas/ModelRouterV3
+  ModelRouterV3ValidationResult:
+    type: object
+    additionalProperties: false
+    required:
+    - valid
+    - issues
+    - compiled_plan
+    properties:
+      valid:
+        type: boolean
+      issues:
+        type: array
+        items:
+          $ref: ../../openapi.yaml#/components/schemas/RouterCompilationIssue
+      compiled_plan:
+        oneOf:
+        - $ref: ../../openapi.yaml#/components/schemas/RouterCompiledPlanV1
+        - type: 'null'
+  ModelRouterWrite:
+    type: object
+    additionalProperties: false
+    required:
+    - name
+    properties:
+      name:
+        type: string
+        minLength: 1
+        maxLength: 120
+      description:
+        type: string
+        maxLength: 500
+        default: ''
+      definition:
+        $ref: ../../openapi.yaml#/components/schemas/ModelRouterDefinition
+  ModelRouterDuplicateWrite:
+    type: object
+    additionalProperties: false
+    required:
+    - name
+    properties:
+      name:
+        type: string
+        minLength: 1
+        maxLength: 120
+  ModelRouterListResponse:
+    type: object
+    additionalProperties: false
+    required:
+    - items
+    properties:
+      items:
+        type: array
+        items:
+          $ref: ../../openapi.yaml#/components/schemas/ModelRouter
+      model_references:
+        type: array
+        readOnly: true
+        default: []
+        description: Display metadata for exact model identities referenced by the
+          caller's Routers. Historical references do not grant invocation or selection
+          eligibility.
+        items:
+          $ref: ../../openapi.yaml#/components/schemas/ModelRouterModelReference
+  ModelRouterModelReference:
+    type: object
+    additionalProperties: false
+    required:
+    - id
+    - model_key
+    - display_name
+    - provider_name
+    - status
+    properties:
+      id:
+        type: string
+        format: uuid
+      model_key:
+        type: string
+      display_name:
+        type: string
+      provider_name:
+        type: string
+      family_key:
+        type: string
+        enum:
+        - generic
+        - claude
+        - copilot
+        - openai
+        default: generic
+      status:
+        type: string
+        enum:
+        - available
+        - disabled
+        - removed
+  ModelRouterModelCatalog:
+    type: object
+    additionalProperties: false
+    required:
+    - model_ids
+    properties:
+      model_ids:
+        type: array
+        items:
+          type: string
+          format: uuid
+  ModelRouterDecisionPreviewWrite:
+    type: object
+    additionalProperties: false
+    required:
+    - definition
+    - strategy_node_id
+    properties:
+      definition:
+        $ref: ../../openapi.yaml#/components/schemas/ModelRouterDefinition
+      strategy_node_id:
+        type: string
+        pattern: ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$
+      sample_prompt:
+        type: string
+        maxLength: 200000
+        default: ''
+  ModelRouterDecisionCandidatePreview:
+    type: object
+    additionalProperties: false
+    required:
+    - model_id
+    - display_name
+    - provider_name
+    - description
+    - capabilities
+    - context_window
+    - input_cost_per_million
+    - output_cost_per_million
+    - priority
+    - weight
+    - max_latency_ms
+    - max_cost_per_million
+    properties:
+      model_id:
+        type: string
+        format: uuid
+      display_name:
+        type: string
+      provider_name:
+        type: string
+      description:
+        type: string
+      capabilities:
+        type: array
+        items:
+          type: string
+      context_window:
+        type:
+        - integer
+        - 'null'
+      input_cost_per_million:
+        type:
+        - number
+        - 'null'
+      output_cost_per_million:
+        type:
+        - number
+        - 'null'
+      priority:
+        type: integer
+        minimum: 1
+        maximum: 100
+      weight:
+        type: integer
+        minimum: 1
+        maximum: 100
+      max_latency_ms:
+        type:
+        - integer
+        - 'null'
+        minimum: 1
+        maximum: 300000
+      max_cost_per_million:
+        type:
+        - number
+        - 'null'
+        minimum: 0
+  ModelRouterDecisionPreview:
+    type: object
+    additionalProperties: false
+    required:
+    - system
+    - user
+    - sample_truncated
+    - candidates
+    - routing_model_id
+    - routing_model_name
+    - is_default_prompt
+    - has_placeholder
+    - models_without_description
+    - chars
+    properties:
+      system:
+        type: string
+      user:
+        type: string
+      sample_truncated:
+        type: boolean
+      candidates:
+        type: array
+        items:
+          $ref: ../../openapi.yaml#/components/schemas/ModelRouterDecisionCandidatePreview
+      routing_model_id:
+        type: string
+        format: uuid
+      routing_model_name:
+        type: string
+      decision_protocol:
+        type: string
+        enum:
+        - chat_json
+        - system_one
+        default: chat_json
+      decision_reasoning_effort:
+        type:
+        - string
+        - 'null'
+        enum:
+        - none
+        - low
+        - medium
+        - high
+        - null
+        default: null
+      is_default_prompt:
+        type: boolean
+      has_placeholder:
+        type: boolean
+      models_without_description:
+        type: array
+        items:
+          type: string
+          format: uuid
+      chars:
+        type: integer
+        minimum: 0
+  ModelRouterDecisionTrialWrite:
+    type: object
+    additionalProperties: false
+    required:
+    - definition
+    - strategy_node_id
+    - sample_prompt
+    properties:
+      definition:
+        $ref: ../../openapi.yaml#/components/schemas/ModelRouterDefinition
+      strategy_node_id:
+        type: string
+        pattern: ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$
+      sample_prompt:
+        type: string
+        minLength: 1
+        maxLength: 200000
+  ModelRouterDecisionProbability:
+    type: object
+    additionalProperties: false
+    required:
+    - model_id
+    - display_name
+    - probability
+    properties:
+      model_id:
+        type: string
+        format: uuid
+      display_name:
+        type: string
+      probability:
+        type: number
+        minimum: 0
+        maximum: 1
+  ModelRouterDecisionTrialResult:
+    type: object
+    additionalProperties: false
+    required:
+    - routing_model_id
+    - routing_model_name
+    - decision_protocol
+    - selected_model_id
+    - selected_model_name
+    - latency_ms
+    - sample_truncated
+    - decision_input_chars
+    properties:
+      routing_model_id:
+        type: string
+        format: uuid
+      routing_model_name:
+        type: string
+      decision_protocol:
+        type: string
+        enum:
+        - chat_json
+        - system_one
+      selected_model_id:
+        type: string
+        format: uuid
+      selected_model_name:
+        type: string
+      fallback_used:
+        type: boolean
+        default: false
+      rationale:
+        type:
+        - string
+        - 'null'
+        default: null
+      confidence:
+        type:
+        - number
+        - 'null'
+        minimum: 0
+        maximum: 1
+        default: null
+      probabilities:
+        type: array
+        default: []
+        items:
+          $ref: ../../openapi.yaml#/components/schemas/ModelRouterDecisionProbability
+      latency_ms:
+        type: integer
+        minimum: 0
+      input_tokens:
+        type:
+        - integer
+        - 'null'
+        default: null
+      output_tokens:
+        type:
+        - integer
+        - 'null'
+        default: null
+      total_tokens:
+        type:
+        - integer
+        - 'null'
+        default: null
+      estimated_cost:
+        type:
+        - number
+        - 'null'
+        default: null
+      sample_truncated:
+        type: boolean
+      decision_input_chars:
+        type: integer
+        minimum: 0
+  ModelRouterAssignedList:
+    type: object
+    additionalProperties: false
+    required:
+    - items
+    properties:
+      items:
+        type: array
+        items:
+          $ref: ../../openapi.yaml#/components/schemas/ModelRouter
+  ModelRouterAssignmentWrite:
+    type: object
+    additionalProperties: false
+    required:
+    - user_id
+    - assigned
+    properties:
+      user_id:
+        type: string
+        minLength: 1
+        maxLength: 320
+      assigned:
+        type: boolean
+  ModelRouterAssignment:
+    type: object
+    additionalProperties: false
+    required:
+    - router_id
+    - user_id
+    - assigned
+    properties:
+      router_id:
+        type: string
+        format: uuid
+      user_id:
+        type: string
+      assigned:
+        type: boolean
+  ModelRouterValidationIssue:
+    type: object
+    additionalProperties: false
+    required:
+    - code
+    - message
+    - node_id
+    properties:
+      code:
+        type: string
+      message:
+        type: string
+      node_id:
+        type:
+        - string
+        - 'null'
+  ModelRouterValidationResult:
+    type: object
+    additionalProperties: false
+    required:
+    - valid
+    - issues
+    properties:
+      valid:
+        type: boolean
+      issues:
+        type: array
+        items:
+          $ref: ../../openapi.yaml#/components/schemas/ModelRouterValidationIssue
+  ModelRouter:
+    type: object
+    additionalProperties: false
+    required:
+    - id
+    - name
+    - description
+    - status
+    - version
+    - definition
+    - has_unpublished_changes
+    - created_at
+    - updated_at
+    - published_at
+    - created_by
+    - updated_by
+    properties:
+      id:
+        type: string
+        format: uuid
+      name:
+        type: string
+      description:
+        type: string
+      status:
+        type: string
+        enum:
+        - draft
+        - published
+        - disabled
+      version:
+        type: integer
+        minimum: 0
+      definition:
+        $ref: ../../openapi.yaml#/components/schemas/ModelRouterDefinition
+      has_unpublished_changes:
+        type: boolean
+      created_at:
+        type: string
+        format: date-time
+      updated_at:
+        type: string
+        format: date-time
+      published_at:
+        type:
+        - string
+        - 'null'
+        format: date-time
+      created_by:
+        type: string
+      updated_by:
+        type: string
+  ModelRouterCandidate:
+    type: object
+    additionalProperties: false
+    required:
+    - model_id
+    properties:
+      model_id:
+        type: string
+        format: uuid
+  ModelRouterCondition:
+    type: object
+    additionalProperties: false
+    required:
+    - field
+    - operator
+    properties:
+      field:
+        type: string
+        minLength: 1
+        maxLength: 120
+        description: Condition lookup key. Identity, prompt, prompt length, and required
+          capability are derived by the server during execution.
+      operator:
+        type: string
+        enum:
+        - equals
+        - not_equals
+        - contains
+        - matches_any
+        - greater_than
+        - greater_than_or_equal
+        - less_than
+        - less_than_or_equal
+        - exists
+      value:
+        type:
+        - string
+        - number
+        - boolean
+        - 'null'
+        default: null
+  ModelRouterDefinition:
+    type: object
+    additionalProperties: false
+    properties:
+      schema_version:
+        type: integer
+        const: 2
+        default: 2
+      presentation_version:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 1
+      default_model_id:
+        type:
+        - string
+        - 'null'
+        format: uuid
+        default: null
+        deprecated: true
+        description: Deprecated wire-compatibility field; ignored by routing and validation.
+      nodes:
+        type: array
+        maxItems: 100
+        items:
+          $ref: ../../openapi.yaml#/components/schemas/ModelRouterNode
+        default: []
+      edges:
+        type: array
+        maxItems: 200
+        items:
+          $ref: ../../openapi.yaml#/components/schemas/ModelRouterEdge
+        default: []
+  ModelRouterEdge:
+    type: object
+    additionalProperties: false
+    required:
+    - id
+    - source
+    - target
+    properties:
+      id:
+        type: string
+        pattern: ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$
+      source:
+        type: string
+        pattern: ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$
+      target:
+        type: string
+        pattern: ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$
+      source_handle:
+        type:
+        - string
+        - 'null'
+        maxLength: 64
+        default: null
+      label:
+        type: string
+        maxLength: 120
+        default: ''
+  ModelRouterNode:
+    type: object
+    additionalProperties: false
+    required:
+    - id
+    - type
+    - label
+    - position
+    properties:
+      id:
+        type: string
+        pattern: ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$
+      type:
+        type: string
+        enum:
+        - start
+        - condition
+        - candidate_models
+        - strategy
+        - priority
+        - fallback
+        - output
+      label:
+        type: string
+        minLength: 1
+        maxLength: 120
+      position:
+        $ref: ../../openapi.yaml#/components/schemas/ModelRouterPosition
+      condition:
+        oneOf:
+        - $ref: ../../openapi.yaml#/components/schemas/ModelRouterCondition
+        - type: 'null'
+        default: null
+      candidates:
+        type: array
+        maxItems: 50
+        items:
+          $ref: ../../openapi.yaml#/components/schemas/ModelRouterCandidate
+        default: []
+      strategy_type:
+        type:
+        - string
+        - 'null'
+        enum:
+        - priority
+        - weighted
+        - model_based
+        - null
+        default: null
+      model_configs:
+        type: array
+        maxItems: 50
+        items:
+          $ref: ../../openapi.yaml#/components/schemas/ModelRouterStrategyModel
+        default: []
+      routing_model_id:
+        type:
+        - string
+        - 'null'
+        format: uuid
+        default: null
+      decision_prompt:
+        type:
+        - string
+        - 'null'
+        maxLength: 20000
+        default: null
+        description: Optional model-based system prompt. The {catalog} placeholder
+          expands to the authorized candidate catalog.
+      max_prompt_chars:
+        type: integer
+        minimum: 64
+        maximum: 50000
+        default: 4000
+      decision_reasoning_effort:
+        type:
+        - string
+        - 'null'
+        enum:
+        - none
+        - low
+        - medium
+        - high
+        - null
+        default: null
+      fallback_on:
+        type: array
+        items:
+          type: string
+          enum:
+          - error
+          - timeout
+          - rate_limit
+          - quality
+        default: []
+        description: Retry event classes on Fallback nodes. Quality remains readable
+          for legacy definitions but validation rejects its publication.
+      timeout_ms:
+        type:
+        - integer
+        - 'null'
+        minimum: 1
+        maximum: 300000
+        default: null
+        description: Default candidate invocation timeout on Strategy nodes. Legacy
+          Fallback values migrate here while loading.
+  ModelRouterPosition:
+    type: object
+    additionalProperties: false
+    required:
+    - x
+    - y
+    properties:
+      x:
+        type: number
+        minimum: -100000
+        maximum: 100000
+      y:
+        type: number
+        minimum: -100000
+        maximum: 100000
+  ModelRouterStrategyModel:
+    type: object
+    additionalProperties: false
+    required:
+    - model_id
+    properties:
+      model_id:
+        type: string
+        format: uuid
+      priority:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 1
+      weight:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 100
+      max_latency_ms:
+        type:
+        - integer
+        - 'null'
+        minimum: 1
+        maximum: 300000
+        default: null
+        description: Legacy field name for the candidate invocation timeout. It may
+          only tighten the Strategy timeout and is not evaluated after success.
+      max_cost_per_million:
+        type:
+        - number
+        - 'null'
+        minimum: 0
+        default: null
+        description: Static ceiling for the larger input/output list rate per million,
+          not an estimated request-cost budget.
+      description:
+        type: string
+        maxLength: 1000
+        default: ''

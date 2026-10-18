@@ -20,6 +20,12 @@ from uuid import UUID
 
 from pydantic import Field, model_validator
 
+from .model_router import (
+    ModelRouterCondition,
+    ModelRouterDefinition,
+    ModelRouterFallbackEvent,
+    ModelRouterStrategyType,
+)
 from .models import StrictModel
 
 ChartKind = Literal["bar", "line", "table", "kpi"]
@@ -100,6 +106,28 @@ class AssistantStep(StrictModel):
     row_count: int = Field(default=0, ge=0)
 
 
+class AssistantRouterProposalModel(StrictModel):
+    model_id: UUID
+    display_name: str = Field(min_length=1, max_length=160)
+    provider_name: str = Field(min_length=1, max_length=160)
+    capabilities: list[str] = Field(default_factory=list, max_length=20)
+    branch: Literal["primary", "else"]
+    priority: int = Field(ge=1, le=50)
+    weight: int = Field(ge=1, le=100)
+
+
+class AssistantRouterProposal(StrictModel):
+    id: UUID
+    name: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=500)
+    strategy_type: ModelRouterStrategyType
+    else_strategy_type: ModelRouterStrategyType | None = None
+    condition: ModelRouterCondition | None = None
+    fallback_on: list[ModelRouterFallbackEvent] = Field(default_factory=list)
+    models: list[AssistantRouterProposalModel] = Field(min_length=1, max_length=20)
+    definition: ModelRouterDefinition
+
+
 class AssistantTurn(StrictModel):
     role: Literal["user", "assistant"]
     content: str = Field(min_length=1, max_length=20_000)
@@ -119,6 +147,7 @@ class AssistantReply(StrictModel):
     conversation_id: str
     message: str
     charts: list[ChartSpec]
+    router_proposals: list[AssistantRouterProposal] = Field(default_factory=list)
     steps: list[AssistantStep]
     latency_ms: int = Field(ge=0)
     model: str

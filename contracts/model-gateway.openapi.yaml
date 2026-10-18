@@ -2,7 +2,8 @@ openapi: 3.1.0
 info:
   title: SmartHive Internal Model Invocation API
   version: 1.0.0
-  description: 'Internal Dashboard invocation schema used during the APIM migration. It is
+  description: 'Internal Dashboard invocation schema used during the APIM migration.
+    It is
 
     not the API product delivered to business consumers. APIM Product
 
@@ -297,9 +298,11 @@ components:
       description: 'One turn in an OpenAI-shaped conversation.
 
 
-        `content` is optional because an assistant turn that only calls tools carries no
+        `content` is optional because an assistant turn that only calls tools carries
+        no
 
-        text, and a `tool` turn carries the result of exactly one call. The validator below
+        text, and a `tool` turn carries the result of exactly one call. The validator
+        below
 
         is what keeps that from degrading into "any field may be missing".'
     ModelInvocationRequest:
@@ -351,6 +354,15 @@ components:
           - 'null'
           maximum: 1000000
           minimum: 1
+        reasoning_effort:
+          anyOf:
+          - type: string
+            enum:
+            - none
+            - low
+            - medium
+            - high
+          - type: 'null'
         response_format:
           anyOf:
           - type: string
@@ -359,7 +371,23 @@ components:
         stream:
           type: boolean
           default: false
-          description: Provider streaming is consumed and returned as one normalized response.
+          description: Provider streaming is consumed and returned as one normalized
+            response.
+        router_id:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Router Id
+        router_context:
+          additionalProperties:
+            anyOf:
+            - type: string
+            - type: number
+            - type: boolean
+          type: object
+          maxProperties: 50
+          title: Router Context
       additionalProperties: false
       type: object
       required:
@@ -432,7 +460,8 @@ components:
           type:
           - string
           - 'null'
-          description: Actual Gateway correlation ID, never a fallback caller or upstream ID.
+          description: Actual Gateway correlation ID, never a fallback caller or upstream
+            ID.
         upstream_request_id:
           type:
           - string
@@ -491,6 +520,29 @@ components:
           anyOf:
           - type: string
           - type: 'null'
+        router_id:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Router Id
+        router_name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Router Name
+        router_version:
+          anyOf:
+          - type: integer
+            minimum: 1.0
+          - type: 'null'
+          title: Router Version
+        router_attempts:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          title: Router Attempts
       additionalProperties: false
       type: object
       required:

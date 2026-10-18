@@ -61,7 +61,7 @@ Turnstile 是一个用于治理 AI 模型访问的自托管控制平面。它整
 > [!WARNING]
 > GitHub 数据源和 GitHub Copilot 集成功能仍在积极开发中，尚未达到生产就绪状态。请谨慎启用，并在将相关用量、成本或治理数据用于运营或财务决策前进行独立核验。如果你只需要 GitHub Copilot FinOps 功能，请参考 [OctoFinance](https://github.com/satomic/OctoFinance)。
 
-Model Intelligent Router 未包含在此版本中，未来可能作为可选扩展重新加入。
+- **模型智能路由（Model Intelligent Router）：** 支持可视化画布与常规配置模式，提供按优先级、按权重与模型判路由（Model-based）策略，支持条件分支、失败转移策略、人员级路由器授权及两阶段 Request Trace 决策归因。
 
 ## v1.2 新增特性
 
@@ -240,7 +240,6 @@ Turnstile不会创建或修改客户的Foundry项目；执行IAM授权的Azure�
 - 必须使用 PostgreSQL；不支持将本地或嵌入式数据存储用于生产环境。
 - APIM 与 Azure 资源预配可能需要数分钟。
 - 对于 APIM 策略无法捕获用量明细的流式响应，Token 与成本记录最初并不完整。当网关日志可用时，对账流程会补全提示词和补全 Token 数，但无法恢复单请求缓存用量，因此相应成本可能仍只是下限估算。
-- 此版本不包含 Model Intelligent Router。
 
 ## 故障排除
 

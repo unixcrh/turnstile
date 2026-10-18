@@ -9,7 +9,7 @@ import type {
   ConversationSummary,
   PinnedReport,
 } from "./types"
-
+import type { ModelRouter } from "../../data-sources/apim/types"
 
 const path = (source: AssistantSource, suffix: string) =>
   source === "github-copilot"
@@ -31,7 +31,12 @@ export const assistantApi = {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   }),
-
+  confirmRouterProposal: (conversationId: string, proposalId: string) =>
+    request<ModelRouter>(
+      `/api/v1/assistant/conversations/${encodeURIComponent(conversationId)}`
+      + `/router-proposals/${encodeURIComponent(proposalId)}/confirm`,
+      { method: "POST" },
+    ),
   conversations: (source: AssistantSource) => request<{ items: ConversationSummary[] }>(
     path(source, "/conversations"),
   ).then((response) => response.items),

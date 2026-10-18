@@ -14,7 +14,8 @@ schemas:
       usage_available:
         type: boolean
         default: true
-        description: False means numeric usage fields are unavailable, not measured zero.
+        description: False means numeric usage fields are unavailable, not measured
+          zero.
       platform_outcome:
         type:
         - string
@@ -133,6 +134,26 @@ schemas:
         anyOf:
         - type: string
         - type: 'null'
+      router_id:
+        anyOf:
+        - type: string
+          format: uuid
+        - type: 'null'
+        default: null
+        title: Router Id
+      router_name:
+        anyOf:
+        - type: string
+        - type: 'null'
+        default: null
+        title: Router Name
+      router_version:
+        anyOf:
+        - type: integer
+          minimum: 1.0
+        - type: 'null'
+        default: null
+        title: Router Version
     additionalProperties: false
     type: object
     required:
@@ -416,6 +437,33 @@ schemas:
         - type: string
         - type: 'null'
         title: Model Admission
+      router_id:
+        anyOf:
+        - type: string
+          format: uuid
+        - type: 'null'
+        default: null
+        title: Router Id
+      router_name:
+        anyOf:
+        - type: string
+        - type: 'null'
+        default: null
+        title: Router Name
+      router_version:
+        anyOf:
+        - type: integer
+          minimum: 1.0
+        - type: 'null'
+        default: null
+        title: Router Version
+      router_attempts:
+        items:
+          additionalProperties: true
+          type: object
+        type: array
+        title: Router Attempts
+        default: []
     additionalProperties: false
     type: object
     required:
@@ -800,7 +848,8 @@ schemas:
         type: integer
         minimum: 0.0
         default: 0
-        description: Measured cache-read bucket; unlike cached_tokens, it excludes cache writes.
+        description: Measured cache-read bucket; unlike cached_tokens, it excludes
+          cache writes.
       cache_write_tokens:
         type: integer
         minimum: 0.0

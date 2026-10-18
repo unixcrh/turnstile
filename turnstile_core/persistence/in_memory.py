@@ -38,12 +38,15 @@ from .in_memory_budgets import InMemoryBudgetRepositoryMixin
 from .in_memory_gateway_targets import InMemoryGatewayTargetRepositoryMixin
 from .in_memory_publications import InMemoryPublicationRepositoryMixin
 from .in_memory_registry import InMemoryRegistryRepositoryMixin
+from .in_memory_router import InMemoryRouterRepositoryMixin
 from .repository import (
     CACHE_DIMENSION_FIELDS,
     QueryRepository,
     UsageFilters,
+    apply_router_totals,
     cache_distribution_supported,
     cache_scope_for_filters,
+    enrich_router_attempts,
 )
 
 
@@ -96,6 +99,7 @@ class InMemoryRepository(
     InMemoryAssistantRepositoryMixin,
     InMemoryBudgetRepositoryMixin,
     InMemoryBillableRequestRepositoryMixin,
+    InMemoryRouterRepositoryMixin,
     QueryRepository,
 ):
     def begin_platform_invocation(self, attempt: PlatformInvocationAttempt) -> None:
@@ -285,6 +289,38 @@ class InMemoryRepository(
                 now,
             ),
         ]
+        self.model_routers: list[dict[str, Any]] = []
+        self.model_router_revisions: list[dict[str, Any]] = []
+        self.model_router_specs: list[dict[str, Any]] = []
+        self.model_router_spec_revisions: list[dict[str, Any]] = []
+        self.model_router_context_fields: list[dict[str, Any]] = [
+            {
+                "name": name,
+                "version": 1,
+                "value_type": value_type,
+                "source": source,
+                "enabled": True,
+            }
+            for name, value_type, source in (
+                ("user_id", "string", "authenticated_identity"),
+                ("task_type", "string", "client_claim"),
+                ("request_parameter", "string", "server_derived"),
+                ("prompt_length", "integer", "server_derived"),
+                ("required_capability", "string", "server_derived"),
+                ("stream", "boolean", "server_derived"),
+                ("tools_present", "boolean", "server_derived"),
+            )
+        ]
+        self.model_router_model_facts: list[dict[str, Any]] = []
+        self.model_router_profiles: list[dict[str, Any]] = []
+        self.model_router_evaluations: list[dict[str, Any]] = []
+        self.user_model_router_policies: dict[str, dict[str, Any]] = {}
+        self.user_model_router_access: dict[str, set[UUID]] = {}
+        self.user_model_router_access_audit: list[dict[str, Any]] = []
+        self.model_router_run_bindings: dict[
+            tuple[UUID, int, str, str], dict[str, Any]
+        ] = {}
+        self.model_router_invocations: dict[str, dict[str, Any]] = {}
         self.gateways = [
             {
                 "id": UUID("10000000-0000-4000-8000-000000000001"),
@@ -1051,7 +1087,7 @@ class InMemoryRepository(
     def _unmatched_invocation(self, attempt: PlatformInvocationAttempt) -> dict[str, Any]:
         completion = self.invocation_completions.get(attempt.request_id)
         metadata = attempt.metadata
-        return UsageRequestDetail(
+        detail = UsageRequestDetail(
             request_id=attempt.request_id,
             trace_id="platform:" + attempt.request_id,
             correlation_id=completion.gateway_correlation_id if completion else None,
@@ -1098,6 +1134,19 @@ class InMemoryRepository(
             ingest_source="platform",
             ingest_error="platform_usage_unavailable",
         ).model_dump()
+        decision = deepcopy(self.model_router_invocations.get(attempt.request_id, {}))
+        if decision:
+            attempts = enrich_router_attempts(decision.get("router_attempts", []), {})
+            detail.update(
+                {
+                    key: value
+                    for key, value in decision.items()
+                    if key != "router_attempts"
+                }
+            )
+            detail["router_attempts"] = attempts
+            apply_router_totals(detail, attempts)
+        return detail
 
     @staticmethod
     def _matches_trace(row: Mapping[str, Any], filters: UsageFilters) -> bool:
@@ -1175,19 +1224,80 @@ class InMemoryRepository(
         }
 
     def list_usage_requests(
-        self, from_: datetime, to: datetime, filters: UsageFilters, limit: int,
+        self,
+        from_: datetime,
+        to: datetime,
+        filters: UsageFilters,
+        limit: int,
         after: tuple[datetime, str] | None = None,
     ) -> list[dict[str, Any]]:
-        summaries = [self._request_summary(record)
-                     for record in self._usage_between(from_, to, UsageFilters())]
+        records = sorted(
+            self._usage_between(from_, to, UsageFilters()),
+            key=lambda record: record.ts,
+            reverse=True,
+        )
+        intermediate_request_ids = {
+            str(attempt["request_id"])
+            for logical_request_id, decision in self.model_router_invocations.items()
+            for attempt in decision.get("router_attempts", [])
+            if attempt.get("request_id")
+            and str(attempt["request_id"]) != logical_request_id
+        }
+        usage_by_request = {item.request_id: item for item in records}
+        summaries: list[dict[str, Any]] = []
+        for record in records:
+            if record.request_id in intermediate_request_ids:
+                continue
+            decision = self.model_router_invocations.get(record.request_id, {})
+            summary = {
+                **self._request_summary(record),
+                **{
+                    key: value
+                    for key, value in decision.items()
+                    if key != "router_attempts"
+                },
+            }
+            raw_usage = {
+                request_id: {
+                    "input_tokens": item.input_tokens,
+                    "cached_tokens": item.cached_tokens,
+                    "cache_write_tokens": item.cache_write_tokens,
+                    "output_tokens": item.output_tokens,
+                    "total_tokens": item.input_tokens + item.cached_tokens + item.output_tokens,
+                    "estimated_cost": item.estimated_cost,
+                }
+                for request_id, item in usage_by_request.items()
+            }
+            attempts = enrich_router_attempts(
+                decision.get("router_attempts", []), raw_usage
+            )
+            apply_router_totals(summary, attempts)
+            summaries.append(summary)
         for attempt in self.invocation_attempts.values():
-            if from_ <= attempt.started_at < to and self._platform_usage(attempt) is None:
+            if (
+                from_ <= attempt.started_at < to and self._platform_usage(attempt) is None
+                and attempt.request_id not in intermediate_request_ids
+            ):
                 detail = self._unmatched_invocation(attempt)
-                summaries.append({key: value for key, value in detail.items()
-                                  if key in UsageRequestSummary.model_fields})
-        return sorted((row for row in summaries if self._matches_trace(row, filters)
-                   and (after is None or (row["timestamp"], row["trace_id"]) < after)),
-                  key=lambda row: (row["timestamp"], row["trace_id"]), reverse=True)[:limit]
+                summaries.append(
+                    {
+                        key: value
+                        for key, value in detail.items()
+                        if key in UsageRequestSummary.model_fields
+                    }
+                )
+        return sorted(
+            (
+                row for row in summaries
+                if self._matches_trace(row, filters)
+                and (
+                    after is None
+                    or (row["timestamp"], row["trace_id"]) < after
+                )
+            ),
+            key=lambda row: (row["timestamp"], row["trace_id"]),
+            reverse=True,
+        )[:limit]
 
     def get_usage_request(self, request_id: str) -> dict[str, Any] | None:
         platform = self.invocation_attempts.get(request_id.removeprefix("platform:"))
@@ -1208,8 +1318,24 @@ class InMemoryRepository(
         record = max(exact or records, key=lambda item: item.ts, default=None)
         if record is None:
             return None
+        decision = deepcopy(self.model_router_invocations.get(record.request_id, {}))
+        attempts = decision.get("router_attempts", [])
+        usage_by_request = {item.request_id: item for item in self.usage_records}
+        raw_usage = {
+            request_id: {
+                "input_tokens": usage.input_tokens,
+                "cached_tokens": usage.cached_tokens,
+                "cache_write_tokens": usage.cache_write_tokens,
+                "output_tokens": usage.output_tokens,
+                "total_tokens": usage.input_tokens + usage.cached_tokens + usage.output_tokens,
+                "estimated_cost": usage.estimated_cost,
+            }
+            for request_id, usage in usage_by_request.items()
+        }
+        attempts = enrich_router_attempts(attempts, raw_usage)
         result = {
             **self._request_summary(record),
+            **decision,
             "provider": record.provider,
             "workflow": record.workflow,
             "run_id": record.run_id,
@@ -1227,7 +1353,9 @@ class InMemoryRepository(
             "ingest_error": record.ingest_error,
             "budget_admission": record.budget_admission,
             "model_admission": record.model_admission,
+            "router_attempts": attempts,
         }
+        apply_router_totals(result, attempts)
         return result
 
     def observed_users(self) -> list[dict[str, Any]]:

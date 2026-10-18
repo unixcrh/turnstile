@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, Response
 
 from turnstile_core.domain.assistant_models import (
     AssistantAskRequest,
@@ -22,8 +22,10 @@ from turnstile_core.domain.assistant_models import (
     PinnedReportList,
     PinnedReportVisibilityWrite,
 )
+from turnstile_core.domain.model_router import ModelRouter, ModelRouterWrite
 
-from .service_dependencies import AssistantServiceDependency
+from ..services.model_router_service import ModelRouterConflictError
+from .service_dependencies import AssistantServiceDependency, ModelRouterServiceDependency
 from .session import (
     CurrentSession,
     OwnerSession,
@@ -52,7 +54,61 @@ def ask_assistant(
         request,
         user_id=identity.email,
         user_name=identity.name or identity.email,
+        user_role=identity.role,
     )
+
+
+@router.post(
+    "/api/v1/assistant/conversations/{conversation_id}/router-proposals/{proposal_id}/confirm",
+    response_model=ModelRouter,
+    status_code=201,
+)
+def confirm_assistant_router_proposal(
+    conversation_id: UUID,
+    proposal_id: UUID,
+    response: Response,
+    assistant: AssistantServiceDependency,
+    router_service: ModelRouterServiceDependency,
+    identity: OwnerSession,
+) -> ModelRouter:
+    proposal = assistant.router_proposal(conversation_id, proposal_id, identity.email)
+    owner_id = UUID(identity.id)
+    write = ModelRouterWrite(
+        name=proposal.name.strip(),
+        description=proposal.description.strip(),
+        definition=proposal.definition,
+    )
+    try:
+        return router_service.create(
+            write,
+            owner_id,
+            identity.email,
+            identity.role,
+        )
+    except ModelRouterConflictError as error:
+        validation = router_service.validate_definition(
+            write.definition,
+            available_model_ids=set(
+                router_service.catalog(identity.email, identity.role).model_ids
+            ),
+        )
+        existing = next(
+            (
+                router
+                for router in router_service.list(owner_id).items
+                if router.status == "draft"
+                and router.name.casefold() == write.name.casefold()
+                and router.description == write.description
+                and router.definition == write.definition
+            ),
+            None,
+        )
+        if existing is not None and not any(
+            issue.code == "candidate_unavailable" for issue in validation.issues
+        ):
+            response.status_code = 200
+            return existing
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 
 # Conversations are declared before the pinned-chart routes purely for readability; they

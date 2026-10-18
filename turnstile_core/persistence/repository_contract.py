@@ -226,31 +226,144 @@ class QueryRepository(ABC):
     @abstractmethod
     def delete_anomaly_rule(self, rule_id: UUID) -> bool: ...
 
+    @abstractmethod
+    def list_model_routers(self, owner_id: UUID) -> Sequence[dict[str, Any]]: ...
 
+    @abstractmethod
+    def model_router_model_references(
+        self, model_ids: Sequence[UUID],
+    ) -> Sequence[dict[str, Any]]: ...
 
+    @abstractmethod
+    def get_model_router(
+        self, router_id: UUID, owner_id: UUID
+    ) -> dict[str, Any] | None: ...
 
+    @abstractmethod
+    def create_model_router(
+        self, owner_id: UUID, owner_email: str, values: Mapping[str, Any]
+    ) -> dict[str, Any] | None: ...
 
+    @abstractmethod
+    def update_model_router(
+        self, router_id: UUID, owner_id: UUID, values: Mapping[str, Any]
+    ) -> dict[str, Any] | None: ...
 
+    @abstractmethod
+    def publish_model_router(
+        self, router_id: UUID, owner_id: UUID, published_by: str
+    ) -> dict[str, Any] | None: ...
 
+    @abstractmethod
+    def disable_model_router(
+        self, router_id: UUID, owner_id: UUID, changed_by: str
+    ) -> dict[str, Any] | None: ...
 
+    @abstractmethod
+    def delete_model_router(self, router_id: UUID, owner_id: UUID) -> bool: ...
 
+    @abstractmethod
+    def list_model_routers_v3(self, owner_id: UUID) -> Sequence[dict[str, Any]]: ...
 
+    @abstractmethod
+    def get_model_router_v3(
+        self, router_id: UUID, owner_id: UUID
+    ) -> dict[str, Any] | None: ...
 
+    @abstractmethod
+    def create_model_router_v3(
+        self, owner_id: UUID, owner_email: str, values: Mapping[str, Any]
+    ) -> dict[str, Any] | None: ...
 
+    @abstractmethod
+    def update_model_router_v3(
+        self, router_id: UUID, owner_id: UUID, values: Mapping[str, Any]
+    ) -> dict[str, Any] | None: ...
 
+    @abstractmethod
+    def publish_model_router_v3(
+        self,
+        router_id: UUID,
+        owner_id: UUID,
+        published_by: str,
+        compiled_plan: Mapping[str, Any],
+    ) -> dict[str, Any] | None: ...
 
+    @abstractmethod
+    def disable_model_router_v3(
+        self, router_id: UUID, owner_id: UUID, changed_by: str
+    ) -> dict[str, Any] | None: ...
 
+    @abstractmethod
+    def delete_model_router_v3(self, router_id: UUID, owner_id: UUID) -> bool: ...
 
+    @abstractmethod
+    def list_model_router_context_fields(
+        self, references: Sequence[tuple[str, int]]
+    ) -> Sequence[dict[str, Any]]: ...
 
+    @abstractmethod
+    def list_model_router_model_facts(
+        self, references: Sequence[tuple[UUID, int]]
+    ) -> Sequence[dict[str, Any]]: ...
 
+    @abstractmethod
+    def list_model_router_profiles(
+        self, references: Sequence[tuple[UUID, int]]
+    ) -> Sequence[dict[str, Any]]: ...
 
+    @abstractmethod
+    def list_model_router_evaluations(
+        self, evaluation_ids: Sequence[UUID]
+    ) -> Sequence[dict[str, Any]]: ...
 
+    @abstractmethod
+    def list_assigned_model_routers(self, user_id: str) -> Sequence[dict[str, Any]]: ...
 
+    @abstractmethod
+    def get_callable_model_router(
+        self, router_id: UUID, user_id: str
+    ) -> dict[str, Any] | None: ...
 
+    @abstractmethod
+    def set_model_router_assignment(
+        self, router_id: UUID, user_id: str, assigned: bool, changed_by: str
+    ) -> bool: ...
 
+    @abstractmethod
+    def list_model_router_assignees(self, router_id: UUID) -> Sequence[str]: ...
 
+    @abstractmethod
+    def get_model_router_run_binding(
+        self,
+        router_id: UUID,
+        router_version: int,
+        user_id: str,
+        run_id: str,
+    ) -> UUID | None: ...
 
+    @abstractmethod
+    def save_model_router_run_binding(
+        self,
+        router_id: UUID,
+        router_version: int,
+        user_id: str,
+        run_id: str,
+        selected_model_id: UUID,
+        selected_model_name: str,
+    ) -> None: ...
 
+    @abstractmethod
+    def save_model_router_invocation(
+        self,
+        request_id: str,
+        router_id: UUID,
+        router_name: str,
+        router_version: int,
+        selected_model_id: UUID,
+        selected_model_name: str,
+        attempts: Sequence[Mapping[str, Any]],
+    ) -> None: ...
 
     @abstractmethod
     def list_pinned_reports(self, owner_id: str) -> Sequence[dict[str, Any]]: ...

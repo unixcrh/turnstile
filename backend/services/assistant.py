@@ -30,6 +30,7 @@ from turnstile_core.domain.assistant_models import (
     AssistantAskRequest,
     AssistantModelChoice,
     AssistantReply,
+    AssistantRouterProposal,
     AssistantSettings,
     AssistantSettingsWrite,
     AssistantStep,
@@ -109,6 +110,10 @@ Rules:
 7. If a tool returns no rows, say plainly that there is no data in that scope and offer a
    likely reason such as too narrow a window or too strict a filter. Never fabricate.
 8. Write your answer in {language}.
+9. When the user asks to create or design a Model Router, call list_router_models first,
+   then call propose_model_router with only model IDs from that result. The proposal is
+   not created yet: tell the user to review it and use the confirmation button. Never
+   claim a Router was created, published, assigned or invoked from a proposal tool call.
 """
 
 # Only the answer language varies. Anything unlisted falls back to English rather than to
@@ -275,6 +280,7 @@ class AssistantService:
         *,
         user_id: str,
         user_name: str,
+        user_role: str = "member",
     ) -> AssistantReply:
         started = time.monotonic()
         conversation_id = self._resolve_conversation(request.conversation_id, user_id)
@@ -291,8 +297,10 @@ class AssistantService:
         tools = tool_definitions()
         steps: list[AssistantStep] = []
         charts: list[ChartSpec] = []
+        router_proposals: list[AssistantRouterProposal] = []
         total_tokens = 0
         answer = ""
+        self._tools.set_router_context(user_id, user_role)
 
         for turn_index in range(1, MAX_TOOL_ROUNDS + 1):
             response = self._runtime.invoke(
@@ -336,6 +344,8 @@ class AssistantService:
                 steps.append(step)
                 if outcome is not None and outcome.chart is not None:
                     charts.append(outcome.chart)
+                if outcome is not None and outcome.router_proposal is not None:
+                    router_proposals.append(outcome.router_proposal)
                 messages.append(
                     ChatMessage(
                         role="tool",
@@ -356,6 +366,7 @@ class AssistantService:
             conversation_id=conversation_id,
             message=answer.strip() or "No usable conclusion was produced. Try rephrasing.",
             charts=charts,
+            router_proposals=router_proposals,
             steps=steps,
             latency_ms=elapsed_ms(started),
             model=model_key,
@@ -363,6 +374,23 @@ class AssistantService:
         )
         self._record_turn(conversation_id, user_id, request.question, reply)
         return reply
+
+    def router_proposal(
+        self, conversation_id: UUID, proposal_id: UUID, owner_id: str
+    ) -> AssistantRouterProposal:
+        conversation = self.get_conversation(conversation_id, owner_id)
+        proposal = next(
+            (
+                item
+                for exchange in conversation.exchanges
+                for item in exchange.reply.router_proposals
+                if item.id == proposal_id
+            ),
+            None,
+        )
+        if proposal is None:
+            raise HTTPException(status_code=404, detail="Router proposal not found")
+        return proposal
 
     # -- conversations ---------------------------------------------------------
 

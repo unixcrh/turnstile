@@ -427,6 +427,8 @@ class OpenAICompatibleGatewayAdapter:
         if request.max_output_tokens is not None:
             max_tokens_field = str(runtime_config.get("max_tokens_field", "max_tokens"))
             body[max_tokens_field] = request.max_output_tokens
+        if request.reasoning_effort is not None:
+            body["reasoning_effort"] = request.reasoning_effort
         if request.response_format is not None:
             body["response_format"] = {"type": request.response_format}
         response_headers: dict[str, str] = {}

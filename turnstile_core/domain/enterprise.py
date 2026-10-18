@@ -9,6 +9,10 @@ ORGANIZATION_ID = "org-contoso-global"
 DEFAULT_APPLICATION_USER_DEPARTMENT_ID = "department-platform"
 
 
+def invocation_tester(user_id: str) -> EnterpriseEntity | None:
+    return next((user for user in enterprise_catalog().users if user.id == user_id), None)
+
+
 def configured_invocation_testers(
     catalog: EnterpriseEntityCatalog, tester_ids: Iterable[str],
 ) -> list[EnterpriseEntity]:

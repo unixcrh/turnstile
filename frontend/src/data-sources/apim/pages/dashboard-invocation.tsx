@@ -37,7 +37,7 @@ import {
 
 const DEFAULT_MODEL_OPTION = "__default__"
 const MODEL_TARGET_PREFIX = "model:"
-
+const ROUTER_TARGET_PREFIX = "router:"
 const INVOCATION_MAX_OUTPUT_TOKENS = 1_024
 const DECISION_STATE_SAMPLE = "The checkout service has returned HTTP 500 errors for 15 minutes. Customers cannot complete purchases, and the issue affects all regions."
 const DECISION_STATE_JSON_SAMPLE = JSON.stringify({
@@ -96,7 +96,7 @@ export function AgentInvocation({ entities }: { entities: EnterpriseEntityCatalo
   const [mode, setMode] = useState<"chat" | "image" | "decision">("chat");
   const imageMode = mode === "image";
   const decisionMode = mode === "decision";
-
+  const assignedRouters = useQuery({ ...finopsQueries.assignedModelRouters(userId), enabled: mode === "chat" && Boolean(userId) });
   const [invocationTarget, setInvocationTarget] = useState(DEFAULT_MODEL_OPTION);
   const [gatewaySelection, setGatewaySelection] = useState<GatewaySelection>({ targetId: null, deploymentId: null });
   const selectedDirectModelId = invocationTarget.startsWith(MODEL_TARGET_PREFIX)
@@ -146,6 +146,10 @@ export function AgentInvocation({ entities }: { entities: EnterpriseEntityCatalo
   const [invokeError, setInvokeError] = useState<string | null>(null);
   const selectUser = (value: string | undefined) => {
     setUserId(value ?? "");
+    if (invocationTarget.startsWith(ROUTER_TARGET_PREFIX)) {
+      setInvocationTarget(DEFAULT_MODEL_OPTION);
+      setResult(null);
+    }
   };
   const selectDepartment = (value: string | undefined) => {
     const nextDepartmentId = value ?? "";
@@ -171,9 +175,11 @@ export function AgentInvocation({ entities }: { entities: EnterpriseEntityCatalo
   };
   const invoke = async () => {
     if (!registry.data || !gatewayReady || isInvoking || (mode === "chat" && !validOutputLimit)) return;
-
+    const routerId = mode === "chat" && invocationTarget.startsWith(ROUTER_TARGET_PREFIX)
+      ? invocationTarget.slice(ROUTER_TARGET_PREFIX.length)
+      : null;
     const model = invocationModel;
-    if (!model) return;
+    if (!model && !routerId) return;
     if (imageMode && (registry.data.image_generation_supported !== true || registry.data.image_configuration_schema_version !== 4 || !model || !imageProfile || !effectiveImageOptions)) return;
     if (decisionMode && (registry.data.decision_supported !== true || !model)) return;
     const runtime = registry.data.runtimes.find(
@@ -191,9 +197,19 @@ export function AgentInvocation({ entities }: { entities: EnterpriseEntityCatalo
     setImageResult(null);
     try {
       const invocation = {
-        ...{ runtime_id: explicitGateway ? undefined : model.runtime_id, model_id: model.id,
+        ...(routerId
+          ? {
+              router_id: routerId,
+              router_context: {
+                task_type: `${project.id}-interactive`,
+                request_parameter: prompt,
+                user_id: invocationUser.id,
+                required_capability: "chat",
+              },
+            }
+            : { runtime_id: explicitGateway ? undefined : model!.runtime_id, model_id: model!.id,
               gateway_profile_id: explicitGateway ? gatewaySelection.targetId! : undefined,
-              gateway_deployment_id: explicitGateway ? gatewaySelection.deploymentId! : undefined },
+              gateway_deployment_id: explicitGateway ? gatewaySelection.deploymentId! : undefined }),
         metadata: {
           organization_id: entities.organizations[0].id,
           organization: entities.organizations[0].name,
@@ -206,15 +222,17 @@ export function AgentInvocation({ entities }: { entities: EnterpriseEntityCatalo
           user_id: invocationUser.id,
           user: invocationUser.name,
           workflow: decisionMode ? "decision" : imageMode ? "image-generation" : `${project.id}-interactive`,
-          model_id: model.id,
+          model_id: routerId ?? model!.id,
           // These two are display values, so they must carry names. Sending the registry
           // UUID here put a bare UUID in the model column of every denial trace; the
           // ingestion path hid it by resolving the identity server-side, but a caller
           // should not be labelling a model with its primary key in the first place.
           // The runtime had the same defect, and its fallback still reintroduced it, so a
           // missing registry entry now degrades to unattributed rather than to a UUID.
-          model: model.model_key,
-          runtime: runtime?.name ?? "unattributed",
+          model: routerId
+            ? assignedRouters.data?.items.find((item) => item.id === routerId)?.name ?? "model-router"
+            : model!.model_key,
+          runtime: routerId ? "model-router" : runtime?.name ?? "unattributed",
           request_source: decisionMode ? "decision-invocation-module" : imageMode ? "image-invocation-module" : "agent-invocation-module",
           run_id: crypto.randomUUID(),
           turn_index: 1,
@@ -259,7 +277,9 @@ export function AgentInvocation({ entities }: { entities: EnterpriseEntityCatalo
   const selectedModel = invocationTarget.startsWith(MODEL_TARGET_PREFIX)
     ? invocationModel
     : null;
-
+  const selectedRouter = invocationTarget.startsWith(ROUTER_TARGET_PREFIX)
+    ? assignedRouters.data?.items.find((router) => router.id === invocationTarget.slice(ROUTER_TARGET_PREFIX.length))
+    : null;
   const totalTokens = result?.usage
     ? result.usage.input_tokens +
       result.usage.cached_tokens +
@@ -270,7 +290,7 @@ export function AgentInvocation({ entities }: { entities: EnterpriseEntityCatalo
     ? Math.max(result.usage.cached_tokens - cacheWriteTokens, 0)
     : null;
   const exhaustedOutputBudget = mode === "chat" && !!result?.usage && result.usage.output_tokens >= (result.requested_max_output_tokens ?? 64);
-  const canInvoke = !isInvoking && gatewayReady && Boolean(invocationModel) && (mode !== "chat" || validOutputLimit) && Boolean(prompt.trim() && userId && projectId && agentId)
+  const canInvoke = !isInvoking && gatewayReady && Boolean(invocationModel || selectedRouter) && (mode !== "chat" || validOutputLimit) && Boolean(prompt.trim() && userId && projectId && agentId)
     && (!decisionMode || (registry.data?.decision_supported === true && Boolean(questions.trim())))
     && (!imageMode || (registry.data?.image_generation_supported === true && registry.data.image_configuration_schema_version === 4 && Boolean(selectedModel) && Boolean(imageProfile && effectiveImageOptions)));
   const selectMode = (next: typeof mode) => {
@@ -332,12 +352,12 @@ export function AgentInvocation({ entities }: { entities: EnterpriseEntityCatalo
               disabled={isInvoking}
               onValueChange={(next) => { setInvocationTarget(next ?? DEFAULT_MODEL_OPTION); setImageOptions(null); setGatewaySelection({ targetId: null, deploymentId: null }); }}
             >
-              <SelectTrigger aria-label="调用目标" title={selectedModelUnavailable ? "所选模型不可用" : selectedModel?.display_name ?? "默认可用模型"}>
+              <SelectTrigger aria-label="调用目标" title={selectedModelUnavailable ? "所选模型不可用" : selectedRouter?.name ?? selectedModel?.display_name ?? "默认可用模型"}>
                 <SelectValue>
                   {selectedModel && !selectedModelUnavailable ? <span className="invoke-model-option">
                     <InvocationModelLogo model={selectedModel} runtime={registry.data?.runtimes.find(runtime => runtime.id === selectedModel.runtime_id)} />
                     <span>{selectedModel.display_name}</span>
-                  </span> : selectedModelUnavailable ? "所选模型不可用" : (decisionMode ? "选择 Decision 模型" : imageMode ? "选择图片模型" : "默认可用模型")}
+                  </span> : selectedModelUnavailable ? "所选模型不可用" : selectedRouter ? `${selectedRouter.name} · Router v${selectedRouter.version}` : (decisionMode ? "选择 Decision 模型" : imageMode ? "选择图片模型" : "默认可用模型")}
                 </SelectValue>
               </SelectTrigger>
               <SelectContent className="invoke-target-menu" align="start" alignItemWithTrigger={false}>
@@ -353,11 +373,15 @@ export function AgentInvocation({ entities }: { entities: EnterpriseEntityCatalo
                     </span>
                   </SelectItem>
                 ))}</SelectGroup>
-
+                {mode === "chat" && (assignedRouters.data?.items.length ?? 0) > 0 && <><SelectSeparator /><SelectGroup><SelectLabel>模型路由器</SelectLabel>{assignedRouters.data!.items.map((router) => (
+                  <SelectItem key={router.id} value={`${ROUTER_TARGET_PREFIX}${router.id}`}>
+                    {router.name} · v{router.version}
+                  </SelectItem>
+                ))}</SelectGroup></>}
               </SelectContent>
             </Select>
             {selectedModelUnavailable && <div className="invoke-error" role="alert">所选模型不可用</div>}
-
+            {mode === "chat" && assignedRouters.isFetching && <small className="invoke-target-loading"><RefreshCw className="spin" size={11} />正在读取人员路由器</small>}
           </div>
           {explicitGatewayAvailable && selectedDirectModelId && <>
             <div className="invoke-select">
@@ -440,14 +464,17 @@ export function AgentInvocation({ entities }: { entities: EnterpriseEntityCatalo
         {imageMode ? <ImageGenerationResult result={imageResult} pending={isInvoking} available={registry.data?.image_generation_supported === true} /> : result ? (
           <div className="invoke-response">
             <dl className="invoke-result-facts">
-
+              {"router_name" in result && result.router_name && <div>
+                <dt>模型路由器</dt>
+                <dd>{result.router_name} · v{result.router_version}</dd>
+              </div>}
               <div>
                 <dt>网关</dt>
                 <dd>{result.native_gateway_id ?? result.gateway.toUpperCase()}</dd>
               </div>
               {result.gateway_profile_id && <div><dt>APIM 实例</dt><dd>{registry.data?.gateways.find(item => item.id === result.gateway_profile_id)?.name ?? result.gateway_profile_id}</dd></div>}
               <div>
-                <dt></dt>
+                <dt>{"router_name" in result && result.router_name ? "最终模型" : "模型"}</dt>
                 <dd>{"selected_model_name" in result ? result.selected_model_name ?? result.model : result.model}</dd>
               </div>
               <div>

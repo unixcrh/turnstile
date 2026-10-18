@@ -27,6 +27,7 @@ export const DYNAMIC_RULES: Array<[RegExp, (...args: string[]) => string]> = [
   [/^有\s*([\d,]+)\s*个候选缺少用途说明。$/g, (_match, value) => `${value} candidate models have no routing description.`],
   [/^(.+)\s+等\s+([\d,]+)\s+个模型$/g, (_match, name, value) => `${name} and ${value} models total`],
   [/^拖拽或点击添加\s+(.+)$/g, (_match, name) => `Drag or click to add ${name}`],
+  [/^共\s*([\d,]+)\s*个路由器$/g, (_match, value) => `${value} model routers`],
   [/^([\d,]+)\s*个网关发布$/g, (_match, value) => `${value} Gateway ${plural(value, "Release")}`],
   [/^([\d,]+)\s*个条件$/g, (_match, value) => `${value} ${plural(value, "condition")}`],
   [/^([\d,]+)\s*条分支$/g, (_match, value) => `${value} ${plural(value, "branch", "branches")}`],

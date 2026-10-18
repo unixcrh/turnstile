@@ -41,7 +41,7 @@ def test_readme_covers_the_operator_journey() -> None:
     ):
         assert heading in readme
     assert "does not create an Azure AI Foundry project" in readme
-    assert "Model Intelligent Router is intentionally not part" in readme
+    assert "Model Intelligent Router" in readme
 
 
 def test_repository_documents_one_database_entry_point() -> None:

@@ -13,8 +13,8 @@ import {
 
 import type {
   AssistantReply,
-
-
+  AssistantRouterProposal,
+  AssistantRouterProposalModel,
   ChartSpec,
 } from "./types"
 import { ChartCard } from "../charts/chart-card"
@@ -31,7 +31,10 @@ const STARTERS = [
   { emoji: "💰", text: "哪个模型的成本最高？" },
 ]
 
-
+const ROUTER_STARTER = {
+  emoji: "🧭",
+  text: "帮我创建一个按优先级路由的智能模型路由草稿。",
+}
 
 const COPILOT_STARTERS = [
   { emoji: "👥", text: "哪些 Copilot 成员最近最活跃？" },
@@ -64,12 +67,17 @@ function ToolSteps({ reply }: { reply: AssistantReply }) {
   </div>
 }
 
-
+const STRATEGY_LABELS = {
+  priority: "优先级",
+  weighted: "权重",
+  model_based: "模型决策",
+} as const
 
 const OPERATOR_LABELS = {
   equals: "等于",
   not_equals: "不等于",
   contains: "包含",
+  matches_any: "包含任一关键词",
   greater_than: "大于",
   greater_than_or_equal: "大于或等于",
   less_than: "小于",
@@ -77,15 +85,144 @@ const OPERATOR_LABELS = {
   exists: "存在",
 } as const
 
+const FALLBACK_LABELS = {
+  error: "错误",
+  timeout: "超时",
+  rate_limit: "限流",
+  quality: "质量不足",
+} as const
 
+function strategyDetail(model: AssistantRouterProposalModel, strategy: AssistantRouterProposal["strategy_type"]) {
+  if (strategy === "weighted") return `${model.weight}%`
+  if (strategy === "priority") return `P${model.priority}`
+  return "候选"
+}
 
+function ProposalBranch({
+  label,
+  strategy,
+  models,
+}: {
+  label: string
+  strategy: AssistantRouterProposal["strategy_type"]
+  models: AssistantRouterProposalModel[]
+}) {
+  return <section className="assistant-router-branch">
+    <div className="assistant-router-branch-head">
+      <span>{label}</span>
+      <em>{STRATEGY_LABELS[strategy]}</em>
+    </div>
+    <ol>
+      {models.map((model) => <li key={model.model_id}>
+        <span className="assistant-router-model-order">{model.priority}</span>
+        <span className="assistant-router-model-copy">
+          <b data-no-localize>{model.display_name}</b>
+          <small data-no-localize>{model.provider_name}</small>
+        </span>
+        <span className="assistant-router-model-strategy">{strategyDetail(model, strategy)}</span>
+      </li>)}
+    </ol>
+  </section>
+}
 
+function openModelRouters(routerId: string) {
+  const url = new URL(window.location.href)
+  url.searchParams.set("page", "model-router")
+  url.searchParams.set("router", routerId)
+  url.searchParams.delete("conversation")
+  window.history.replaceState(null, "", url)
+  window.dispatchEvent(new Event(FINOPS_NAVIGATE_EVENT))
+}
 
+function RouterProposalCard({
+  proposal,
+  conversationId,
+  controller,
+}: {
+  proposal: AssistantRouterProposal
+  conversationId: string
+  controller: AssistantController
+}) {
+  const result = controller.routerProposalResults[proposal.id]
+  const confirming = controller.confirmRouterProposal.isPending
+    && controller.confirmRouterProposal.variables?.proposalId === proposal.id
+  const primary = proposal.models.filter((model) => model.branch === "primary")
+  const alternate = proposal.models.filter((model) => model.branch === "else")
+  const conditionValue = proposal.condition?.operator === "exists"
+    ? null
+    : String(proposal.condition?.value ?? "")
 
+  return <article className="assistant-router-proposal">
+    <header>
+      <span className="assistant-router-proposal-icon"><Route size={15} /></span>
+      <div>
+        <small>智能模型路由提案</small>
+        <h4 data-no-localize>{proposal.name}</h4>
+      </div>
+      <span className="assistant-router-draft">草稿</span>
+    </header>
+    {proposal.description && <p data-no-localize>{proposal.description}</p>}
 
+    {proposal.condition && <div className="assistant-router-condition">
+      <GitBranch size={13} />
+      <span>当</span>
+      <b data-no-localize>{proposal.condition.field}</b>
+      <span>{OPERATOR_LABELS[proposal.condition.operator]}</span>
+      {conditionValue != null && <b data-no-localize>{conditionValue}</b>}
+    </div>}
 
+    <div className="assistant-router-branches">
+      <ProposalBranch
+        label={proposal.condition ? "Match 分支" : "候选模型"}
+        strategy={proposal.strategy_type}
+        models={primary}
+      />
+      {alternate.length > 0 && <ProposalBranch
+        label="Else 分支"
+        strategy={proposal.else_strategy_type ?? proposal.strategy_type}
+        models={alternate}
+      />}
+    </div>
 
+    {proposal.fallback_on.length > 0 && <div className="assistant-router-fallback">
+      <span>失败转移</span>
+      {proposal.fallback_on.map((event) => <em key={event}>{FALLBACK_LABELS[event]}</em>)}
+    </div>}
 
+    <footer>
+      {result?.status === "created"
+        ? <>
+          <span className="assistant-router-created"><Check size={13} />已创建草稿</span>
+          <button
+            type="button"
+            className="assistant-router-open"
+            onClick={() => openModelRouters(result.router.id)}
+          >
+            打开模型智能路由<ChevronRight size={13} />
+          </button>
+        </>
+        : controller.canManageRouters
+          ? <button
+            type="button"
+            className="assistant-router-confirm"
+            disabled={controller.confirmRouterProposal.isPending}
+            onClick={() => controller.confirmRouterProposal.mutate({
+              conversationId,
+              proposalId: proposal.id,
+            })}
+          >
+            {confirming ? <Loader2 size={13} className="assistant-spin" /> : <Check size={13} />}
+            {confirming ? "正在创建…" : "创建草稿"}
+          </button>
+          : <span className="assistant-router-owner-note">
+            <ShieldAlert size={13} />仅 Owner 可创建路由器草稿
+          </span>}
+      {result?.status === "error" && <span className="assistant-router-proposal-error">
+        <AlertTriangle size={12} /><span data-no-localize>{result.message}</span>
+      </span>}
+    </footer>
+  </article>
+}
 
 /**
  * The transcript and the composer, shared verbatim by the floating panel and the full
@@ -102,7 +239,7 @@ export function AssistantConversation({ controller, onPin }: {
   const isCopilot = controller.source === "github-copilot"
   const starters = isCopilot
     ? COPILOT_STARTERS
-    : STARTERS
+    : controller.canManageRouters ? [...STARTERS, ROUTER_STARTER] : STARTERS
   const scrollRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -153,7 +290,43 @@ export function AssistantConversation({ controller, onPin }: {
         </div>
       </div>}
 
-
+      {exchanges.map((exchange) => <div className="assistant-exchange" key={exchange.id}>
+        {/* Both the question and the answer are content, not product copy: one is typed
+            by a person and the other is written by the model in the language it was
+            asked to use. Running either through the phrase dictionary rewrites
+            recognised fragments and leaves the rest, which reads as corruption. */}
+        <div className="assistant-question" data-no-localize>{exchange.question}</div>
+        {!exchange.reply && !exchange.error && <div className="assistant-thinking">
+          <Loader2 size={13} className="assistant-spin" />
+          <span>正在查询…</span>
+        </div>}
+        {exchange.error && <div className="assistant-error">
+          <AlertTriangle size={13} />
+          <span>{exchange.error}</span>
+        </div>}
+        {exchange.reply && <div className="assistant-answer">
+          <ToolSteps reply={exchange.reply} />
+          {/* The question is not rendered this way: it is typed into a plain textarea,
+              not authored as markdown, so a person asking about `**` or a cost of
+              `$5 * 3` would have their own words silently reformatted. */}
+          {exchange.reply.message && <AssistantMarkdown>{exchange.reply.message}</AssistantMarkdown>}
+          {exchange.reply.router_proposals?.map((proposal) => <RouterProposalCard
+            key={proposal.id}
+            proposal={proposal}
+            conversationId={exchange.reply!.conversation_id}
+            controller={controller}
+          />)}
+          {exchange.reply.charts.map((chart) => <ChartCard
+            key={chart.id}
+            chart={chart}
+            onPin={onPin ? () => onPin({ chart, question: exchange.question }) : undefined}
+          />)}
+          <div className="assistant-meta">
+            {exchange.reply.model} · {exchange.reply.total_tokens.toLocaleString()} Token ·
+            {" "}{(exchange.reply.latency_ms / 1000).toFixed(1)} s
+          </div>
+        </div>}
+      </div>)}
     </div>
 
     <div className="assistant-composer">

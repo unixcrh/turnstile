@@ -16,7 +16,8 @@ import calendar
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from typing import Any
+from typing import Annotated, Any, Literal
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import (
@@ -24,9 +25,13 @@ from pydantic import (
     ConfigDict,
     Field,
     ValidationError,
+    field_validator,
+    model_validator,
 )
 
 from turnstile_core.domain.assistant_models import (
+    AssistantRouterProposal,
+    AssistantRouterProposalModel,
     ChartQuery,
     ChartSeries,
     ChartSpec,
@@ -34,6 +39,17 @@ from turnstile_core.domain.assistant_models import (
     TrendInterval,
     UsageDimension,
     UsageMetric,
+)
+from turnstile_core.domain.model_router import (
+    ModelRouterCandidate,
+    ModelRouterCondition,
+    ModelRouterDefinition,
+    ModelRouterEdge,
+    ModelRouterFallbackEvent,
+    ModelRouterNode,
+    ModelRouterPosition,
+    ModelRouterStrategyModel,
+    ModelRouterStrategyType,
 )
 from turnstile_core.domain.runtime_models import ToolDefinition, ToolFunctionDefinition
 from turnstile_core.persistence.repository import QueryRepository, UsageFilters
@@ -250,6 +266,80 @@ class EntityArguments(ToolArguments):
     keyword: str | None = Field(default=None, max_length=120)
 
 
+class RouterModelCatalogArguments(ToolArguments):
+    capability: str | None = Field(default=None, max_length=64)
+
+
+RouterWeight = Annotated[int, Field(ge=1, le=100)]
+RouterProposalFallbackEvent = Literal["error", "timeout", "rate_limit"]
+
+
+class RouterProposalArguments(ToolArguments):
+    name: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=500)
+    strategy_type: Literal["priority", "weighted", "model_based"] = "priority"
+    routing_model_id: UUID | None = None
+    model_ids: list[UUID] = Field(min_length=1, max_length=10)
+    model_weights: list[RouterWeight] | None = Field(
+        default=None, min_length=1, max_length=10
+    )
+    condition_field: str | None = Field(default=None, min_length=1, max_length=120)
+    condition_operator: Literal[
+        "equals", "not_equals", "contains", "greater_than", "greater_than_or_equal",
+        "less_than", "less_than_or_equal", "exists"
+    ] | None = None
+    condition_value: str | float | bool | None = None
+    else_model_ids: list[UUID] = Field(default_factory=list, max_length=10)
+    else_strategy_type: Literal["priority", "weighted", "model_based"] | None = None
+    else_routing_model_id: UUID | None = None
+    else_model_weights: list[RouterWeight] | None = Field(default=None, max_length=10)
+    fallback_on: list[RouterProposalFallbackEvent] = Field(
+        default_factory=list, max_length=3
+    )
+
+    @field_validator("name", "condition_field", mode="before")
+    @classmethod
+    def strip_required_text(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def validate_router_shape(self) -> RouterProposalArguments:
+        has_condition = self.condition_field is not None
+        if has_condition != (self.condition_operator is not None):
+            raise ValueError("condition_field and condition_operator must be provided together")
+        if bool(self.else_model_ids) != has_condition:
+            raise ValueError("else_model_ids are required exactly when a condition is configured")
+        if self.condition_operator == "exists" and self.condition_value is not None:
+            raise ValueError("an exists condition must not provide condition_value")
+        if self.condition_operator not in {None, "exists"} and self.condition_value is None:
+            raise ValueError("this condition operator requires condition_value")
+        if self.model_weights is not None and len(self.model_weights) != len(self.model_ids):
+            raise ValueError("model_weights must match model_ids")
+        if self.else_model_weights is not None and len(self.else_model_weights) != len(
+            self.else_model_ids
+        ):
+            raise ValueError("else_model_weights must match else_model_ids")
+        if len(set(self.model_ids + self.else_model_ids)) != len(
+            self.model_ids + self.else_model_ids
+        ):
+            raise ValueError("a model cannot appear in more than one branch")
+        if (self.strategy_type == "model_based") != (self.routing_model_id is not None):
+            raise ValueError(
+                "routing_model_id is required exactly for a model_based primary branch"
+            )
+        if not has_condition and self.else_routing_model_id is not None:
+            raise ValueError("else_routing_model_id requires a condition branch")
+        if has_condition:
+            else_strategy = self.else_strategy_type or self.strategy_type
+            if (else_strategy == "model_based") != (
+                self.else_routing_model_id is not None
+            ):
+                raise ValueError(
+                    "else_routing_model_id is required exactly for a model_based else branch"
+                )
+        return self
+
+
 @dataclass(frozen=True)
 class ResolvedRange:
     start: datetime
@@ -362,6 +452,337 @@ class AssistantTools:
     ):
         self._repository = repository
         self._entity_catalog = entity_catalog
+        self._router_user_email = ""
+        self._router_role = "member"
+
+    def set_router_context(self, user_email: str, role: str) -> None:
+        self._router_user_email = user_email
+        self._router_role = role
+
+    def _available_router_models(self) -> list[dict[str, Any]]:
+        registry = self._repository.registry()
+        providers = {row["id"]: row for row in registry["providers"]}
+        runtimes = {row["id"]: row for row in registry["runtimes"]}
+        gateways = {row["id"]: row for row in registry["gateways"]}
+        policy = next(
+            (
+                row
+                for row in self._repository.list_user_model_policies(
+                    [self._router_user_email]
+                )
+                if str(row["user_id"]) == self._router_user_email
+            ),
+            None,
+        )
+        assigned = (
+            {UUID(str(value)) for value in policy.get("model_ids", [])}
+            if policy
+            else None
+        )
+        available: list[dict[str, Any]] = []
+        for model in registry["models"]:
+            runtime = runtimes.get(model["runtime_id"])
+            provider = providers.get(model["provider_id"])
+            gateway = gateways.get(runtime.get("gateway_profile_id")) if runtime else None
+            model_id = UUID(str(model["id"]))
+            if not model.get("enabled") or not runtime or not runtime.get("enabled"):
+                continue
+            if not provider or not provider.get("enabled"):
+                continue
+            if gateway is not None and not gateway.get("enabled"):
+                continue
+            if self._router_role not in (model.get("allowed_roles") or []):
+                continue
+            if self._router_role not in (runtime.get("allowed_roles") or []):
+                continue
+            if assigned is not None and model_id not in assigned:
+                continue
+            if assigned is None and model.get("assignment_required"):
+                continue
+            available.append(
+                {
+                    "id": model_id,
+                    "display_name": str(model["display_name"]),
+                    "provider_name": str(model["provider_name"]),
+                    "capabilities": [str(value) for value in model.get("capabilities", [])],
+                }
+            )
+        available.sort(key=lambda item: item["display_name"])
+        return available
+
+    def list_router_models(
+        self, arguments: RouterModelCatalogArguments, timezone: str, locale: str
+    ) -> ToolOutcome:
+        del timezone, locale
+        capability = (arguments.capability or "").strip().casefold()
+        models = [
+            model
+            for model in self._available_router_models()
+            if not capability
+            or capability in {value.casefold() for value in model["capabilities"]}
+        ]
+        return ToolOutcome(
+            payload={
+                "models": [
+                    {
+                        **model,
+                        "id": str(model["id"]),
+                    }
+                    for model in models
+                ]
+            },
+            summary=f"{len(models)} Router models available",
+            row_count=len(models),
+        )
+
+    def propose_model_router(
+        self, arguments: RouterProposalArguments, timezone: str, locale: str
+    ) -> ToolOutcome:
+        del timezone, locale
+        available = {model["id"]: model for model in self._available_router_models()}
+        requested = [
+            *arguments.model_ids,
+            *arguments.else_model_ids,
+            *(
+                [arguments.routing_model_id]
+                if arguments.routing_model_id is not None
+                else []
+            ),
+            *(
+                [arguments.else_routing_model_id]
+                if arguments.else_routing_model_id is not None
+                else []
+            ),
+        ]
+        unavailable = [model_id for model_id in requested if model_id not in available]
+        if unavailable:
+            raise ToolInputError(
+                "The proposal contains a model that is unavailable to this user"
+            )
+
+        condition = (
+            ModelRouterCondition(
+                field=arguments.condition_field,
+                operator=arguments.condition_operator,
+                value=arguments.condition_value,
+            )
+            if arguments.condition_field is not None
+            and arguments.condition_operator is not None
+            else None
+        )
+        start = ModelRouterNode(
+            id="start",
+            type="start",
+            label="Start",
+            position=ModelRouterPosition(x=40, y=220),
+        )
+        output = ModelRouterNode(
+            id="output",
+            type="output",
+            label="Output",
+            position=ModelRouterPosition(x=1260, y=220),
+        )
+        nodes = [start]
+        edges: list[ModelRouterEdge] = []
+        proposal_models: list[AssistantRouterProposalModel] = []
+
+        def add_branch(
+            branch: Literal["primary", "else"],
+            model_ids: list[UUID],
+            strategy_type: ModelRouterStrategyType,
+            routing_model_id: UUID | None,
+            weights: list[int] | None,
+            y: int,
+        ) -> tuple[ModelRouterNode, ModelRouterNode]:
+            pool_id = f"{branch}-candidates"
+            strategy_id = f"{branch}-strategy"
+            resolved_weights = weights or [100] * len(model_ids)
+            pool = ModelRouterNode(
+                id=pool_id,
+                type="candidate_models",
+                label="Primary candidates" if branch == "primary" else "Else candidates",
+                position=ModelRouterPosition(x=500, y=y),
+                candidates=[ModelRouterCandidate(model_id=model_id) for model_id in model_ids],
+            )
+            strategy = ModelRouterNode(
+                id=strategy_id,
+                type="strategy",
+                label="Primary strategy" if branch == "primary" else "Else strategy",
+                position=ModelRouterPosition(x=860, y=y),
+                strategy_type=strategy_type,
+                routing_model_id=routing_model_id,
+                model_configs=[
+                    ModelRouterStrategyModel(
+                        model_id=model_id,
+                        priority=index + 1,
+                        weight=resolved_weights[index],
+                    )
+                    for index, model_id in enumerate(model_ids)
+                ],
+            )
+            edges.extend(
+                [
+                    ModelRouterEdge(
+                        id=f"{pool_id}-{strategy_id}",
+                        source=pool_id,
+                        target=strategy_id,
+                    ),
+                    ModelRouterEdge(
+                        id=f"{strategy_id}-output",
+                        source=strategy_id,
+                        target=output.id,
+                        source_handle="branch-normal",
+                        label="正常输出",
+                    ),
+                ]
+            )
+            proposal_models.extend(
+                AssistantRouterProposalModel(
+                    model_id=model_id,
+                    display_name=available[model_id]["display_name"],
+                    provider_name=available[model_id]["provider_name"],
+                    capabilities=available[model_id]["capabilities"],
+                    branch=branch,
+                    priority=index + 1,
+                    weight=resolved_weights[index],
+                )
+                for index, model_id in enumerate(model_ids)
+            )
+            return pool, strategy
+
+        if condition is None:
+            primary_pool, primary_strategy = add_branch(
+                "primary",
+                arguments.model_ids,
+                arguments.strategy_type,
+                arguments.routing_model_id,
+                arguments.model_weights,
+                220,
+            )
+            nodes.extend([primary_pool, primary_strategy, output])
+            edges.insert(
+                0,
+                ModelRouterEdge(
+                    id="start-primary-candidates",
+                    source=start.id,
+                    target=primary_pool.id,
+                ),
+            )
+        else:
+            condition_node = ModelRouterNode(
+                id="condition",
+                type="condition",
+                label="Condition",
+                position=ModelRouterPosition(x=260, y=220),
+                condition=condition,
+            )
+            primary_pool, primary_strategy = add_branch(
+                "primary",
+                arguments.model_ids,
+                arguments.strategy_type,
+                arguments.routing_model_id,
+                arguments.model_weights,
+                60,
+            )
+            else_strategy = arguments.else_strategy_type or arguments.strategy_type
+            else_pool, else_strategy_node = add_branch(
+                "else",
+                arguments.else_model_ids,
+                else_strategy,
+                arguments.else_routing_model_id,
+                arguments.else_model_weights,
+                380,
+            )
+            nodes.extend(
+                [
+                    condition_node,
+                    primary_pool,
+                    else_pool,
+                    primary_strategy,
+                    else_strategy_node,
+                    output,
+                ]
+            )
+            edges[0:0] = [
+                ModelRouterEdge(
+                    id="start-condition",
+                    source=start.id,
+                    target=condition_node.id,
+                ),
+                ModelRouterEdge(
+                    id="condition-primary",
+                    source=condition_node.id,
+                    target=primary_pool.id,
+                    label="Match",
+                ),
+                ModelRouterEdge(
+                    id="condition-else",
+                    source=condition_node.id,
+                    target=else_pool.id,
+                    label="Else",
+                ),
+            ]
+
+        fallback_events: list[ModelRouterFallbackEvent] = list(arguments.fallback_on)
+        definition = ModelRouterDefinition(
+            presentation_version=6,
+            default_model_id=arguments.model_ids[0],
+            nodes=nodes,
+            edges=edges,
+        )
+        if fallback_events:
+            output.position = ModelRouterPosition(x=1260, y=124)
+            fallback = ModelRouterNode(
+                id="fallback",
+                type="fallback",
+                label="Fallback",
+                position=ModelRouterPosition(x=1260, y=340),
+                fallback_on=fallback_events,
+            )
+            nodes.append(fallback)
+            for strategy_node in (node for node in nodes if node.type == "strategy"):
+                edges.append(
+                    ModelRouterEdge(
+                        id=f"{strategy_node.id}-fallback",
+                        source=strategy_node.id,
+                        target=fallback.id,
+                        source_handle="branch-exception",
+                        label="异常策略",
+                    )
+                )
+            definition = definition.model_copy(update={"nodes": nodes, "edges": edges})
+
+        proposal = AssistantRouterProposal(
+            id=uuid4(),
+            name=arguments.name,
+            description=arguments.description,
+            strategy_type=arguments.strategy_type,
+            else_strategy_type=arguments.else_strategy_type,
+            condition=condition,
+            fallback_on=fallback_events,
+            models=proposal_models,
+            definition=definition,
+        )
+        return ToolOutcome(
+            payload={
+                "proposal_id": str(proposal.id),
+                "name": proposal.name,
+                "status": "awaiting_user_confirmation",
+                "models": [
+                    {
+                        "id": str(model.model_id),
+                        "display_name": model.display_name,
+                        "branch": model.branch,
+                        "priority": model.priority,
+                        "weight": model.weight,
+                    }
+                    for model in proposal.models
+                ],
+            },
+            router_proposal=proposal,
+            summary=f"Router proposal ready: {proposal.name}",
+            row_count=len(proposal.models),
+        )
 
     # -- catalog ---------------------------------------------------------------
 
@@ -673,6 +1094,32 @@ REGISTRY: tuple[RegisteredTool, ...] = (
         ),
         arguments_model=UsageSummaryArguments,
         run=lambda tools, arguments, timezone, locale: tools.usage_summary(
+            arguments, timezone, locale
+        ),
+    ),
+    RegisteredTool(
+        name="list_router_models",
+        description=(
+            "List the real models the current user may include in a Model Router. "
+            "Call this before proposing a Router. Never invent or reuse a model ID "
+            "that is absent from this result. Optionally filter by capability."
+        ),
+        arguments_model=RouterModelCatalogArguments,
+        run=lambda tools, arguments, timezone, locale: tools.list_router_models(
+            arguments, timezone, locale
+        ),
+    ),
+    RegisteredTool(
+        name="propose_model_router",
+        description=(
+            "Create a non-mutating Model Router draft proposal for user confirmation. "
+            "Use only model IDs returned by list_router_models. Use model_ids for one "
+            "candidate pool. To make a real conditional Router, provide condition_field, "
+            "condition_operator, condition_value and else_model_ids; the backend builds "
+            "Match and Else branches. This tool never creates, publishes or assigns a Router."
+        ),
+        arguments_model=RouterProposalArguments,
+        run=lambda tools, arguments, timezone, locale: tools.propose_model_router(
             arguments, timezone, locale
         ),
     ),

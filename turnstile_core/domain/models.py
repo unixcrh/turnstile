@@ -165,6 +165,9 @@ class UsageRequestSummary(StrictModel):
     estimated_cost: float = Field(ge=0)
     cost_available: bool | None = None
     error_message: str | None
+    router_id: UUID | None = None
+    router_name: str | None = None
+    router_version: int | None = Field(default=None, ge=1)
     selected_model_id: UUID | None = None
     selected_model_name: str | None = None
 
@@ -201,6 +204,7 @@ class UsageRequestDetail(UsageRequestSummary):
     # Outcome of the gateway model access check. Same contract as above: anything other
     # than 'ok' or None means the model policy did not actually bind on this call.
     model_admission: str | None = None
+    router_attempts: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class UsageAnomaly(StrictModel):

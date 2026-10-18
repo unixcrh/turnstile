@@ -61,7 +61,7 @@ Turnstile is a self-hosted control plane for governed AI model access. It combin
 > [!WARNING]
 > The GitHub data source and GitHub Copilot integration are still under active development and are not production-ready. Enable them with care, and independently verify usage, cost, and governance data before relying on it for operational or financial decisions. If you only need FinOps for GitHub Copilot, see [OctoFinance](https://github.com/satomic/OctoFinance).
 
-Model Intelligent Router is intentionally not part of this release. It may return as an optional extension in a future version.
+- **Model Intelligent Router:** visual canvas and regular configuration for priority, weighted, and model-based logical routing with conditional branching, fallback policies, per-person router assignment, and two-stage Request Trace attribution.
 
 ## What's New in v1.2
 
@@ -248,7 +248,6 @@ Review [Security](docs/security.md) before deployment.
 - PostgreSQL is required; there is no supported local or embedded production data store.
 - APIM and Azure resource provisioning can take several minutes.
 - For streamed responses where the APIM policy cannot capture a usage breakdown, token and cost records are initially incomplete. Reconciliation restores prompt and completion counts when gateway logs are available, but per-request cache usage remains unknown and resulting costs may remain lower bounds.
-- Model Intelligent Router is not included in this release.
 
 ## Troubleshooting
 

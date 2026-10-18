@@ -96,6 +96,7 @@ import {
 import { useIsMobile } from "./hooks/use-mobile";
 import { getIntlLocale } from "./locales/index";
 import { ModelManagementPage } from "./pages/model-management-page";
+import { ModelRouterPage } from "./pages/model-router-page";
 import { ApimNativeRoutesPage } from "./pages/apim-native-routes-page";
 import { GatewayReleasesPage } from "./pages/gateway-releases-page";
 import { ApplicationsPage } from "./pages/applications-page";
@@ -112,6 +113,7 @@ import type {
 type Page =
   | "settings"
   | "models"
+  | "model-router"
   | "apim-native-routes"
   | "gateway-releases"
   | "applications"
@@ -149,6 +151,7 @@ function dataSourceFromStorage(): DataSource {
 const pageIds: Page[] = [
   "settings",
   "models",
+  "model-router",
   "apim-native-routes",
   "gateway-releases",
   "applications",
@@ -1067,6 +1070,7 @@ export function App() {
     url.searchParams.set("page", next);
     url.searchParams.delete("runtime");
     url.searchParams.delete("tab");
+    if (next !== "model-router") url.searchParams.delete("router");
     url.searchParams.delete("application");
     if (next !== "pinned-report") url.searchParams.delete("chart");
     // The open thread belongs to the assistant page alone. Leaving it in the URL would
@@ -1134,7 +1138,9 @@ export function App() {
   const pageInfo = sourcePages.find((item) => item.id === page) ?? {
     id: page,
     label:
-      page === "apim-native-routes"
+      page === "model-router"
+        ? "模型智能路由"
+        : page === "apim-native-routes"
         ? "APIM 后端池"
         : page === "gateway-releases"
           ? "发布管理"
@@ -1144,7 +1150,9 @@ export function App() {
           ? "设置"
           : "模型管理",
     icon:
-      page === "apim-native-routes"
+      page === "model-router"
+        ? Workflow
+        : page === "apim-native-routes"
         ? Network
         : page === "gateway-releases"
           ? History
@@ -1179,6 +1187,7 @@ export function App() {
       items: [
         { label: "模型管理", icon: Cpu, page: "models" },
         { label: "APIM 后端池", icon: Network, page: "apim-native-routes" },
+        { label: "模型智能路由", icon: Workflow, page: "model-router" },
         { label: "发布历史", icon: History, page: "gateway-releases" },
         { label: "订阅管理", icon: KeyRound, page: "applications" },
       ],
@@ -1498,13 +1507,14 @@ export function App() {
           </header>
         )}
         <div
-          className={`page ${page === "settings" ? "settings-host" : ""} ${page === "models" || page === "apim-native-routes" || page === "gateway-releases" || page === "applications" ? "registry-workspace-host" : ""} ${workspacePage ? "finops-workspace-host" : ""}`}
+          className={`page ${page === "settings" ? "settings-host" : ""} ${page === "models" || page === "apim-native-routes" || page === "gateway-releases" || page === "applications" || page === "model-router" ? "registry-workspace-host" : ""} ${workspacePage ? "finops-workspace-host" : ""}`}
         >
           {page === "settings" && <SettingsPage dataSource={selectedDataSource} />}
           {selectedDataSource === "apim" && page === "models" && <ModelManagementPage onToggleSidebar={toggleSidebar} />}
           {selectedDataSource === "apim" && page === "apim-native-routes" && <ApimNativeRoutesPage routeDrawerOpen={nativeRouteDrawerOpen} onRouteDrawerOpenChange={setNativeRouteDrawerOpen} addOpen={nativeRouteAddOpen} onAddOpenChange={setNativeRouteAddOpen} />}
           {selectedDataSource === "apim" && page === "gateway-releases" && <GatewayReleasesPage releaseDrawerOpen={gatewayReleaseDrawerOpen} onReleaseDrawerOpenChange={setGatewayReleaseDrawerOpen} />}
           {selectedDataSource === "apim" && page === "applications" && <ApplicationsPage />}
+          {selectedDataSource === "apim" && page === "model-router" && <ModelRouterPage />}
           {page === "assistant" && (
             <AssistantPage
               key={selectedDataSource}

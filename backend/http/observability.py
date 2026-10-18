@@ -64,6 +64,8 @@ def usage_filters(
     user_id: str | None = None,
     runtime: Annotated[list[str] | None, Query()] = None,
     status_code: Annotated[int | None, Query(ge=100, le=599)] = None,
+    apim_target_id: UUID | None = None,
+    gateway_deployment_id: UUID | None = None,
 ) -> UsageFilters:
     return UsageFilters(
         organization_id=organization_id,
@@ -74,6 +76,8 @@ def usage_filters(
         user_id=user_id,
         runtime=tuple(runtime) if runtime else None,
         status_code=status_code,
+        apim_target_id=apim_target_id,
+        gateway_deployment_id=gateway_deployment_id,
     )
 
 

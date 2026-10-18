@@ -145,6 +145,7 @@ def test_openapi_root_is_a_small_domain_index() -> None:
         "budgets.yaml",
         "github-copilot.yaml",
         "model-platform.yaml",
+        "model-router.yaml",
         "observability.yaml",
     }
 
