@@ -36,6 +36,8 @@ from .repository_support import (
     _program_migration_manifest,
     _program_migration_retry,
     _require_program_migration_activation,
+    _route_reconcile_credential_read_denied,
+    _route_reconcile_preparation_failed,
     _validate_gateway_deployment_snapshots,
 )
 
@@ -191,11 +193,20 @@ class InMemoryPublicationRepositoryMixin:
                     "created_at": datetime.now(UTC),
                 })
                 existing = None
-        if (existing is not None and (model_addition or model_removal)
+        credential_read_denied = (existing is not None
+            and publication_kind == "route_reconcile"
+            and _route_reconcile_credential_read_denied(existing))
+        preparation_failed = (existing is not None
+            and publication_kind == "route_reconcile"
+            and _route_reconcile_preparation_failed(existing))
+        if (existing is not None
+            and (model_addition or model_removal or credential_read_denied
+                 or preparation_failed)
             and existing["status"] == "failed"
                 and existing.get("base_release_id") == expected_base_release_id
                 and existing.get("desired_spec") == dict(desired_spec)
-                and existing.get("resource_manifest") == manifest
+                and (existing.get("resource_manifest") == manifest
+                     or (preparation_failed and not manifest))
                 and existing.get("apim_revision") is None
                 and existing.get("policy_sha256") is None
                 and any(outbox["publication_id"] == existing["id"]

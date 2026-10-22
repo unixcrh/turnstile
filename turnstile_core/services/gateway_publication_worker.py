@@ -570,6 +570,20 @@ class GatewayPublicationWorker:
                 "base_policy_document_sha256": policy_document_digest(live_policy),
             }
         elif status == "validating":
+            if any(
+                binding.provider_brand_key.value == "microsoft_foundry"
+                and binding.backend_pool is not None and any(
+                    member.model_id is not None or (
+                        member.upstream_model_id is not None
+                        and member.upstream_model_id != binding.model.upstream_model_id
+                    )
+                    for member in binding.backend_pool.members
+                ) for binding in publication.desired_spec.bindings
+            ):
+                validate_pool = getattr(client, "validate_pool_deployments", None)
+                if not callable(validate_pool):
+                    raise PolicyCompilationError("Pool deployment validation is unavailable")
+                validate_pool(publication)
             encrypted = self._repository.gateway_publication_credential(publication.id)
             credential = None
             if encrypted is not None:

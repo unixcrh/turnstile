@@ -33,6 +33,7 @@ from ..domain.application_access import (
 from ..domain.billable_requests import BillableRequestOutcome
 from ..domain.control_plane import (
     COUNT_TOKENS_REJECTIONS,
+    PUBLICATION_OBSERVER_ACTIONS,
     ApiFormat,
     AuthStrategy,
     DiscoveryModel,
@@ -193,6 +194,27 @@ class AzureApimPublisherClient(AzureSelfHostedGatewayManagementMixin):
                 request_id = str(UUID(correlation))
             response.raise_for_status()
             missing = missing_management_actions(response.json(), required)
+        except (httpx.HTTPError, RuntimeError, ValueError, KeyError):
+            raise PublisherPermissionError(request_id=request_id) from None
+        if missing:
+            raise PublisherPermissionError(missing_actions=missing, request_id=request_id)
+
+    def verify_observer_permissions(self, named_value_id: str) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,180}", named_value_id):
+            raise PolicyCompilationError("Observer credential source identity is invalid")
+        path = "/namedValues/" + quote(named_value_id, safe="")
+        request_id = None
+        try:
+            response = self._client.get(
+                self._base + path + "/providers/Microsoft.Authorization/permissions",
+                params={"api-version": "2022-04-01"}, headers=self._headers(),
+                timeout=10.0, follow_redirects=False,
+            )
+            supplied_id = response.headers.get("x-ms-request-id", "")
+            if re.fullmatch(r"[a-fA-F0-9-]{36}", supplied_id):
+                request_id = str(UUID(supplied_id))
+            response.raise_for_status()
+            missing = missing_management_actions(response.json(), PUBLICATION_OBSERVER_ACTIONS)
         except (httpx.HTTPError, RuntimeError, ValueError, KeyError):
             raise PublisherPermissionError(request_id=request_id) from None
         if missing:
@@ -620,6 +642,86 @@ class AzureApimPublisherClient(AzureSelfHostedGatewayManagementMixin):
                 self._circuit_breaker_properties(backend.circuit_breaker)
             )
         )
+
+    def pool_deployment_catalog(self, binding: GatewayModelBinding) -> dict[str, Any]:
+        from ..security import CredentialCipher
+        from .gateway_connection_probe import foundry_deployment_catalog
+        from .route_credential_vault import RouteCredentialVault
+
+        def headers() -> dict[str, str]:
+            if binding.auth_strategy is AuthStrategy.MANAGED_IDENTITY:
+                return {"Authorization": "Bearer " + self._token_provider.token(
+                    "https://ai.azure.com",
+                )}
+            if binding.key_vault_secret_id is not None:
+                encryption_key = self._settings.credential_encryption_key
+                if encryption_key is None:
+                    raise PolicyCompilationError("Deployment credential vault is unavailable")
+                secret_id = str(binding.key_vault_secret_id)
+                address = urlparse(secret_id)
+                vault = RouteCredentialVault(
+                    address.scheme + "://" + address.netloc,
+                    CredentialCipher(encryption_key.get_secret_value().encode("utf-8")),
+                    self._token_provider, self._client,
+                )
+                return {"api-key": vault.verify(secret_id).get_secret_value()}
+            raise PolicyCompilationError("Deployment metadata credential is unavailable")
+
+        return foundry_deployment_catalog(
+            self._client, str(binding.runtime_config.get("project_endpoint") or ""),
+            str(binding.backend_url), binding.model.upstream_model_id, headers,
+        )
+
+    def validate_pool_deployments(self, publication: GatewayPublication) -> None:
+        from ..domain.control_plane import pool_member_bindings
+        from .gateway_connection_probe import (
+            foundry_model_identity,
+            verify_pool_deployment_observer,
+        )
+        from .route_credential_vault import credential_bindings, route_credential_source
+
+        catalogs: dict[tuple[str, str], dict[str, Any]] = {}
+        observer_verified = False
+        credentials = credential_bindings(publication.resource_manifest)
+        for binding in publication.desired_spec.bindings:
+            pool = binding.backend_pool
+            if pool is None or binding.provider_brand_key.value != "microsoft_foundry" or not any(
+                member.model_id is not None or (
+                    member.upstream_model_id is not None
+                    and member.upstream_model_id != binding.model.upstream_model_id
+                )
+                for member in pool.members
+            ):
+                continue
+            requires_rewriter = any(
+                member.upstream_model_id is not None
+                and member.upstream_model_id != binding.model.upstream_model_id
+                for member in pool.members
+            )
+            if requires_rewriter and not observer_verified:
+                observer = self._settings.apim_usage_observer_url
+                key_name = self._settings.apim_usage_observer_key_named_value
+                if not observer or not key_name:
+                    raise PolicyCompilationError("Deployment-specific pools require the Observer")
+                self.verify_observer_permissions(key_name)
+                verify_pool_deployment_observer(
+                    self._client, str(observer),
+                    self.route_credential_value(key_name).get_secret_value(),
+                )
+                observer_verified = True
+            identities = set()
+            for source in pool_member_bindings(binding):
+                secret_id = credentials.get(route_credential_source(source))
+                if source.key_vault_secret_id is None and secret_id is not None:
+                    source = source.model_copy(update={"key_vault_secret_id": secret_id})
+                key = (str(source.runtime_id), str(source.runtime_config.get("project_endpoint")))
+                if key not in catalogs:
+                    catalogs[key] = self.pool_deployment_catalog(source)
+                identities.add(foundry_model_identity(
+                    catalogs[key].get(source.model.upstream_model_id),
+                ))
+            if len(identities) != 1:
+                raise PolicyCompilationError("Pool deployments must use the same model and version")
 
     def _pool_services(
         self,
@@ -2616,7 +2718,7 @@ class AzureApimPublisherClient(AzureSelfHostedGatewayManagementMixin):
             raise PolicyCompilationError("Fixed route Pool readback changed")
 
     def verify_route_pool(self, connection: ConnectionRevision) -> str:
-        self.verify_route_pool_slice(connection, 0, maximum=121)
+        self.verify_route_pool_slice(connection, 0, maximum=151)
         return connection.dependency_sha256
 
     def verify_route_pool_slice(
@@ -2633,7 +2735,7 @@ class AzureApimPublisherClient(AzureSelfHostedGatewayManagementMixin):
         headers = sorted(pool.header_values.items())
         total = 1 + len(pool.members) + len(versions) + len(headers)
         if (type(cursor) is not int or not 0 <= cursor <= total
-            or type(maximum) is not int or not 1 <= maximum <= 121):
+            or type(maximum) is not int or not 1 <= maximum <= 151):
             raise PolicyCompilationError("Fixed route Pool readback cursor is invalid")
         end = min(total, cursor + maximum)
         for index in range(cursor, end):

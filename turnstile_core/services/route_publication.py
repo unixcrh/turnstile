@@ -20,6 +20,8 @@ from ..domain.control_plane import (
     GatewayReleaseDependencies,
     ImageProbeAuthorization,
 )
+from ..domain.control_plane import pool_member_binding as pool_member_binding
+from ..domain.control_plane import pool_member_bindings as pool_member_bindings
 from ..domain.storage_routes import (
     ActiveRouteHead,
     ConfigurationApproval,
@@ -52,6 +54,7 @@ from ..integrations.apim_control_plane_contract import (
     ProbeVerificationDeferred,
     RetryablePublicationError,
 )
+from ..integrations.route_credential_vault import route_credential_source as route_credential_source
 from ..integrations.storage_route_projection import (
     ModelRouteActivationIntent,
     RouteActivationIntent,
@@ -99,8 +102,12 @@ def require_model_addition_activation(
     ))
     if program_upgrade is not None:
         upgrade = FixedProgramUpgrade.model_validate_json(canonical_document(program_upgrade))
-        upgrade.require_previous(str(current.base_release_id), expected_installation)
-        expected_installation = upgrade.installation
+        if not (
+            upgrade.previous_publication_id != str(current.base_release_id)
+            and upgrade.installation == expected_installation
+        ):
+            upgrade.require_previous(str(current.base_release_id), expected_installation)
+            expected_installation = upgrade.installation
     if task.serving_programs:
         if task.serving_installation_sha256.get(installed.program.instance_id) != document_digest(
             installed,
@@ -781,39 +788,6 @@ def binding_public_count_path(binding: GatewayModelBinding) -> str | None:
     return path
 
 
-def route_credential_source(binding: GatewayModelBinding) -> str:
-    if binding.runtime_id is None or binding.named_value_name is None:
-        raise PolicyCompilationError("Fixed route credential has no stable source")
-    return document_digest({
-        "runtime_id": str(binding.runtime_id), "auth_strategy": binding.auth_strategy.value,
-        "named_value_name": binding.named_value_name,
-        "key_vault_secret_id": (
-            str(binding.key_vault_secret_id) if binding.key_vault_secret_id is not None else None
-        ),
-    })
-
-
-def pool_member_bindings(binding: GatewayModelBinding) -> tuple[GatewayModelBinding, ...]:
-    pool = binding.backend_pool
-    if pool is None:
-        return ()
-    config = {name: value for name, value in binding.runtime_config.items() if name not in {
-        "apim_backend_pool", "apim_backend_pool_session_affinity",
-    }}
-    return tuple(GatewayModelBinding.model_validate({
-        **binding.model_dump(mode="python"), "runtime_id": member.runtime_id,
-        "runtime_name": member.runtime_name, "backend_url": member.backend_url,
-        "auth_strategy": member.auth_strategy, "named_value_name": member.named_value_name,
-        "key_vault_secret_id": binding.key_vault_secret_id if (
-            member.runtime_id == binding.runtime_id
-            and member.named_value_name == binding.named_value_name
-        ) else None,
-        "managed_identity_resource": binding.managed_identity_resource
-        if member.auth_strategy is AuthStrategy.MANAGED_IDENTITY else None,
-        "runtime_config": config,
-    }) for member in pool.members)
-
-
 def pool_credential_name(binding: GatewayModelBinding, scope: RouteScope, secret_id: str) -> str:
     return "turnstile-route-key-" + document_digest({
         "scope": scope.model_dump(mode="json"),
@@ -837,12 +811,19 @@ def _pool_matches_binding(
         return actual is None
     if actual is None:
         return False
+    if any(member.upstream_model_id is not None
+           and member.upstream_model_id != binding.model.upstream_model_id
+           for member in pool.members) and actual.configuration_sha256 != document_digest(pool):
+        return False
     versions: dict[str, str] = {}
     headers: dict[str, str] = {}
     for source in pool_member_bindings(binding):
         _, _, credential = _binding_route_contract(source, credential_bindings=credential_bindings)
         if connection.observer:
             for value in (urlsplit(_binding_route_origin(source)).netloc, source.runtime_name):
+                headers[pool_header_name(connection.scope, value)] = value
+            if source.model.upstream_model_id != binding.model.upstream_model_id:
+                value = source.model.upstream_model_id
                 headers[pool_header_name(connection.scope, value)] = value
         if credential.secret_id:
             versions[pool_credential_name(source, connection.scope, credential.secret_id)] = (
@@ -1033,6 +1014,7 @@ def build_route_publication_task(
     credential_bindings: Mapping[str, str] | None = None,
     configuration_only: bool = False,
     scope_only: bool = False,
+    previous_program_sha256: str | None = None,
 ) -> RoutePublicationTask:
     model_addition = "model_route_addition" in publication.resource_manifest
     if model_addition and (
@@ -1111,6 +1093,7 @@ def build_route_publication_task(
             previous_routes, snapshot, program, proof, str(budgets.epoch), now,
         ),
         previous_routes=tuple(previous_routes), previous_head=previous_head,
+        previous_program_sha256=previous_program_sha256,
         previous_members=tuple(previous_members),
         credential_bindings=dict(credential_bindings or {}),
         program_migration_sha256=(

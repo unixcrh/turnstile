@@ -238,7 +238,7 @@ class PostgreSqlOpsDbProxy(
         pool_min_size: int = 1,
         pool_max_size: int = 4,
         identity_cache_seconds: float = _IDENTITY_CACHE_SECONDS,
-        apim_api_id: str = "finops-foundry-llm",
+        apim_api_id: str = "turnstile-llm",
         *, autocommit: bool = False,
     ) -> None:
         self._database_url = database_url
@@ -1283,11 +1283,11 @@ class PostgreSqlOpsDbProxy(
                             routed.estimated_cost,
                             usage.estimated_cost
                         )::DOUBLE PRECISION AS estimated_cost,
-                        ((usage.usage_available OR COALESCE(routed.usage_available, FALSE))
-                         AND (COALESCE(routed.cost_available, FALSE)
-                          OR COALESCE(routed.estimated_cost, usage.estimated_cost) > 0
+                        ((usage.usage_available AND (usage.estimated_cost > 0
                           OR (usage.input_price_per_million IS NOT NULL
-                              AND usage.output_price_per_million IS NOT NULL))) AS cost_available,
+                              AND usage.output_price_per_million IS NOT NULL)))
+                         OR (COALESCE(routed.usage_available, FALSE)
+                             AND COALESCE(routed.cost_available, FALSE))) AS cost_available,
                         usage.error_message, decision.router_id,
                         decision.router_name, decision.router_version,
                         decision.selected_model_id,
@@ -1443,7 +1443,13 @@ class PostgreSqlOpsDbProxy(
                               cache_write_tokens, output_tokens,
                               (input_tokens + cached_tokens + output_tokens)::BIGINT
                                   AS total_tokens,
-                              estimated_cost::DOUBLE PRECISION AS estimated_cost
+                              estimated_cost::DOUBLE PRECISION AS estimated_cost,
+                              input_price_per_million,
+                              cached_price_per_million,
+                              cache_write_price_per_million,
+                              output_price_per_million,
+                              price_context_tier,
+                              price_context_snapshot
                        FROM token_usage
                        WHERE request_id = ANY(%s) AND usage_domain = 'apim'""",
                     (attempt_ids,),

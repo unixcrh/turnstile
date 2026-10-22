@@ -7,6 +7,7 @@ import {
 } from "lucide-react"
 import { useState } from "react"
 
+import { ModelBrandLogo } from "../brand-logos"
 import { Button } from "../ui/button"
 import { Checkbox } from "../ui/checkbox"
 import { Input } from "../ui/input"
@@ -138,13 +139,14 @@ function StrategyConfiguration({
     {node.strategy_type === "model_based" && <label className="router-field"><span>Routing Model</span>
       <Select value={node.routing_model_id ?? ""} onValueChange={(value) => updateStrategyNode({ ...node, routing_model_id: value ?? null })}>
         <SelectTrigger aria-label="常规配置选择 Routing Model" title={node.routing_model_id ?? undefined}>
-          <SelectValue>{node.routing_model_id ? <>
+          <SelectValue>{node.routing_model_id ? <span className="registry-option">
+            <ModelBrandLogo familyKey={routingModel?.family_key} identity={`${routingModel?.display_name ?? ""} ${routingModel?.model_key ?? ""}`} providerName={routingModel?.provider_name ?? ""} size={15} />
             <span>{routingModel?.display_name ?? "已不可用的模型"}</span>
             {routingModel && routingModel.status !== "available" && <small>{routerModelStatusLabel(routingModel.status)}</small>}
-          </> : "选择判路由模型"}</SelectValue>
+          </span> : "选择判路由模型"}</SelectValue>
         </SelectTrigger>
         <SelectContent>
-          {models.map((model) => <SelectItem key={model.id} value={model.id}>{model.display_name}</SelectItem>)}
+          {models.map((model) => <SelectItem key={model.id} value={model.id}><span className="registry-option"><ModelBrandLogo familyKey={model.family_key} identity={`${model.display_name} ${model.model_key}`} providerName={model.provider_name} size={15} /><span>{model.display_name}</span></span></SelectItem>)}
         </SelectContent>
       </Select>
     </label>}
@@ -188,7 +190,7 @@ function CandidateConfiguration({
   return <div className="router-candidate-pool" role="group" aria-label="候选模型池">
       {candidatePoolModels.map((model) => {
         const selected = configured.has(model.id)
-        return <label className="router-candidate-pool-item" data-selected={selected} key={model.id}><Checkbox checked={selected} onCheckedChange={(checked) => toggleModel(model.id, checked === true)} /><span className="router-model-logo" /><span><b>{model.display_name}</b><small>{model.provider_name} · {model.capabilities.join(" / ")}</small></span></label>
+        return <label className="router-candidate-pool-item" data-selected={selected} key={model.id}><Checkbox checked={selected} onCheckedChange={(checked) => toggleModel(model.id, checked === true)} /><span className="router-model-logo"><ModelBrandLogo familyKey={model.family_key} identity={`${model.display_name} ${model.model_key}`} providerName={model.provider_name} size={14} /></span><span><b>{model.display_name}</b><small>{model.provider_name} · {model.capabilities.join(" / ")}</small></span></label>
       })}
       {!candidatePoolModels.length && <div className="router-config-empty">当前用户没有可用于模型路由的模型。</div>}
   </div>

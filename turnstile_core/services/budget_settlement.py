@@ -203,6 +203,7 @@ def execution_budget_view(
             "ledger_read_at": datetime.now(UTC),
             "ledger_snapshot_at": summary.updated_at,
             "ledger_version": summary.version,
+            "budget_mode": "tokens",
             "token_limit": summary.token_limit,
             "enforce": summary.enforce,
             "used_tokens": summary.confirmed_tokens,
@@ -371,6 +372,44 @@ class BudgetRecoveryService:
                     continue
                 opening_balance: int | Decimal | None = None
                 if current.budget_mode != update.budget_mode:
+                    pending_dispatch = False
+                    if update.scope.scope_type == "person":
+                        plans, next_partition, next_row = self._ledger.pending_dispatch_page(
+                            LedgerRecoveryCursor(scope=update.scope, epoch=update.epoch, version=0),
+                            limit=1,
+                        )
+                        pending_dispatch = bool(plans or next_partition or next_row)
+                    usage = self._repository.budget_switch_usage(update)
+                    source_field = "usd" if current.budget_mode == "usd" else "tokens"
+                    source_balance = (current.confirmed_usd if current.budget_mode == "usd"
+                                      else current.confirmed_tokens)
+                    opening_balance = (
+                        None
+                        if usage is None
+                        else usage["usd" if update.budget_mode == "usd" else "tokens"]
+                    )
+                    if (
+                        pending_dispatch
+                        or current.upper_bound_tokens
+                        or current.upper_bound_usd
+                        or usage is None
+                        or opening_balance is None
+                        or (
+                            not current.active_reserved_tokens
+                            and not current.active_reserved_usd
+                            and usage[source_field] != source_balance
+                        )
+                    ):
+                        if (
+                            not current.enabled
+                            and update.enabled
+                            and not current.active_reserved_tokens
+                            and not current.active_reserved_usd
+                        ):
+                            self._ledger.quiesce_budget_scope(
+                                update.scope, update.epoch, update.revision, enabled=True,
+                            )
+                        continue
                     current = self._ledger.quiesce_budget_scope(
                         update.scope, update.epoch, update.revision,
                     )
@@ -378,6 +417,15 @@ class BudgetRecoveryService:
                         continue
                     if (current.active_reserved_tokens or current.upper_bound_tokens
                         or current.active_reserved_usd or current.upper_bound_usd):
+                        if (
+                            (current.upper_bound_tokens or current.upper_bound_usd)
+                            and not current.active_reserved_tokens
+                            and not current.active_reserved_usd
+                            and update.enabled
+                        ):
+                            self._ledger.quiesce_budget_scope(
+                                update.scope, update.epoch, update.revision, enabled=True,
+                            )
                         continue
                     if update.scope.scope_type == "person":
                         plans, next_partition, next_row = self._ledger.pending_dispatch_page(
@@ -385,15 +433,30 @@ class BudgetRecoveryService:
                             limit=1,
                         )
                         if plans or next_partition or next_row:
+                            if (
+                                not current.active_reserved_tokens
+                                and not current.active_reserved_usd
+                                and update.enabled
+                            ):
+                                self._ledger.quiesce_budget_scope(
+                                    update.scope, update.epoch, update.revision, enabled=True,
+                                )
                             continue
                     usage = self._repository.budget_switch_usage(update)
-                    source_field = "usd" if current.budget_mode == "usd" else "tokens"
                     source_balance = (current.confirmed_usd if current.budget_mode == "usd"
                                       else current.confirmed_tokens)
                     if usage is None or usage[source_field] != source_balance:
+                        if update.enabled:
+                            self._ledger.quiesce_budget_scope(
+                                update.scope, update.epoch, update.revision, enabled=True,
+                            )
                         continue
                     opening_balance = usage["usd" if update.budget_mode == "usd" else "tokens"]
                     if opening_balance is None:
+                        if update.enabled:
+                            self._ledger.quiesce_budget_scope(
+                                update.scope, update.epoch, update.revision, enabled=True,
+                            )
                         continue
                 if update.budget_mode == "usd" and update.enabled and not prices_initialized:
                     _initialize_model_prices(self._repository, self._ledger, datetime.now(UTC))

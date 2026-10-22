@@ -1371,6 +1371,7 @@ __LEGACY_PROVIDER_ROUTING__
     <set-header name="x-hive-runtime" exists-action="delete" />
     <set-header name="x-turnstile-pool-member" exists-action="delete" />
     <set-header name="x-turnstile-pool-runtime" exists-action="delete" />
+    <set-header name="x-turnstile-pool-deployment" exists-action="delete" />
 __USAGE_OBSERVER_HEADERS__
     <set-variable name="imageGenerationPolicyVersion" value="@(2)" />
   </inbound>

@@ -4,16 +4,23 @@ import {
   useMemo,
   useState,
 } from "react"
+import { createPortal } from "react-dom"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import {
   AlertCircle,
   Blocks,
+  Building2,
   CheckCircle2,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Copy,
   FileSliders,
   GitBranch,
   MoreHorizontal,
+  Pencil,
   Plus,
+  PowerOff,
   RefreshCw,
   Save,
   Search,
@@ -26,7 +33,6 @@ import {
 
 import { RouterCanvas } from "../components/model-router/router-canvas"
 import { RouterConfigForm } from "../components/model-router/router-config-form"
-import { FoundryLogo } from "../components/brand-logos"
 import {
   cloneDefinition,
   createStarterDefinition,
@@ -63,6 +69,13 @@ import {
   DropdownMenuTrigger,
 } from "../components/ui/dropdown-menu"
 import { Input } from "../components/ui/input"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "../components/ui/select"
 import { Textarea } from "../components/ui/textarea"
 import { useResizablePane } from "../components/ui/use-resizable-pane"
 import { dataSource } from "../data-sources/apim/api"
@@ -70,13 +83,16 @@ import { finopsKeys, finopsQueries } from "../data-sources/apim/queries"
 import type {
   ManagedModel,
   ModelRouter,
+  ModelRouterBulkAssignmentWrite,
   ModelRouterList,
   ModelRouterModelReference,
+  ModelRouterPersonAccessItem,
   ModelRouterStatus,
   ModelRouterValidation,
   ModelRouterWrite,
 } from "../data-sources/apim/types"
 import { getIntlLocale } from "../locales/index"
+import { useIsMobile } from "../hooks/use-mobile"
 import { useAuth } from "../providers/auth-provider"
 
 
@@ -219,7 +235,7 @@ function RouterNameDialog({
           {mode === "rename" && <label className="router-field"><span>描述</span><Textarea rows={3} maxLength={500} value={description} onChange={(event) => setDescription(event.target.value)} /></label>}
           {error && <div className="registry-error">{error}</div>}
         </div>
-        <DialogFooter className="registry-editor-footer"><DialogClose render={<Button type="button" variant="outline" disabled={busy} />}>取消</DialogClose><Button type="submit" disabled={busy || !name.trim()}>{mode === "duplicate" ? <Copy size={14} /> : <Save size={14} />}{mode === "duplicate" ? "创建副本" : "保存"}</Button></DialogFooter>
+        <DialogFooter className="registry-editor-footer"><DialogClose render={<Button type="button" variant="outline" disabled={busy} />}>取消</DialogClose><Button type="submit" disabled={busy || !name.trim()}>{busy && <RefreshCw className="spin" size={14} />}{mode === "duplicate" ? "创建副本" : "保存"}</Button></DialogFooter>
       </form>
     </DialogContent>
   </Dialog>
@@ -227,50 +243,327 @@ function RouterNameDialog({
 
 function RouterAccessDialog({
   router,
-  users,
-  busyUserId,
+  busy,
   error,
   onClose,
-  onToggle,
+  onSave,
 }: {
   router: ModelRouter
-  users: Array<{ id: string; name: string }>
-  busyUserId: string | null
+  busy: boolean
   error: string | null
   onClose: () => void
-  onToggle: (userId: string, assigned: boolean) => void
+  onSave: (write: ModelRouterBulkAssignmentWrite) => void
 }) {
   const [search, setSearch] = useState("")
-  const assignees = useQuery({
-    queryKey: ["model-platform", "model-router-assignees", router.id],
-    queryFn: () => dataSource.modelRouterAssignees(router.id),
-  })
-  const assigned = new Set(assignees.data ?? [])
-  const normalized = search.trim().toLocaleLowerCase()
-  const visibleUsers = users.filter((user) =>
-    `${user.name} ${user.id}`.toLocaleLowerCase().includes(normalized),
+  const [debouncedSearch, setDebouncedSearch] = useState("")
+  const [selectedDeptId, setSelectedDeptId] = useState<string>("all")
+  const [offset, setOffset] = useState(0)
+  const [collapsedDepts, setCollapsedDepts] = useState<Set<string>>(new Set())
+  const limit = 50
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedSearch(search.trim()), 250)
+    return () => window.clearTimeout(timer)
+  }, [search])
+
+  useEffect(() => {
+    setOffset(0)
+  }, [selectedDeptId, debouncedSearch])
+
+  const people = useQuery(
+    finopsQueries.modelRouterPeople(
+      router.id,
+      selectedDeptId,
+      debouncedSearch,
+      offset,
+      limit,
+    ),
   )
-  return <Dialog open onOpenChange={(open) => { if (!open && !busyUserId) onClose() }}>
+
+  const [allMatchingDraft, setAllMatchingDraft] = useState<{
+    assigned: boolean
+    departmentId: string
+    query: string
+  } | null>(null)
+  const [deptDraft, setDeptDraft] = useState<
+    Map<string, { assigned: boolean; query: string }>
+  >(new Map())
+  const [userDraft, setUserDraft] = useState<Map<string, boolean>>(new Map())
+
+  const isPersonAssigned = (person: ModelRouterPersonAccessItem): boolean => {
+    if (userDraft.has(person.id)) return userDraft.get(person.id)!
+    if (person.department_id && deptDraft.has(person.department_id)) {
+      return deptDraft.get(person.department_id)!.assigned
+    }
+    if (
+      allMatchingDraft &&
+      (allMatchingDraft.departmentId === "all" ||
+        allMatchingDraft.departmentId === person.department_id)
+    ) {
+      return allMatchingDraft.assigned
+    }
+    return person.assigned
+  }
+
+  const departments = people.data?.departments ?? []
+  const pageItems = people.data?.items ?? []
+  const total = people.data?.total ?? 0
+  const totalUsers = people.data?.total_users ?? 0
+
+  const filteredGroups = useMemo(() => {
+    const groupMap = new Map<
+      string,
+      { id: string; name: string; visibleUsers: ModelRouterPersonAccessItem[] }
+    >()
+    for (const person of pageItems) {
+      const deptId = person.department_id ?? "__unassigned__"
+      let group = groupMap.get(deptId)
+      if (!group) {
+        group = { id: deptId, name: person.department_name, visibleUsers: [] }
+        groupMap.set(deptId, group)
+      }
+      group.visibleUsers.push(person)
+    }
+    return [...groupMap.values()]
+  }, [pageItems])
+
+  const effectiveAssignedCount = useMemo(() => {
+    if (!people.data) return 0
+    if (allMatchingDraft && allMatchingDraft.departmentId === "all" && !allMatchingDraft.query) {
+      let base = allMatchingDraft.assigned ? totalUsers : 0
+      for (const [deptId, draft] of deptDraft.entries()) {
+        const summary = departments.find((dept) => dept.id === deptId)
+        if (summary && draft.assigned !== allMatchingDraft.assigned) {
+          base += draft.assigned ? summary.total_users : -summary.total_users
+        }
+      }
+      for (const [, nextVal] of userDraft.entries()) {
+        if (nextVal !== allMatchingDraft.assigned) {
+          base += nextVal ? 1 : -1
+        }
+      }
+      return Math.max(0, Math.min(totalUsers, base))
+    }
+    let count = 0
+    for (const summary of departments) {
+      if (deptDraft.has(summary.id)) {
+        count += deptDraft.get(summary.id)!.assigned ? summary.total_users : 0
+      } else if (
+        allMatchingDraft &&
+        allMatchingDraft.departmentId === summary.id &&
+        !allMatchingDraft.query
+      ) {
+        count += allMatchingDraft.assigned ? summary.total_users : 0
+      } else {
+        count += summary.assigned_users
+      }
+    }
+    for (const person of pageItems) {
+      if (!userDraft.has(person.id)) continue
+      const userVal = userDraft.get(person.id)!
+      const deptVal =
+        person.department_id && deptDraft.has(person.department_id)
+          ? deptDraft.get(person.department_id)!.assigned
+          : allMatchingDraft &&
+              (allMatchingDraft.departmentId === "all" ||
+                allMatchingDraft.departmentId === person.department_id)
+            ? allMatchingDraft.assigned
+            : person.assigned
+      if (userVal !== deptVal) {
+        count += userVal ? 1 : -1
+      }
+    }
+    return Math.max(0, Math.min(totalUsers, count))
+  }, [allMatchingDraft, departments, deptDraft, pageItems, people.data, totalUsers, userDraft])
+
+  const hasPendingChanges = Boolean(
+    allMatchingDraft !== null || deptDraft.size > 0 || userDraft.size > 0,
+  )
+
+  const togglePerson = (person: ModelRouterPersonAccessItem, nextAssigned: boolean) => {
+    setUserDraft((current) => {
+      const next = new Map(current)
+      const baseline =
+        person.department_id && deptDraft.has(person.department_id)
+          ? deptDraft.get(person.department_id)!.assigned
+          : allMatchingDraft &&
+              (allMatchingDraft.departmentId === "all" ||
+                allMatchingDraft.departmentId === person.department_id)
+            ? allMatchingDraft.assigned
+            : person.assigned
+      if (nextAssigned === baseline && !deptDraft.has(person.department_id ?? "") && !allMatchingDraft) {
+        next.delete(person.id)
+      } else {
+        next.set(person.id, nextAssigned)
+      }
+      return next
+    })
+  }
+
+  const toggleEntireDept = (deptId: string, nextAssigned: boolean) => {
+    setDeptDraft((current) => {
+      const next = new Map(current)
+      next.set(deptId, { assigned: nextAssigned, query: debouncedSearch })
+      return next
+    })
+    setUserDraft((current) => {
+      const next = new Map(current)
+      for (const person of pageItems) {
+        if (person.department_id === deptId) next.delete(person.id)
+      }
+      return next
+    })
+  }
+
+  const applyBulkMatching = (nextAssigned: boolean) => {
+    setAllMatchingDraft({
+      assigned: nextAssigned,
+      departmentId: selectedDeptId,
+      query: debouncedSearch,
+    })
+    if (selectedDeptId === "all") {
+      setDeptDraft(new Map())
+    } else {
+      setDeptDraft((current) => {
+        const next = new Map(current)
+        next.delete(selectedDeptId)
+        return next
+      })
+    }
+    setUserDraft(new Map())
+  }
+
+  const toggleDeptCollapse = (deptId: string) => {
+    setCollapsedDepts((current) => {
+      const next = new Set(current)
+      if (next.has(deptId)) next.delete(deptId)
+      else next.add(deptId)
+      return next
+    })
+  }
+
+  const allVisibleAssigned =
+    pageItems.length > 0 && pageItems.every((person) => isPersonAssigned(person))
+  const anyVisibleAssigned = pageItems.some((person) => isPersonAssigned(person))
+  const pageStart = total === 0 ? 0 : offset + 1
+  const pageEnd = Math.min(offset + limit, total)
+
+  const submitSave = () => {
+    onSave({
+      all_matching_assigned: allMatchingDraft ? allMatchingDraft.assigned : null,
+      department_id: allMatchingDraft ? allMatchingDraft.departmentId : null,
+      query: allMatchingDraft ? allMatchingDraft.query || null : null,
+      department_assignments: [...deptDraft.entries()].map(([department_id, item]) => ({
+        department_id,
+        assigned: item.assigned,
+        query: item.query || null,
+      })),
+      changes: [...userDraft.entries()].map(([user_id, assigned]) => ({
+        user_id,
+        assigned,
+      })),
+    })
+  }
+
+  return <Dialog open onOpenChange={(open) => { if (!open && !busy) onClose() }}>
     <DialogContent className="registry-editor-dialog router-access-dialog" finalFocus={false}>
       <div className="registry-editor router-access-editor">
         <DialogHeader className="registry-editor-header"><DialogTitle>人员访问</DialogTitle><DialogDescription>{router.name} · 已发布 v{router.version}</DialogDescription></DialogHeader>
-        <DialogClose render={<Button type="button" variant="ghost" size="icon-sm" className="registry-editor-close" disabled={Boolean(busyUserId)} />}><X size={16} /><span className="sr-only">关闭</span></DialogClose>
+        <DialogClose render={<Button type="button" variant="ghost" size="icon-sm" className="registry-editor-close" disabled={busy} />}><X size={16} /><span className="sr-only">关闭</span></DialogClose>
         <div className="registry-editor-body router-access-body">
-          <label className="people-model-search router-access-search"><Search size={14} /><Input autoFocus value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索姓名或邮箱" aria-label="搜索路由器人员" /></label>
-          <div className="router-access-summary"><span>{assigned.size} / {users.length} 已分配</span><small>候选模型访问由保存时一并校验</small></div>
-          {assignees.isLoading ? <div className="router-access-state"><RefreshCw className="spin" size={15} />正在加载人员访问</div> : <div className="people-model-select-list router-access-list" role="group" aria-label="模型路由器人员访问">
-            {visibleUsers.map((person) => <label className="people-model-option" key={person.id}><Checkbox checked={assigned.has(person.id)} disabled={Boolean(busyUserId)} onCheckedChange={(checked) => onToggle(person.id, checked === true)} /><span><b>{person.name}</b><small>{person.id}</small></span>{busyUserId === person.id && <RefreshCw className="spin" size={13} />}</label>)}
-            {!visibleUsers.length && <div className="people-model-empty">没有匹配的人员</div>}
+          <div className="router-access-toolbar">
+            {departments.length > 0 && <Select value={selectedDeptId} onValueChange={(value) => value && setSelectedDeptId(value)}>
+              <SelectTrigger aria-label="所属部门" className="router-access-dept-select">
+                <SelectValue>{selectedDeptId === "all" ? "全部部门" : departments.find((dept) => dept.id === selectedDeptId)?.name ?? "选择部门"}</SelectValue>
+              </SelectTrigger>
+              <SelectContent align="start" alignItemWithTrigger={false}>
+                <SelectItem value="all">全部部门</SelectItem>
+                {departments.map((dept) => <SelectItem key={dept.id} value={dept.id}>{dept.name}</SelectItem>)}
+              </SelectContent>
+            </Select>}
+            <label className="people-model-search router-access-search"><Search size={14} /><Input autoFocus value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索姓名或邮箱" aria-label="搜索路由器人员" /></label>
+          </div>
+          <div className="router-access-summary">
+            <div className="router-access-summary-meta">
+              <span>{effectiveAssignedCount.toLocaleString(getIntlLocale())} / {totalUsers.toLocaleString(getIntlLocale())} 已分配</span>
+              <small>候选模型访问由保存时一并校验</small>
+            </div>
+            {!people.isLoading && pageItems.length > 0 && <div className="router-access-bulk-actions">
+              <button type="button" disabled={busy || allVisibleAssigned} onClick={() => applyBulkMatching(true)}>全选</button>
+              <button type="button" disabled={busy || !anyVisibleAssigned} onClick={() => applyBulkMatching(false)}>清空</button>
+            </div>}
+          </div>
+          {people.isLoading ? <div className="router-access-state"><RefreshCw className="spin" size={15} />正在加载人员访问</div> : <div className="people-model-select-list router-access-list" role="group" aria-label="模型路由器人员访问">
+            {filteredGroups.map((group) => {
+              const summary = departments.find((dept) => dept.id === group.id)
+              const visibleAssigned = group.visibleUsers.filter((person) => isPersonAssigned(person)).length
+              const deptTotal = !debouncedSearch && summary ? summary.total_users : group.visibleUsers.length
+              const deptAssignedCount = !debouncedSearch && summary
+                ? deptDraft.has(group.id)
+                  ? deptDraft.get(group.id)!.assigned ? summary.total_users : 0
+                  : allMatchingDraft && (allMatchingDraft.departmentId === "all" || allMatchingDraft.departmentId === group.id)
+                    ? allMatchingDraft.assigned ? summary.total_users : 0
+                    : Math.max(
+                        0,
+                        Math.min(
+                          summary.total_users,
+                          summary.assigned_users +
+                            group.visibleUsers.reduce(
+                              (delta, person) =>
+                                userDraft.has(person.id) && userDraft.get(person.id) !== person.assigned
+                                  ? delta + (userDraft.get(person.id) ? 1 : -1)
+                                  : delta,
+                              0,
+                            ),
+                        ),
+                      )
+                : visibleAssigned
+              const allDeptAssigned = deptTotal > 0 && deptAssignedCount === deptTotal
+              const someDeptAssigned = deptAssignedCount > 0 && !allDeptAssigned
+              const collapsed = collapsedDepts.has(group.id) && !debouncedSearch
+              return <div className="router-access-dept-group" key={group.id}>
+                <div className="router-access-dept-header">
+                  <Checkbox
+                    checked={allDeptAssigned}
+                    indeterminate={someDeptAssigned}
+                    disabled={busy}
+                    aria-label={`${group.name} · 选择整个部门`}
+                    onCheckedChange={(checked) => toggleEntireDept(group.id, checked === true)}
+                  />
+                  <button type="button" className="router-access-dept-toggle" onClick={() => toggleDeptCollapse(group.id)} aria-expanded={!collapsed}>
+                    <Building2 size={13} />
+                    <b>{group.name}</b>
+                    <small>{deptAssignedCount.toLocaleString(getIntlLocale())} / {deptTotal.toLocaleString(getIntlLocale())} 已分配</small>
+                    <ChevronDown className={collapsed ? "collapsed" : ""} size={14} />
+                  </button>
+                </div>
+                {!collapsed && <div className="router-access-dept-members">
+                  {group.visibleUsers.map((person) => <label className="people-model-option" key={person.id}><Checkbox checked={isPersonAssigned(person)} disabled={busy} onCheckedChange={(checked) => togglePerson(person, checked === true)} /><span><b>{person.name}</b><small>{person.id}</small></span></label>)}
+                </div>}
+              </div>
+            })}
+            {!pageItems.length && <div className="people-model-empty">没有匹配的人员</div>}
           </div>}
-          {(error || assignees.error) && <div className="registry-error">{error ?? String(assignees.error)}</div>}
+          {total > limit && <div className="router-access-pagination">
+            <span>{`显示 ${pageStart.toLocaleString(getIntlLocale())}–${pageEnd.toLocaleString(getIntlLocale())}，共 ${total.toLocaleString(getIntlLocale())} 人`}</span>
+            <div>
+              <Button type="button" variant="outline" size="icon-sm" aria-label="上一页" disabled={busy || offset === 0 || people.isFetching} onClick={() => setOffset(Math.max(0, offset - limit))}><ChevronLeft size={14} /></Button>
+              <Button type="button" variant="outline" size="icon-sm" aria-label="下一页" disabled={busy || offset + limit >= total || people.isFetching} onClick={() => setOffset(offset + limit)}><ChevronRight size={14} /></Button>
+            </div>
+          </div>}
+          {(error || people.error) && <div className="registry-error">{error ?? String(people.error)}</div>}
         </div>
-        <DialogFooter className="registry-editor-footer"><DialogClose render={<Button type="button" variant="outline" disabled={Boolean(busyUserId)} />}>完成</DialogClose></DialogFooter>
+        <DialogFooter className="registry-editor-footer">
+          <DialogClose render={<Button type="button" variant="outline" disabled={busy} />}>取消</DialogClose>
+          <Button type="button" disabled={busy || !hasPendingChanges} onClick={submitSave}>{busy && <RefreshCw className="spin" size={14} />}保存</Button>
+        </DialogFooter>
       </div>
     </DialogContent>
   </Dialog>
 }
 
 function RouterListPane({
+  className = "",
   routers,
   selectedId,
   search,
@@ -287,6 +580,7 @@ function RouterListPane({
   onDisable,
   onDelete,
 }: {
+  className?: string
   routers: ModelRouter[]
   selectedId: string | null
   search: string
@@ -313,7 +607,7 @@ function RouterListPane({
     const searchMatch = `${router.name} ${router.description}`.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase())
     return searchMatch && (filter === "all" || router.status === filter)
   })
-  return <aside className="router-list-pane">
+  return <aside className={`router-list-pane ${className}`}>
     <div className="router-list-controls">
       <div className="smh-search"><Search size={15} /><input aria-label="搜索模型路由器" placeholder="搜索模型路由器..." value={search} onChange={(event) => onSearchChange(event.target.value)} /></div>
       <div className="router-status-filters">
@@ -331,11 +625,11 @@ function RouterListPane({
         </button>
         <DropdownMenu>
           <DropdownMenuTrigger render={<Button type="button" variant="ghost" size="icon-sm" className="router-list-menu" aria-label={`${router.name} 操作`} title="更多操作" disabled={busy} />}><MoreHorizontal size={15} /></DropdownMenuTrigger>
-          <DropdownMenuContent align="end" side="right">
-            <DropdownMenuItem onClick={() => onRename(router)}>编辑基础信息</DropdownMenuItem>
+          <DropdownMenuContent className="router-list-menu-content" align="end" side="right">
+            <DropdownMenuItem onClick={() => onRename(router)}><Pencil size={14} />编辑基础信息</DropdownMenuItem>
             <DropdownMenuItem disabled={dirty && router.id === selectedId} onClick={() => onDuplicate(router)}><Copy size={14} />复制</DropdownMenuItem>
             {canManage && router.status === "published" && <DropdownMenuItem onClick={() => onAccess(router)}><Users size={14} />人员访问</DropdownMenuItem>}
-            {router.status === "published" && <DropdownMenuItem disabled={dirty && router.id === selectedId} onClick={() => onDisable(router)}>停用</DropdownMenuItem>}
+            {router.status === "published" && <DropdownMenuItem disabled={dirty && router.id === selectedId} onClick={() => onDisable(router)}><PowerOff size={14} />停用</DropdownMenuItem>}
             <DropdownMenuSeparator />
             <DropdownMenuItem variant="destructive" onClick={() => onDelete(router)}><Trash2 size={14} />删除</DropdownMenuItem>
           </DropdownMenuContent>
@@ -383,7 +677,7 @@ function RouterEditor({
   const effectiveMode: RouterMode = ROUTER_CONFIG_MODE_ENABLED ? mode : "canvas"
   return <section className="router-editor-pane">
     <header className="router-editor-head">
-      <div className="router-editor-identity"><span><FoundryLogo size={18} /></span><div><div><h2>{value.name || "未命名路由器"}</h2><i data-status={router.status}>{STATUS_LABELS[router.status]}</i>{router.version > 0 && <em>v{router.version}</em>}{dirty && <strong>未保存</strong>}</div></div></div>
+      <div className="router-editor-identity"><span><GitBranch size={18} /></span><div><div><h2>{value.name || "未命名路由器"}</h2><i data-status={router.status}>{STATUS_LABELS[router.status]}</i>{router.version > 0 && <em>v{router.version}</em>}{dirty && <strong>未保存</strong>}</div></div></div>
       <div className="router-editor-actions">
         <Button className="router-action-secondary" type="button" variant="outline" disabled={busy || !dirty} onClick={onSave}>{busy ? <RefreshCw className="spin" size={14} /> : <Save size={14} />}<span>保存草稿</span></Button>
         <Button className="router-action-secondary" type="button" variant="outline" disabled={busy} onClick={onValidate}><CheckCircle2 size={14} />校验</Button>
@@ -401,17 +695,23 @@ function RouterEditor({
       <span>{validation.valid ? "配置校验通过，可以发布。" : `发现 ${validation.issues.length} 个配置问题。`}</span>
       {!validation.valid && ROUTER_CONFIG_MODE_ENABLED && <button type="button" onClick={() => onModeChange("config")}>查看问题</button>}
     </div>}
-    {effectiveMode === "canvas" ? <RouterCanvas definition={value.definition} models={models} displayModels={displayModels} routerName={value.name} routerDescription={value.description} selectedNodeId={selectedNodeId} onSelectedNodeChange={onSelectedNodeChange} onChange={(definition) => onChange({ ...value, definition })} onMetadataChange={(name, description) => onChange({ ...value, name, description })} /> : <RouterConfigForm value={value} models={models} displayModels={displayModels} validation={validation} onChange={onChange} onIssueSelect={(nodeId) => { onSelectedNodeChange(nodeId); onModeChange("canvas") }} />}
+    {effectiveMode === "canvas" ? <RouterCanvas key={router.id} definition={value.definition} models={models} displayModels={displayModels} routerName={value.name} routerDescription={value.description} selectedNodeId={selectedNodeId} onSelectedNodeChange={onSelectedNodeChange} onChange={(definition) => onChange({ ...value, definition })} onMetadataChange={(name, description) => onChange({ ...value, name, description })} /> : <RouterConfigForm value={value} models={models} displayModels={displayModels} validation={validation} onChange={onChange} onIssueSelect={(nodeId) => { onSelectedNodeChange(nodeId); onModeChange("canvas") }} />}
   </section>
 }
 
-export function ModelRouterPage() {
+export function ModelRouterPage({
+  routerDrawerOpen,
+  onRouterDrawerOpenChange,
+}: {
+  routerDrawerOpen: boolean
+  onRouterDrawerOpenChange: (open: boolean) => void
+}) {
   const client = useQueryClient()
   const { user } = useAuth()
+  const isMobile = useIsMobile()
   const registry = useQuery(finopsQueries.registry())
   const routers = useQuery(finopsQueries.modelRouters())
   const catalog = useQuery(finopsQueries.modelRouterCatalog())
-  const entities = useQuery(finopsQueries.entities())
   const [selectedId, setSelectedId] = useState<string | null>(routerIdFromUrl)
   const [draft, setDraft] = useState<ModelRouterWrite | null>(null)
   const [savedDraftSignature, setSavedDraftSignature] = useState<string | null>(null)
@@ -434,6 +734,7 @@ export function ModelRouterPage() {
     maxWidth: ROUTER_PANE_WIDTH_MAX,
   })
   const [createOpen, setCreateOpen] = useState(false)
+  const [mobileActionsTarget, setMobileActionsTarget] = useState<HTMLElement | null>(null)
   const [nameAction, setNameAction] = useState<{ mode: "rename" | "duplicate"; router: ModelRouter } | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<ModelRouter | null>(null)
   const [disableTarget, setDisableTarget] = useState<ModelRouter | null>(null)
@@ -451,20 +752,20 @@ export function ModelRouterPage() {
     () => resolveRouterDisplayModels(registry.data?.models ?? [], routers.data?.model_references),
     [registry.data?.models, routers.data?.model_references],
   )
-  const assignableUsers = useMemo(() => {
-    const people = entities.data?.users ?? []
-    if (!user || people.some((person) => person.id === user.email)) return people
-    return [
-      { id: user.email, name: user.name ?? user.email, parent_id: null },
-      ...people,
-    ]
-  }, [entities.data?.users, user])
   const dirty = Boolean(draft && savedDraftSignature && serializedWrite(draft) !== savedDraftSignature)
 
   useEffect(() => {
     const syncRoute = () => setSelectedId(routerIdFromUrl())
     window.addEventListener("popstate", syncRoute)
     return () => window.removeEventListener("popstate", syncRoute)
+  }, [])
+
+  useEffect(() => {
+    onRouterDrawerOpenChange(false)
+  }, [isMobile, onRouterDrawerOpenChange])
+
+  useEffect(() => {
+    setMobileActionsTarget(document.getElementById("mobile-topbar-end-actions"))
   }, [])
 
   useEffect(() => {
@@ -551,16 +852,29 @@ export function ModelRouterPage() {
     },
   })
   const assignment = useMutation({
-    mutationFn: ({ routerId, userId, assigned }: { routerId: string; userId: string; assigned: boolean }) => dataSource.setModelRouterAssignment(routerId, userId, assigned),
-    onSuccess: (_result, variables) => {
-      client.setQueryData<string[]>(["model-platform", "model-router-assignees", variables.routerId], (current) => variables.assigned ? [...new Set([...(current ?? []), variables.userId])].sort() : (current ?? []).filter((value) => value !== variables.userId))
-      void client.invalidateQueries({ queryKey: finopsKeys.assignedModelRouters(variables.userId) })
+    mutationFn: ({
+      routerId,
+      write,
+    }: {
+      routerId: string
+      write: ModelRouterBulkAssignmentWrite
+    }) => dataSource.saveModelRouterAssignments(routerId, write),
+    onSuccess: (_result, { routerId }) => {
+      void client.invalidateQueries({
+        queryKey: ["model-platform", "model-router-people", routerId],
+      })
+      void client.invalidateQueries({
+        queryKey: ["model-platform", "model-router-assignees", routerId],
+      })
+      void refreshAssignedRouters()
+      setAccessTarget(null)
     },
   })
   const busy = create.isPending || save.isPending || duplicate.isPending || validate.isPending || publish.isPending || disable.isPending || remove.isPending
   const actionError = create.error ?? save.error ?? duplicate.error ?? validate.error ?? publish.error ?? disable.error ?? remove.error
 
   const chooseRouter = (routerId: string) => {
+    onRouterDrawerOpenChange(false)
     if (routerId === selectedId) return
     if (dirty) {
       setPendingSelection(routerId)
@@ -584,6 +898,7 @@ export function ModelRouterPage() {
     if (!result?.valid || !selectedRouter) return
     await publish.mutateAsync(selectedRouter.id)
   }
+  const routerList = <RouterListPane className={isMobile ? "apim-native-route-drawer-list" : undefined} routers={routerItems} selectedId={selectedId} search={search} filter={filter} canManage={user?.role === "owner"} busy={busy} dirty={dirty} onSearchChange={setSearch} onFilterChange={setFilter} onSelect={chooseRouter} onRename={(router) => setNameAction({ mode: "rename", router })} onDuplicate={(router) => setNameAction({ mode: "duplicate", router })} onAccess={(router) => { assignment.reset(); setAccessTarget(router) }} onDisable={setDisableTarget} onDelete={setDeleteTarget} />
 
   if (registry.isLoading || routers.isLoading || catalog.isLoading) {
     return <div className="registry-loading"><RefreshCw className="spin" />加载模型路由器</div>
@@ -596,14 +911,15 @@ export function ModelRouterPage() {
   }
 
   return <div className="smh-workspace model-router-workspace">
+    {isMobile && mobileActionsTarget && createPortal(<Button type="button" variant="ghost" size="icon-sm" className="settings-mobile-topbar-end-action" aria-label="新建路由器" title="新建路由器" onClick={() => setCreateOpen(true)}><Plus size={16} /></Button>, mobileActionsTarget)}
     <header className="smh-page-header">
       <div><span className="smh-header-icon"><Workflow size={17} /></span><h1>模型智能路由</h1><span>{routerItems.length}</span></div>
       <div className="smh-header-actions"><Button aria-label="新建路由器" onClick={() => setCreateOpen(true)}><Plus size={14} />新建路由器</Button></div>
     </header>
     {actionError && <div className="smh-notice registry-error"><AlertCircle size={15} /><div className="smh-notice-copy"><b>操作失败</b><span>{String(actionError)}</span></div></div>}
     <div className="router-split" style={{ "--router-pane-width": `${paneWidth}px` } as CSSProperties}>
-      <RouterListPane routers={routerItems} selectedId={selectedId} search={search} filter={filter} canManage={user?.role === "owner"} busy={busy} dirty={dirty} onSearchChange={setSearch} onFilterChange={setFilter} onSelect={chooseRouter} onRename={(router) => setNameAction({ mode: "rename", router })} onDuplicate={(router) => setNameAction({ mode: "duplicate", router })} onAccess={(router) => { assignment.reset(); setAccessTarget(router) }} onDisable={setDisableTarget} onDelete={setDeleteTarget} />
-      <button
+      {!isMobile && routerList}
+      {!isMobile && <button
         className="runtime-pane-handle"
         type="button"
         role="separator"
@@ -616,12 +932,18 @@ export function ModelRouterPage() {
         onPointerDown={startPaneResize}
         onKeyDown={resizePaneWithKeyboard}
         onDoubleClick={resetPaneWidth}
-      />
+      />}
       {selectedRouter && draft ? <RouterEditor router={selectedRouter} value={draft} models={availableModels} displayModels={displayModels} mode={mode} validation={validation} selectedNodeId={selectedNodeId} dirty={dirty} busy={busy} onModeChange={setMode} onSelectedNodeChange={setSelectedNodeId} onChange={(value) => { setDraft(value); setValidation(null) }} onSave={() => void persistDraft()} onValidate={() => void runValidation()} onPublish={() => void runPublish()} /> : <section className="router-editor-pane"><div className="smh-empty router-empty-state"><GitBranch size={32} /><b>创建第一个模型路由器</b><span>从可用模型中选择候选池，并在画布上连接条件、优先级和 Fallback。</span><Button className="router-new-button" onClick={() => setCreateOpen(true)}><Plus size={14} />新建路由器</Button></div></section>}
     </div>
 
+    {isMobile && <Dialog open={routerDrawerOpen} onOpenChange={onRouterDrawerOpenChange}>
+      <DialogContent className="apim-native-route-drawer model-router-drawer" finalFocus={false}>
+        <DialogHeader className="apim-native-route-drawer-header"><DialogTitle>模型路由器</DialogTitle><DialogDescription className="sr-only">{selectedRouter?.name ?? "模型路由器"}</DialogDescription><DialogClose render={<Button type="button" variant="ghost" size="icon-sm" className="apim-native-route-drawer-close" />}><X size={16} /><span className="sr-only">关闭</span></DialogClose></DialogHeader>
+        {routerList}
+      </DialogContent>
+    </Dialog>}
     <RouterCreateDialog open={createOpen} models={availableModels} busy={create.isPending} error={create.error ? String(create.error) : null} onOpenChange={setCreateOpen} onCreate={(value) => create.mutate(value)} />
-    {user?.role === "owner" && accessTarget && <RouterAccessDialog router={accessTarget} users={assignableUsers} busyUserId={assignment.isPending ? assignment.variables?.userId ?? null : null} error={assignment.error ? String(assignment.error) : null} onClose={() => setAccessTarget(null)} onToggle={(userId, assigned) => assignment.mutate({ routerId: accessTarget.id, userId, assigned })} />}
+    {user?.role === "owner" && accessTarget && <RouterAccessDialog router={accessTarget} busy={assignment.isPending} error={assignment.error ? String(assignment.error) : null} onClose={() => setAccessTarget(null)} onSave={(write) => assignment.mutate({ routerId: accessTarget.id, write })} />}
     {nameAction && <RouterNameDialog mode={nameAction.mode} router={nameAction.router} initialValue={nameAction.router.id === selectedRouter?.id && draft ? draft : writeFromRouter(nameAction.router)} busy={save.isPending || duplicate.isPending} error={(nameAction.mode === "duplicate" ? duplicate.error : save.error) ? String(nameAction.mode === "duplicate" ? duplicate.error : save.error) : null} onClose={() => setNameAction(null)} onSubmit={(name, description) => {
       if (nameAction.mode === "duplicate") duplicate.mutate({ id: nameAction.router.id, name })
       else {

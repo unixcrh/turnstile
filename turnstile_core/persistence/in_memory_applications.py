@@ -656,13 +656,21 @@ class InMemoryApplicationRepositoryMixin:
     def list_gateway_application_model_access(
         self, application_ids: Sequence[UUID]
     ) -> Sequence[dict[str, Any]]:
+        enabled_model_ids = {
+            item["id"] for item in self.models if item.get("enabled", True)
+        }
         rows: list[dict[str, Any]] = []
         for application_id in application_ids:
             policy = self.gateway_application_model_policies.get(application_id)
             if policy is None:
                 continue
             model_ids = sorted(
-                self.gateway_application_model_access.get(application_id, set()), key=str
+                (
+                    model_id
+                    for model_id in self.gateway_application_model_access.get(application_id, set())
+                    if model_id in enabled_model_ids
+                ),
+                key=str,
             )
             if not model_ids:
                 rows.append({**policy, "model_id": None})

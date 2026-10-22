@@ -853,12 +853,14 @@ class PostgreSqlApplicationRepositoryMixin:
             rows = connection.execute(
                 """SELECT policy.application_id,
                           policy.updated_by, policy.updated_at,
-                          access.model_id
+                          model.id AS model_id
                    FROM gateway_application_model_policy policy
                    LEFT JOIN gateway_application_model_access access
                      ON access.application_id = policy.application_id
+                   LEFT JOIN managed_model model
+                     ON model.id = access.model_id AND model.enabled
                    WHERE policy.application_id = ANY(%s)
-                   ORDER BY policy.application_id, access.model_id""",
+                   ORDER BY policy.application_id, model.id""",
                 (list(application_ids),),
             ).fetchall()
         return cast(Sequence[dict[str, Any]], rows)

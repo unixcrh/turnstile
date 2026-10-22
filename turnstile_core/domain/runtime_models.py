@@ -1045,6 +1045,57 @@ class ModelInvocationResponse(StrictModel):
     router_attempts: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class ChatCompletionsRequest(StrictModel):
+    model: str = Field(min_length=1, max_length=255)
+    messages: list[ChatMessage] = Field(min_length=1, max_length=100)
+    tools: list[ToolDefinition] | None = Field(default=None, max_length=32)
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    max_tokens: int | None = Field(default=None, ge=1, le=1_000_000)
+    max_completion_tokens: int | None = Field(default=None, ge=1, le=1_000_000)
+    reasoning_effort: Literal["none", "low", "medium", "high"] | None = Field(
+        default=None, exclude_if=lambda value: value is None,
+    )
+    response_format: Literal["json_object"] | dict[str, Any] | None = None
+    stream: bool = False
+    user: str | None = Field(default=None, max_length=255)
+    router_context: dict[str, str | float | bool] = Field(
+        default_factory=dict, max_length=50
+    )
+
+
+class ChatCompletionsResponse(StrictModel):
+    id: str
+    object: Literal["chat.completion"] = "chat.completion"
+    created: int = Field(ge=0)
+    model: str
+    choices: list[dict[str, Any]]
+    usage: dict[str, int] | None = None
+    turnstile_routing: dict[str, Any]
+
+
+class GatewayModelCatalogItem(StrictModel):
+    id: str
+    object: Literal["model"] = "model"
+    type: Literal["model", "model_router"] = "model"
+    created: int = Field(ge=0)
+    owned_by: str
+    display_name: str
+    model_id: str | None = None
+    router_id: str | None = None
+    router_version: int | None = None
+    runtime: str | None = None
+    description: str | None = None
+    capabilities: list[str] = Field(default_factory=list)
+    strategy_types: list[str] = Field(default_factory=list)
+    condition_fields: list[str] = Field(default_factory=list)
+    candidate_models: list[str] = Field(default_factory=list)
+
+
+class GatewayModelCatalogResponse(StrictModel):
+    object: Literal["list"] = "list"
+    data: list[GatewayModelCatalogItem]
+
+
 class DecisionInvocationResponse(StrictModel):
     request_id: str
     correlation_id: str | None = None

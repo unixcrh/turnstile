@@ -1256,6 +1256,160 @@ schemas:
         type: string
       assigned:
         type: boolean
+  ModelRouterDepartmentAccessSummary:
+    type: object
+    additionalProperties: false
+    required:
+    - id
+    - name
+    - total_users
+    - assigned_users
+    properties:
+      id:
+        type: string
+        minLength: 1
+        maxLength: 320
+      name:
+        type: string
+        minLength: 1
+        maxLength: 320
+      total_users:
+        type: integer
+        minimum: 0
+      assigned_users:
+        type: integer
+        minimum: 0
+  ModelRouterPersonAccessItem:
+    type: object
+    additionalProperties: false
+    required:
+    - id
+    - name
+    - department_name
+    - assigned
+    properties:
+      id:
+        type: string
+        minLength: 1
+        maxLength: 320
+      name:
+        type: string
+        minLength: 1
+        maxLength: 320
+      department_id:
+        type:
+        - string
+        - 'null'
+      department_name:
+        type: string
+        minLength: 1
+        maxLength: 320
+      assigned:
+        type: boolean
+  ModelRouterPeopleAccessResponse:
+    type: object
+    additionalProperties: false
+    required:
+    - router_id
+    - total
+    - offset
+    - limit
+    - total_users
+    - assigned_count
+    - matching_assigned_count
+    properties:
+      router_id:
+        type: string
+        format: uuid
+      total:
+        type: integer
+        minimum: 0
+      offset:
+        type: integer
+        minimum: 0
+      limit:
+        type: integer
+        minimum: 1
+      total_users:
+        type: integer
+        minimum: 0
+      assigned_count:
+        type: integer
+        minimum: 0
+      matching_assigned_count:
+        type: integer
+        minimum: 0
+      departments:
+        type: array
+        items:
+          $ref: ../../openapi.yaml#/components/schemas/ModelRouterDepartmentAccessSummary
+      items:
+        type: array
+        items:
+          $ref: ../../openapi.yaml#/components/schemas/ModelRouterPersonAccessItem
+  ModelRouterDepartmentAssignmentWrite:
+    type: object
+    additionalProperties: false
+    required:
+    - department_id
+    - assigned
+    properties:
+      department_id:
+        type: string
+        minLength: 1
+        maxLength: 320
+      assigned:
+        type: boolean
+      query:
+        type:
+        - string
+        - 'null'
+        maxLength: 200
+  ModelRouterBulkAssignmentWrite:
+    type: object
+    additionalProperties: false
+    properties:
+      changes:
+        type: array
+        maxItems: 1000
+        items:
+          $ref: ../../openapi.yaml#/components/schemas/ModelRouterAssignmentWrite
+      department_assignments:
+        type: array
+        maxItems: 200
+        items:
+          $ref: ../../openapi.yaml#/components/schemas/ModelRouterDepartmentAssignmentWrite
+      all_matching_assigned:
+        type:
+        - boolean
+        - 'null'
+      department_id:
+        type:
+        - string
+        - 'null'
+        maxLength: 320
+      query:
+        type:
+        - string
+        - 'null'
+        maxLength: 200
+  ModelRouterBulkAssignmentResult:
+    type: object
+    additionalProperties: false
+    required:
+    - router_id
+    - updated_count
+    - assigned_count
+    properties:
+      router_id:
+        type: string
+        format: uuid
+      updated_count:
+        type: integer
+        minimum: 0
+      assigned_count:
+        type: integer
+        minimum: 0
   ModelRouterValidationIssue:
     type: object
     additionalProperties: false

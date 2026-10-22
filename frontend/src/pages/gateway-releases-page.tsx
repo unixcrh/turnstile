@@ -669,7 +669,7 @@ export function GatewayReleasesPage({
 
   return <div className="smh-workspace gateway-releases-workspace">
     <header className="smh-page-header gateway-releases-header">
-      <div><span className="smh-header-icon"><History size={17} /></span><h1>发布管理</h1><span>{releases.isLoading ? "—" : items.length}</span></div>
+      <div><span className="smh-header-icon"><History size={17} /></span><h1>发布历史</h1><span>{releases.isLoading ? "—" : items.length}</span></div>
       <div className="smh-header-actions">
         {user?.role === "owner" && selectedGatewayId && <Button variant="outline" disabled={readinessMutation.isPending} onClick={checkReadiness}><ShieldCheck size={13} />验证预算委托</Button>}
         {releases.data && !operationsEnabled && <span className="gateway-release-worker-state" title="检查依赖、回滚和清理计划暂不可用。"><AlertTriangle size={13} />Release Worker 未部署</span>}
@@ -695,7 +695,7 @@ export function GatewayReleasesPage({
       </div>}
     {isMobile && releases.data && items.length > 0 && <Dialog open={releaseDrawerOpen} onOpenChange={onReleaseDrawerOpenChange}>
       <DialogContent className="apim-native-route-drawer gateway-release-drawer" finalFocus={false}>
-        <DialogHeader className="apim-native-route-drawer-header"><DialogTitle>发布管理</DialogTitle><DialogDescription className="sr-only">选择一条发布记录</DialogDescription><DialogClose render={<Button type="button" variant="ghost" size="icon-sm" className="apim-native-route-drawer-close" />}><X size={16} /><span className="sr-only">关闭</span></DialogClose></DialogHeader>
+        <DialogHeader className="apim-native-route-drawer-header"><DialogTitle>发布历史</DialogTitle><DialogDescription className="sr-only">选择一条发布记录</DialogDescription><DialogClose render={<Button type="button" variant="ghost" size="icon-sm" className="apim-native-route-drawer-close" />}><X size={16} /><span className="sr-only">关闭</span></DialogClose></DialogHeader>
         <aside className="gateway-release-list-pane gateway-release-drawer-list">{releaseListContent(true)}</aside>
         <div ref={releaseDrawerPortalRef} className="gateway-release-drawer-portals" />
       </DialogContent>

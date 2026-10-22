@@ -23,6 +23,9 @@ from .http.budgets import router as budgets_router
 from .http.dependencies import get_repository
 from .http.governance import router as governance_router
 from .http.model_platform import (
+    gateway_compat_router as model_platform_gateway_compat_router,
+)
+from .http.model_platform import (
     protected_router as model_platform_protected_router,
 )
 from .http.model_platform import (
@@ -79,7 +82,18 @@ app.add_middleware(
     allow_origins=get_settings().cors_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_headers=[
+        "Content-Type",
+        "Authorization",
+        "Ocp-Apim-Subscription-Key",
+        "api-key",
+        "x-interaction-id",
+        "x-session-id",
+        "x-initiator",
+        "x-turn-index",
+        "x-task-type",
+        "x-session-ttl-seconds",
+    ],
 )
 
 
@@ -96,6 +110,7 @@ protected.routes.extend(model_platform_protected_router.routes)
 protected.routes.extend(observability_router.routes)
 protected.routes.extend(application_access_router.routes)
 app.include_router(protected)
+app.include_router(model_platform_gateway_compat_router)
 app.include_router(assistant_title_router)
 app.include_router(model_platform_publication_router)
 app.include_router(github_copilot_router)

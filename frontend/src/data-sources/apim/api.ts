@@ -29,6 +29,8 @@ import type {
   GatewayReleaseProtectionWrite,
   GatewayReleaseRollbackPreview,
   GatewayBackendPoolConfig,
+  GatewayBackendPoolCandidate,
+  GatewayBackendPoolSummary,
   GatewayBackendPoolWrite,
   GatewayApplicationAvatar,
   GatewayApplicationAvatarUpdate,
@@ -59,10 +61,13 @@ import type {
   ModelRouter,
   ModelRouterAssignedList,
   ModelRouterAssignment,
+  ModelRouterBulkAssignmentResult,
+  ModelRouterBulkAssignmentWrite,
   ModelRouterDecisionPreview,
   ModelRouterDecisionTrialResult,
   ModelRouterList,
   ModelRouterModelCatalog,
+  ModelRouterPeopleAccessResponse,
   ModelRouterValidation,
   ModelRouterWrite,
   OptimizationEvent,
@@ -614,10 +619,46 @@ export const dataSource = {
   modelRouterAssignees: (id: string) => request<string[]>(
     `/api/v1/model-routers/${encodeURIComponent(id)}/assignees`,
   ),
+  modelRouterPeople: (
+    id: string,
+    params: {
+      departmentId?: string
+      query?: string
+      offset?: number
+      limit?: number
+    } = {},
+  ) => {
+    const search = new URLSearchParams()
+    if (params.departmentId && params.departmentId !== "all") {
+      search.set("department_id", params.departmentId)
+    }
+    if (params.query?.trim()) {
+      search.set("query", params.query.trim())
+    }
+    if (typeof params.offset === "number") {
+      search.set("offset", String(params.offset))
+    }
+    if (typeof params.limit === "number") {
+      search.set("limit", String(params.limit))
+    }
+    const qs = search.toString()
+    return request<ModelRouterPeopleAccessResponse>(
+      `/api/v1/model-routers/${encodeURIComponent(id)}/people${qs ? `?${qs}` : ""}`,
+    )
+  },
   setModelRouterAssignment: (id: string, userId: string, assigned: boolean) =>
     writeJson<ModelRouterAssignment>(
       `/api/v1/model-routers/${encodeURIComponent(id)}/assignment`,
       { user_id: userId, assigned },
+      "PUT",
+    ),
+  saveModelRouterAssignments: (
+    id: string,
+    write: ModelRouterBulkAssignmentWrite,
+  ) =>
+    writeJson<ModelRouterBulkAssignmentResult>(
+      `/api/v1/model-routers/${encodeURIComponent(id)}/assignments`,
+      write,
       "PUT",
     ),
   modelRouter: (id: string) => request<ModelRouter>(
@@ -694,6 +735,12 @@ export const dataSource = {
     `/api/v1/model-management/models/${encodeURIComponent(id)}`,
     { method: "DELETE" },
   ).then(normalizeGatewayPublicationAccepted),
+  modelBackendPools: () => request<GatewayBackendPoolSummary[]>(
+    "/api/v1/model-management/backend-pools",
+  ),
+  modelBackendPoolCandidates: (id: string) => request<GatewayBackendPoolCandidate[]>(
+    `/api/v1/model-management/models/${encodeURIComponent(id)}/backend-pool/candidates`,
+  ),
   modelBackendPool: (id: string) => request<GatewayBackendPoolConfig>(
     `/api/v1/model-management/models/${encodeURIComponent(id)}/backend-pool`,
   ).catch((error: unknown) => {

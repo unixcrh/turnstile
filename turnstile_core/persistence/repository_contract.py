@@ -321,8 +321,16 @@ class QueryRepository(ABC):
     def list_assigned_model_routers(self, user_id: str) -> Sequence[dict[str, Any]]: ...
 
     @abstractmethod
+    def list_published_model_routers(self) -> Sequence[dict[str, Any]]: ...
+
+    @abstractmethod
     def get_callable_model_router(
         self, router_id: UUID, user_id: str
+    ) -> dict[str, Any] | None: ...
+
+    @abstractmethod
+    def get_published_model_router(
+        self, router_id: UUID
     ) -> dict[str, Any] | None: ...
 
     @abstractmethod
@@ -330,8 +338,31 @@ class QueryRepository(ABC):
         self, router_id: UUID, user_id: str, assigned: bool, changed_by: str
     ) -> bool: ...
 
+    def set_model_router_assignments_bulk(
+        self,
+        router_id: UUID,
+        assignments: Mapping[str, bool],
+        changed_by: str,
+    ) -> list[str] | None:
+        changed: list[str] = []
+        existing = set(self.list_model_router_assignees(router_id))
+        for user_id, assigned in assignments.items():
+            if not self.set_model_router_assignment(
+                router_id, user_id, assigned, changed_by
+            ):
+                return None
+            if (user_id in existing) != assigned:
+                changed.append(user_id)
+        return changed
+
     @abstractmethod
     def list_model_router_assignees(self, router_id: UUID) -> Sequence[str]: ...
+
+    def list_model_router_policy_users(
+        self, user_ids: Sequence[str] | None = None
+    ) -> Sequence[str]:
+        del user_ids
+        return []
 
     @abstractmethod
     def get_model_router_run_binding(

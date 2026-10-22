@@ -108,12 +108,11 @@ function ringRadius(widths: number[], innerWidths: number[] = [], innerRadius = 
 
 export function layoutModelInventoryGraph(projection: InventoryGraphProjection, width: number, height: number, measure: (name: string) => number): InventoryGraphLayout {
   const clusters: Cluster[] = projection.connections.map(connection => {
-    const widths = connection.models.map(model => Math.max(120, Math.min(240, Math.ceil(measure(model.display_name) + 64))))
-    const innerCount = widths.length > 12 ? Math.ceil(widths.length / 2) : 0
-    const innerRadius = innerCount ? Math.max(174, ringRadius(widths.slice(0, innerCount))) : 0
-    const compact = innerCount ? ringRadius(widths.slice(innerCount), widths.slice(0, innerCount), innerRadius)
+    const innerCount = connection.models.length > 12 ? Math.ceil(connection.models.length / 2) : 0
+    const widths = connection.models.map(model => Math.max(120, Math.min(innerCount ? 180 : 240, Math.ceil(measure(model.display_name) + 64))))
+    const innerRadius = innerCount ? ringRadius(widths.slice(0, innerCount)) : 0
+    const radius = innerCount ? ringRadius(widths.slice(innerCount), widths.slice(0, innerCount), innerRadius)
       : Math.max(widths.length > 4 ? 174 : 100, ringRadius(widths))
-    const radius = innerCount ? innerRadius + (compact - innerRadius) * 1.15 : compact
     const members = connection.models.map((model, index) => {
       const inner = innerCount > 0 && index < innerCount
       const count = inner ? innerCount : widths.length - innerCount

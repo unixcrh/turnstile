@@ -1735,6 +1735,60 @@ paths:
         '
       tags:
       - Model Control Plane
+  /api/v1/model-management/backend-pools:
+    get:
+      summary: List effective model backend pools
+      operationId: listManagedModelBackendPools
+      security:
+      - sessionCookie: []
+      tags:
+      - Model Control Plane
+      responses:
+        '200':
+          description: Effective pools with their public model identities
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: ../../openapi.yaml#/components/schemas/GatewayBackendPoolSummary
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+  /api/v1/model-management/models/{item_id}/backend-pool/candidates:
+    get:
+      summary: List registered compatible deployment candidates for a model
+      operationId: listManagedModelBackendPoolCandidates
+      description: Owner-only, registry-only read. Returns registered deployments with compatible connection, protocol, path, and authentication settings, including distinct deployments in the same Project or different Projects. Does not read ARM credentials or call Foundry. The Publisher verifies the exact Foundry model publisher, name, and version before publishing selected members.
+      security:
+      - sessionCookie: []
+      tags:
+      - Model Control Plane
+      parameters:
+      - name: item_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Registered deployment candidates; model equivalence is verified during publication
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: ../../openapi.yaml#/components/schemas/GatewayBackendPoolCandidate
+        '403':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '404':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '409':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '503':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
   /api/v1/model-management/models/{item_id}/backend-pool:
     get:
       summary: Read one model's effective APIM-native backend Pool
@@ -1815,9 +1869,17 @@ paths:
 
         Resolves only existing compatible managed Runtimes. All members must share the
 
-        model provider, gateway, protocol, backend path, upstream deployment identity,
+        model provider, gateway, protocol, backend path,
 
-        authentication strategy, and streaming mode. The Publisher creates immutable
+        compatible authentication, and streaming mode. A member model_id identifies its registered
+
+        physical deployment, so one Runtime may supply multiple distinct deployments.
+
+        Different Foundry deployment names require verified matching model publisher, name,
+
+        and version, plus a deployment-aware Observer and Operation reader. Legacy Runtime-only
+
+        members retain their existing interpretation. The Publisher creates immutable
 
         Single backends that isolate 429, 408, 5xx, connection failures, and timeouts, plus a
 
@@ -2539,6 +2601,19 @@ paths:
                 $ref: ../../openapi.yaml#/components/schemas/HTTPValidationError
       security:
       - sessionCookie: []
+  /api/v1/model-gateway/models:
+    get:
+      summary: List Gateway Models
+      operationId: list_gateway_models_api_v1_model_gateway_models_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/GatewayModelCatalogResponse
+      security:
+      - sessionCookie: []
   /api/v1/model-gateway/invoke:
     post:
       summary: Invoke Model
@@ -2556,6 +2631,31 @@ paths:
             application/json:
               schema:
                 $ref: ../../openapi.yaml#/components/schemas/ModelInvocationResponse
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/HTTPValidationError
+      security:
+      - sessionCookie: []
+  /api/v1/model-gateway/chat/completions:
+    post:
+      summary: Chat Completions
+      operationId: chat_completions_api_v1_model_gateway_chat_completions_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: ../../openapi.yaml#/components/schemas/ChatCompletionsRequest
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/ChatCompletionsResponse
         '422':
           description: Validation Error
           content:

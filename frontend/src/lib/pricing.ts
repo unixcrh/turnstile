@@ -81,8 +81,128 @@ export function priceRequests<T extends UsageRequestSummary>(
 }
 
 export function requestCostCalculation(request: UsageRequestDetail) {
-  if (request.usage_available === false || request.cost_available === false || request.router_attempts?.length
+  if (request.usage_available === false || request.cost_available === false
     || (request.estimated && !request.reconciled_at)) return null
+  if (request.router_attempts?.length) {
+    const measured = request.router_attempts.filter(
+      (attempt) => (attempt.total_tokens ?? 0) > 0 || (attempt.estimated_cost ?? 0) > 0,
+    )
+    if (!measured.length) return null
+    const lowerBound = request.ingest_error === "stream_cache_usage_unavailable"
+    const terms: Array<{ bucket: string; label?: string; tokens: number; rate: number }> = []
+    type ContextTierItem = NonNullable<NonNullable<UsageRequestDetail["price_context_snapshot"]>["context_tiers"]>[number]
+    let resolvedContextTier: ContextTierItem | null = null
+    let resolvedInputTokens = request.prompt_tokens + request.cached_tokens
+    for (const attempt of measured) {
+      const isPrimary = attempt.request_id === request.request_id
+        || attempt.model_id === (request.selected_model_id ?? request.model_id)
+      const attemptAllZeroRates =
+        attempt.input_price_per_million === 0
+        && attempt.output_price_per_million === 0
+        && (attempt.cached_price_per_million ?? 0) === 0
+        && (attempt.cache_write_price_per_million ?? 0) === 0
+      const preferRequestRates =
+        isPrimary
+        && attemptAllZeroRates
+        && (
+          (attempt.estimated_cost ?? 0) > 0
+          || request.price_context_tier != null
+          || (request.price_context_snapshot?.context_tiers?.length ?? 0) > 0
+          || (request.input_price_per_million ?? 0) > 0
+          || (request.output_price_per_million ?? 0) > 0
+        )
+      const rawInRate = preferRequestRates
+        ? request.input_price_per_million
+        : (attempt.input_price_per_million ?? (isPrimary ? request.input_price_per_million : null))
+      const rawOutRate = preferRequestRates
+        ? request.output_price_per_million
+        : (attempt.output_price_per_million
+          ?? (isPrimary ? request.output_price_per_million : null)
+          ?? (rawInRate != null && (attempt.output_tokens ?? 0) === 0 ? 0 : null))
+      if (rawInRate == null || rawOutRate == null) return null
+      const inRate = Number(rawInRate)
+      const outRate = Number(rawOutRate)
+      const cachedRate = Number(
+        (preferRequestRates ? request.cached_price_per_million : attempt.cached_price_per_million)
+          ?? (isPrimary ? request.cached_price_per_million : null)
+          ?? inRate,
+      )
+      const writeRate = Number(
+        (preferRequestRates ? request.cache_write_price_per_million : attempt.cache_write_price_per_million)
+          ?? (isPrimary ? request.cache_write_price_per_million : null)
+          ?? cachedRate,
+      )
+      if ([inRate, outRate, cachedRate, writeRate].some((v) => !Number.isFinite(v) || v < 0)) {
+        return null
+      }
+      const inTokens = Number(attempt.input_tokens ?? 0)
+      const cachedTokens = Number(attempt.cached_tokens ?? 0)
+      const writes = Number(attempt.cache_write_tokens ?? 0)
+      const outTokens = Number(attempt.output_tokens ?? 0)
+      if (
+        [inTokens, cachedTokens, writes, outTokens].some((v) => !Number.isSafeInteger(v) || v < 0)
+        || writes > cachedTokens
+      ) {
+        return null
+      }
+      const attemptInputTokens = inTokens + cachedTokens
+      const tiers = attempt.price_context_snapshot?.context_tiers
+        ?? (isPrimary ? request.price_context_snapshot?.context_tiers : undefined)
+        ?? []
+      const tierKey = attempt.price_context_tier
+        ?? (isPrimary ? request.price_context_tier : null)
+        ?? null
+      if (tiers.length) {
+        const matchedTier = tiers.find((tier) => tier.key === tierKey) ?? null
+        if (
+          !matchedTier
+          || lowerBound
+          || attemptInputTokens < matchedTier.min_input_tokens
+          || (matchedTier.max_input_tokens != null && attemptInputTokens > matchedTier.max_input_tokens)
+        ) {
+          return null
+        }
+        if (isPrimary || resolvedContextTier === null) {
+          resolvedContextTier = matchedTier
+          resolvedInputTokens = attemptInputTokens
+        }
+      }
+      const cachedRead = Math.max(0, cachedTokens - writes)
+      if (measured.length === 1) {
+        terms.push(
+          { bucket: "input", tokens: inTokens, rate: inRate },
+          ...lowerBound ? [] : [
+            { bucket: "cached", tokens: cachedRead, rate: cachedRate },
+            { bucket: "write", tokens: writes, rate: writeRate },
+          ],
+          { bucket: "output", tokens: outTokens, rate: outRate },
+        )
+      } else {
+        const shortModel = attempt.model_name.split(" · ")[0]
+        const prefix = attempt.attempt_role === "routing_decision"
+          ? `判路由(${shortModel}) `
+          : `推理(${shortModel}) `
+        terms.push({ bucket: `s${attempt.sequence}-in`, label: `${prefix}未缓存输入`, tokens: inTokens, rate: inRate })
+        if (!lowerBound && cachedRead > 0) {
+          terms.push({ bucket: `s${attempt.sequence}-cached`, label: `${prefix}缓存读取`, tokens: cachedRead, rate: cachedRate })
+        }
+        if (!lowerBound && writes > 0) {
+          terms.push({ bucket: `s${attempt.sequence}-write`, label: `${prefix}缓存写入`, tokens: writes, rate: writeRate })
+        }
+        terms.push({ bucket: `s${attempt.sequence}-out`, label: `${prefix}输出`, tokens: outTokens, rate: outRate })
+      }
+    }
+    const calculatedCost = Number((terms.reduce((sum, term) => sum + term.tokens * term.rate, 0) / 1_000_000).toFixed(8))
+    return {
+      terms,
+      contextTier: resolvedContextTier,
+      inputTokens: resolvedInputTokens,
+      calculatedCost,
+      lowerBound,
+      recordedCost: request.estimated_cost,
+      matchesRecordedCost: Math.abs(calculatedCost - request.estimated_cost) < 0.00000005,
+    }
+  }
   const inputRate = request.input_price_per_million
   const outputRate = request.output_price_per_million
   if (inputRate == null || outputRate == null) return null
@@ -95,7 +215,7 @@ export function requestCostCalculation(request: UsageRequestDetail) {
     || [inputRate, cachedRate, writeRate, outputRate, request.estimated_cost]
       .some(value => !Number.isFinite(value) || value < 0)) return null
   const lowerBound = request.ingest_error === "stream_cache_usage_unavailable"
-  const terms = [
+  const terms: Array<{ bucket: string; label?: string; tokens: number; rate: number }> = [
     { bucket: "input", tokens: request.prompt_tokens, rate: inputRate },
     ...lowerBound ? [] : [
       { bucket: "cached", tokens: request.cached_tokens - writes, rate: cachedRate },

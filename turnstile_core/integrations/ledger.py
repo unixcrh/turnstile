@@ -163,6 +163,7 @@ class LedgerReservation:
 class LedgerModelAccess:
     user_id: str
     identifiers: tuple[str, ...]
+    configured: bool = True
 
 
 @dataclass(frozen=True)
@@ -866,15 +867,102 @@ class LedgerSyncService:
         self, user_ids: Sequence[str] | None = None
     ) -> list[LedgerModelAccess]:
         rows = self._repository.model_access_ledger_snapshot(user_ids)
-        return [
-            LedgerModelAccess(
-                user_id=str(row["user_id"]),
-                identifiers=tuple(
-                    [*(row.get("model_uuids") or []), *(row.get("model_keys") or [])]
-                ),
+        direct_by_user = {str(row["user_id"]): row for row in rows}
+        router_tokens_by_user: dict[str, list[str]] = {}
+        list_published = getattr(self._repository, "list_published_model_routers", None)
+        list_assignees = getattr(self._repository, "list_model_router_assignees", None)
+        if callable(list_published):
+            for r_row in list_published():
+                r_id = str(r_row["id"]).strip().lower()
+                token = f"router:{r_id}"
+                users_for_router: set[str] = set()
+                creator = str(r_row.get("created_by") or "").strip()
+                if creator:
+                    users_for_router.add(creator)
+                if callable(list_assignees):
+                    for assignee in list_assignees(UUID(str(r_row["id"]))):
+                        if str(assignee).strip():
+                            users_for_router.add(str(assignee).strip())
+                for u in users_for_router:
+                    if user_ids is not None and not any(
+                        u.casefold() == str(req_u).strip().casefold()
+                        for req_u in user_ids
+                    ):
+                        continue
+                    matched_key = next(
+                        (
+                            str(req_u)
+                            for req_u in (user_ids or ())
+                            if str(req_u).strip().casefold() == u.casefold()
+                        ),
+                        u,
+                    )
+                    bucket = router_tokens_by_user.setdefault(matched_key, [])
+                    if token not in bucket:
+                        bucket.append(token)
+
+        default_unrestricted: list[str] | None = None
+
+        def _unrestricted_identifiers() -> list[str]:
+            nonlocal default_unrestricted
+            if default_unrestricted is None:
+                default_unrestricted = []
+                reg = self._repository.registry()
+                for m in reg.get("models") or []:
+                    if m.get("enabled", True) and not m.get("assignment_required", False):
+                        default_unrestricted.append(str(m["id"]))
+                        if m.get("model_key"):
+                            default_unrestricted.append(str(m["model_key"]))
+            return default_unrestricted
+
+        target_users = (
+            list(
+                dict.fromkeys(
+                    [
+                        *direct_by_user.keys(),
+                        *router_tokens_by_user.keys(),
+                        *(str(uid) for uid in user_ids),
+                    ]
+                )
             )
-            for row in rows
-        ]
+            if user_ids is not None
+            else list(dict.fromkeys([*direct_by_user.keys(), *router_tokens_by_user.keys()]))
+        )
+        result: list[LedgerModelAccess] = []
+        for uid in target_users:
+            r_tokens = router_tokens_by_user.get(uid, [])
+            if uid in direct_by_user:
+                row = direct_by_user[uid]
+                result.append(
+                    LedgerModelAccess(
+                        user_id=uid,
+                        identifiers=tuple(
+                            [
+                                *(row.get("model_uuids") or []),
+                                *(row.get("model_keys") or []),
+                                *r_tokens,
+                            ]
+                        ),
+                        configured=True,
+                    )
+                )
+            elif r_tokens:
+                result.append(
+                    LedgerModelAccess(
+                        user_id=uid,
+                        identifiers=tuple([*_unrestricted_identifiers(), *r_tokens]),
+                        configured=True,
+                    )
+                )
+            else:
+                result.append(
+                    LedgerModelAccess(
+                        user_id=uid,
+                        identifiers=(),
+                        configured=False,
+                    )
+                )
+        return result
 
     def application_snapshot(
         self, now: datetime | None = None
@@ -942,7 +1030,7 @@ class LedgerSyncService:
             self._store.upsert(
                 partition_key(policy.user_id, period),
                 MODEL_ACCESS_ROW_KEY,
-                {"Configured": True, "Models": value},
+                {"Configured": policy.configured, "Models": value},
             )
             written += 1
         return written

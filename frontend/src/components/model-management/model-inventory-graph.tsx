@@ -12,7 +12,7 @@ import "../../styles/model-inventory-graph.css"
 type Selection = { kind: "gateway" | "connection" | "model"; id: string; connectionId: string | null }
 type GraphContextValue = { projection: InventoryGraphProjection; registry: ModelRegistry; selection: Selection | null }
 const GraphContext = createContext<GraphContextValue | null>(null)
-const handleStyle = { left: "50%", top: "50%", width: 1, height: 1, opacity: 0, border: 0, pointerEvents: "none" as const }
+const handleStyle = { left: "50%", top: "50%", width: 0, height: 0, minWidth: 0, minHeight: 0, opacity: 0, border: 0, pointerEvents: "none" as const }
 
 function GraphZoomReadout({ onReset }: { onReset: () => void }) {
   const { zoom } = useViewport()

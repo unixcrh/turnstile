@@ -323,7 +323,17 @@ AnomalyRuleServiceDependency = Annotated[
 
 
 def model_router_service(repository: Repository) -> ModelRouterService:
-    return ModelRouterService(repository)
+    settings = get_settings()
+    if not settings.ledger_sync_enabled or not settings.ledger_table_endpoint:
+        return ModelRouterService(repository)
+    endpoint = settings.ledger_table_endpoint
+
+    def project(user_ids: Sequence[str]) -> None:
+        with TableStorageLedger(endpoint, settings.ledger_table_name) as store:
+            service = LedgerSyncService(repository, store)
+            service.project_model_access(service.model_access(user_ids))
+
+    return ModelRouterService(repository, project)
 
 
 ModelRouterServiceDependency = Annotated[

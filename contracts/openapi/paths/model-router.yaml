@@ -491,6 +491,54 @@ paths:
           $ref: ../../openapi.yaml#/components/responses/ErrorResponse
         default:
           $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+  /api/v1/model-routers/{router_id}/people:
+    get:
+      tags:
+      - Model Router
+      operationId: listModelRouterPeople
+      summary: List paginated people and department summaries for router access management
+      parameters:
+      - $ref: ../../openapi.yaml#/components/parameters/RouterId
+      - name: department_id
+        in: query
+        required: false
+        schema:
+          type: string
+          maxLength: 320
+      - name: query
+        in: query
+        required: false
+        schema:
+          type: string
+          maxLength: 200
+      - name: offset
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+          default: 0
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 200
+          default: 50
+      responses:
+        '200':
+          description: Paginated people access directory and department summaries
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/ModelRouterPeopleAccessResponse
+        '403':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '404':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
   /api/v1/model-routers/{router_id}/assignment:
     put:
       tags:
@@ -513,6 +561,37 @@ paths:
             application/json:
               schema:
                 $ref: ../../openapi.yaml#/components/schemas/ModelRouterAssignment
+        '403':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '404':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '409':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        '422':
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+        default:
+          $ref: ../../openapi.yaml#/components/responses/ErrorResponse
+  /api/v1/model-routers/{router_id}/assignments:
+    put:
+      tags:
+      - Model Router
+      operationId: setModelRouterAssignmentsBulk
+      summary: Grant or revoke multiple people's access to a published model router
+      parameters:
+      - $ref: ../../openapi.yaml#/components/parameters/RouterId
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../../openapi.yaml#/components/schemas/ModelRouterBulkAssignmentWrite
+      responses:
+        '200':
+          description: Bulk applied assignment state
+          content:
+            application/json:
+              schema:
+                $ref: ../../openapi.yaml#/components/schemas/ModelRouterBulkAssignmentResult
         '403':
           $ref: ../../openapi.yaml#/components/responses/ErrorResponse
         '404':

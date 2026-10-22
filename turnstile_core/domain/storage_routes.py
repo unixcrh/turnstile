@@ -12,8 +12,6 @@ from pydantic import AfterValidator, AwareDatetime, ConfigDict, Field, model_val
 
 from .budget_counting import BudgetOperation, ModelCountContract
 from .control_plane import (
-    GatewayBackendPoolMemberWrite,
-    GatewayBackendPoolWrite,
     GatewayPublication,
     GatewayRateLimitResilience,
 )
@@ -223,17 +221,21 @@ class RouteBackendPool(RouteModel):
     )
     credential_versions: dict[Identifier, str] = Field(default_factory=dict, max_length=30)
     header_values: dict[Identifier, str] = Field(
-        default_factory=dict, max_length=60, exclude_if=lambda value: not value,
+        default_factory=dict, max_length=90, exclude_if=lambda value: not value,
+    )
+    configuration_sha256: Digest | None = Field(
+        default=None, exclude_if=lambda value: value is None,
     )
 
     @model_validator(mode="after")
     def validate_members(self) -> RouteBackendPool:
-        GatewayBackendPoolWrite(
-            members=[GatewayBackendPoolMemberWrite(
-                runtime_id=UUID(member.runtime_id), priority=member.priority, weight=member.weight,
-            ) for member in self.members],
-            rate_limit=self.rate_limit, session_affinity=self.session_cookie_name is not None,
-        )
+        priority_weights: dict[int, int] = {}
+        for member in self.members:
+            priority_weights[member.priority] = (
+                priority_weights.get(member.priority, 0) + member.weight
+            )
+        if any(weight == 0 for weight in priority_weights.values()):
+            raise ValueError("every backend priority group needs a positive weight")
         if len({member.backend_id.casefold() for member in self.members}) != len(self.members):
             raise ValueError("ROUTE_POOL_BACKEND_REPEATED")
         for secret_id in self.credential_versions.values():
@@ -1228,6 +1230,9 @@ class RoutePublicationTask(RouteModel):
     program_migration_sha256: Digest | None = Field(
         default=None, exclude_if=lambda value: value is None,
     )
+    previous_program_sha256: Digest | None = Field(
+        default=None, exclude_if=lambda value: value is None,
+    )
     known_unavailable_bindings: dict[str, Digest] = Field(
         default_factory=dict, max_length=10000, exclude_if=lambda value: not value,
     )
@@ -1298,6 +1303,12 @@ class RoutePublicationTask(RouteModel):
         snapshot.require_valid(plan.planned_epoch)
         ActiveRouteHead(approval=snapshot.approval, activated_epoch=plan.planned_epoch)
         previous = self.previous_head
+        if self.previous_program_sha256 is not None and (
+            previous is None or self.model_addition or self.program_migration_sha256 is not None
+            or previous.approval.required_program_sha256 != self.previous_program_sha256
+            or self.previous_program_sha256 == plan.program.program_sha256
+        ):
+            raise ValueError("ROUTE_PREVIOUS_PROGRAM_BINDING_INVALID")
         if previous is None:
             if self.previous_members:
                 raise ValueError("ROUTE_PUBLICATION_BASELINE_INVALID")
@@ -1334,7 +1345,8 @@ class RoutePublicationTask(RouteModel):
                 or snapshot.approval.generation != previous.approval.generation + 1
                 or previous.approval.entry_count != len(self.previous_routes)
                 or previous.approval.catalog_sha256 != catalog_digest(self.previous_routes)
-                or previous.approval.required_program_sha256 != plan.program.program_sha256
+                or previous.approval.required_program_sha256
+                != (self.previous_program_sha256 or plan.program.program_sha256)
             )
         ):
             raise ValueError("ROUTE_PUBLICATION_TASK_INVALID")

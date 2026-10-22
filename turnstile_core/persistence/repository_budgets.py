@@ -579,11 +579,13 @@ class PostgreSqlBudgetRepositoryMixin:
                 """SELECT policy.user_id, policy.updated_at, policy.updated_by,
                           COALESCE(
                               array_agg(access.model_id ORDER BY access.model_id)
-                                  FILTER (WHERE access.model_id IS NOT NULL),
+                                  FILTER (WHERE model.id IS NOT NULL),
                               ARRAY[]::UUID[]
                           ) AS model_ids
                    FROM user_model_policy policy
                    LEFT JOIN user_model_access access ON access.user_id = policy.user_id
+                   LEFT JOIN managed_model model
+                     ON model.id = access.model_id AND model.enabled
                    WHERE policy.user_id = ANY(%s)
                    GROUP BY policy.user_id, policy.updated_at, policy.updated_by""",
                 (list(user_ids),),

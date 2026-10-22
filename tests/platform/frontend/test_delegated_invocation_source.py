@@ -1,3 +1,6 @@
+import subprocess
+from pathlib import Path
+
 from tests.support.paths import FRONTEND_SOURCE
 
 
@@ -29,3 +32,28 @@ def test_member_invocation_picker_lists_self_and_current_department_testers() ->
     assert "@contoso.com" not in invocation
     assert "allowAll = true" in shared
     assert "allowAll && <SelectItem" in shared
+
+
+def test_invocation_client_samples_follow_current_selection() -> None:
+    invocation = (
+        FRONTEND_SOURCE / "data-sources/apim/pages/dashboard-invocation.tsx"
+    ).read_text(encoding="utf-8")
+    assert "selectedRouter?.name ?? invocationModel?.model_key" in invocation
+    assert "selectedGateway?.endpoint" in invocation
+    assert 'stateFormat === "json" ? JSON.parse(prompt) : prompt' in invocation
+    assert "questions: JSON.parse(questions)" in invocation
+    assert "sampleRuntime?.config.max_tokens_field" in invocation
+    assert '"x-user-id": userId' in invocation
+    assert "<ClientSampleCode endpoint={sampleEndpoint}" in invocation
+    assert '<details className="invoke-code-sample">' in invocation
+    assert invocation.index('<details className="invoke-code-sample">') < invocation.index(
+        '<section className="finops-panel invoke-result">'
+    )
+    assert "Tabs." not in invocation
+    assert "outputView" not in invocation
+    assert "invoke-client-quickstart" not in invocation
+    subprocess.run(
+        ["node", "--test", str(Path(__file__).with_name("invocation-client-samples.test.mjs"))],
+        cwd=FRONTEND_SOURCE.parent.parent,
+        check=True,
+    )

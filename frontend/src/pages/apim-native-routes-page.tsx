@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState, type CSSProperties } from "react"
-import { useQueries, useQuery } from "@tanstack/react-query"
+import { useQuery } from "@tanstack/react-query"
 import { Network, Plus, RefreshCw, Search, X } from "lucide-react"
 
 import {
@@ -7,15 +7,8 @@ import {
   type NativeRouteModelOption,
 } from "../components/model-management/apim-native-route-create-dialog"
 import { DeploymentResilienceEditor } from "../components/model-management/deployment-resilience-editor"
-import {
-  compatibleNativeRouteRuntimes,
-  equivalentNativeRouteRuntimes,
-  hasNativeRouteCounterpart,
-  nativeRouteUpstreamIdentity,
-} from "../components/model-management/apim-native-route-eligibility"
 import { finopsQueries } from "../data-sources/apim/queries"
 import { useIsMobile } from "../hooks/use-mobile"
-import { FINOPS_NAVIGATE_EVENT } from "../lib/navigation"
 import { Button } from "../components/ui/button"
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "../components/ui/dialog"
 import { useResizablePane } from "../components/ui/use-resizable-pane"
@@ -40,6 +33,7 @@ export function ApimNativeRoutesPage({
   const { user } = useAuth()
   const isMobile = useIsMobile()
   const registry = useQuery(finopsQueries.registry())
+  const pools = useQuery(finopsQueries.modelBackendPools())
   const [search, setSearch] = useState("")
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null)
   const [pendingCreatedModelId, setPendingCreatedModelId] = useState<string | null>(null)
@@ -56,68 +50,28 @@ export function ApimNativeRoutesPage({
     minWidth: NATIVE_ROUTE_PANE_WIDTH_MIN,
     maxWidth: NATIVE_ROUTE_PANE_WIDTH_MAX,
   })
-  const eligibleRoutes = useMemo(() => {
+  const managedModels = useMemo(() => {
     if (!registry.data) return []
-    return registry.data.models
-      .filter((model) => model.enabled && hasNativeRouteCounterpart(model, registry.data!))
+    return registry.data.models.filter((model) => model.enabled
+      && !model.capabilities.includes("image_generation") && !model.capabilities.includes("decision")
+      && registry.data!.runtimes.some(runtime => runtime.id === model.runtime_id
+        && runtime.enabled && runtime.config.control_plane_managed === true
+        && registry.data!.gateways.some(gateway => gateway.id === runtime.gateway_profile_id
+          && gateway.implementation === "apim")))
       .sort((left, right) => left.model_key.localeCompare(right.model_key))
   }, [registry.data])
-  const poolQueries = useQueries({
-    queries: eligibleRoutes.map((model) => finopsQueries.modelBackendPool(model.id)),
-  })
-  const poolQueryByModelId = new Map(
-    eligibleRoutes.map((model, index) => [model.id, poolQueries[index]] as const),
-  )
-  const activeRoutes = eligibleRoutes.filter(
-    (model) => Boolean(poolQueryByModelId.get(model.id)?.data),
-  )
-  const routeOptions: NativeRouteModelOption[] = (registry.data?.models ?? [])
-    .filter((model) => model.enabled)
-    .map((model) => {
-      const equivalentRuntimes = registry.data
-        ? equivalentNativeRouteRuntimes(model, registry.data)
-        : []
-      const compatibleRuntimes = registry.data
-        ? compatibleNativeRouteRuntimes(model, registry.data)
-        : []
-      const equivalentRuntimeIds = new Set(equivalentRuntimes.map((runtime) => runtime.id))
-      const missingDeploymentRuntimes = compatibleRuntimes.filter(
-        (runtime) => !equivalentRuntimeIds.has(runtime.id),
-      )
-      const poolQuery = poolQueryByModelId.get(model.id)
-      const replicaOwner = activeRoutes.find((route) =>
-        route.id !== model.id
-        && nativeRouteUpstreamIdentity(route) === nativeRouteUpstreamIdentity(model)
-        && poolQueryByModelId.get(route.id)?.data?.members.some(
-          (member) => member.runtime_id === model.runtime_id,
-        ),
-      )
-      const state = replicaOwner
-        ? "replica"
-        : equivalentRuntimes.length < 2
-          ? "ineligible"
-        : poolQuery?.isPending
-          ? "loading"
-          : poolQuery?.isError
-            ? "error"
-            : poolQuery?.data
-              ? "active"
-              : "available"
-      return {
-        model,
-        upstreamDeployment: nativeRouteUpstreamIdentity(model),
-        equivalentRuntimeNames: equivalentRuntimes.map((runtime) => runtime.name),
-        missingDeploymentRuntimeNames: missingDeploymentRuntimes.map((runtime) => runtime.name),
-        replicaOwnerName: replicaOwner?.display_name ?? null,
-        state,
-      }
-    })
-  const routeStateLoading = registry.isLoading || poolQueries.some((query) => query.isPending)
-  const routeStateError = registry.error ?? poolQueries.find((query) => query.error)?.error
+  const poolByModelId = new Map((pools.data ?? []).map(item => [item.model_id, item.pool] as const))
+  const activeRoutes = managedModels.filter(model => poolByModelId.has(model.id))
+  const routeOptions: NativeRouteModelOption[] = managedModels.map(model => ({
+    model,
+    state: poolByModelId.has(model.id) ? "active" : "available",
+  }))
+  const routeStateLoading = registry.isLoading || pools.isLoading
+  const routeStateError = registry.error ?? pools.error
   const routes = useMemo(() => {
     const normalized = search.trim().toLocaleLowerCase()
-    return activeRoutes
-      .filter((model) => !normalized || `${model.display_name} ${model.model_key} ${model.runtime_name}`.toLocaleLowerCase().includes(normalized))
+    return activeRoutes.filter(model => !normalized
+      || `${model.display_name} ${model.model_key} ${model.runtime_name}`.toLocaleLowerCase().includes(normalized))
   }, [activeRoutes, search])
 
   const handleRouteCreated = useCallback((modelId: string) => {
@@ -142,22 +96,10 @@ export function ApimNativeRoutesPage({
   }, [isMobile, onRouteDrawerOpenChange])
 
   const selectedModel = activeRoutes.find((model) => model.id === selectedModelId) ?? null
-  const runtimeNames = selectedModel && registry.data
-    ? equivalentNativeRouteRuntimes(selectedModel, registry.data).map((runtime) => runtime.name)
-    : []
   const selectedPool = selectedModel
-    ? poolQueryByModelId.get(selectedModel.id)?.data
+    ? poolByModelId.get(selectedModel.id)
     : null
-  const memberCount = selectedPool?.members.length ?? runtimeNames.length
-
-  const navigateToModelPlatform = useCallback((tab: "models" | "connections") => {
-    const url = new URL(window.location.href)
-    url.searchParams.set("page", "models")
-    url.searchParams.set("tab", tab)
-    url.searchParams.delete("runtime")
-    window.history.pushState(null, "", url)
-    window.dispatchEvent(new Event(FINOPS_NAVIGATE_EVENT))
-  }, [])
+  const memberCount = selectedPool?.members.length ?? 0
 
   const routeListContent = (closeOnSelect: boolean) => <>
     <div className="router-list-controls apim-native-route-list-controls">
@@ -165,14 +107,14 @@ export function ApimNativeRoutesPage({
     </div>
     <div className="router-list-scroll" role="list" aria-label="APIM 后端池列表">
       {routeStateLoading ? <div className="apim-native-route-drawer-state"><RefreshCw className="spin" size={18} />加载 APIM 后端池列表</div> : routeStateError ? <div className="apim-native-route-drawer-state error">无法加载 APIM 后端池</div> : <>{routes.map((model) => {
-        const runtimes = equivalentNativeRouteRuntimes(model, registry.data!)
+        const members = poolByModelId.get(model.id)?.members ?? []
         return <div role="listitem" className={`router-list-row ${model.id === selectedModelId ? "active" : ""}`} key={model.id}>
           <button type="button" className="router-list-main" onClick={() => {
             setSelectedModelId(model.id)
             if (closeOnSelect) onRouteDrawerOpenChange(false)
           }}>
             <span className="router-list-icon"><Network size={15} /></span>
-            <span className="router-list-copy"><b data-no-localize title={model.display_name}>{model.display_name}</b><small><code data-no-localize title={model.model_key}>{model.model_key}</code><i>·</i><span>{runtimes.length}</span><span>等价 Runtime</span></small></span>
+            <span className="router-list-copy"><b data-no-localize title={model.display_name}>{model.display_name}</b><small><code data-no-localize title={model.model_key}>{model.model_key}</code><i>·</i><span>{members.length}</span><span>个部署</span></small></span>
           </button>
         </div>
       })}
@@ -204,6 +146,7 @@ export function ApimNativeRoutesPage({
       />
       <section className="router-editor-pane apim-native-route-detail">
         {selectedModel ? <DeploymentResilienceEditor
+          key={selectedModel.id}
           model={selectedModel}
           renderFrame={(editor, controls) => <>
             <header className="apim-native-route-toolbar">
@@ -240,8 +183,6 @@ export function ApimNativeRoutesPage({
       options={routeOptions}
       onClose={() => onAddOpenChange(false)}
       onCreated={handleRouteCreated}
-      onManageModels={() => navigateToModelPlatform("models")}
-      onManageRuntimes={() => navigateToModelPlatform("connections")}
     />}
   </div>
 }

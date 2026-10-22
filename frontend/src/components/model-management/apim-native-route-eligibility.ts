@@ -35,23 +35,20 @@ function authCompatible(runtime: ModelRuntime, primary: ModelRuntime) {
   return runtimeAuth === primaryAuth
 }
 
-function runtimeCompatible(runtime: ModelRuntime, primary: ModelRuntime) {
-  return Boolean(
-    runtime.enabled
-    && runtime.provider_id === primary.provider_id
-    && runtime.gateway_profile_id === primary.gateway_profile_id
-    && runtime.config.control_plane_managed === true
-    && primary.config.control_plane_managed === true
-    && runtime.config.backend_url
-    && runtime.config.backend_path
-    && primary.config.backend_url
-    && primary.config.backend_path
-    && apiFormat(runtime) === apiFormat(primary)
-    && configValue(runtime, "backend_path") === configValue(primary, "backend_path")
-    && authCompatible(runtime, primary)
-    && configValue(runtime, "streaming_mode", "native")
-      === configValue(primary, "streaming_mode", "native")
-  )
+function runtimeCompatibilityIssue(runtime: ModelRuntime, primary: ModelRuntime) {
+  if (!runtime.enabled) return "连接已停用"
+  if (runtime.provider_id !== primary.provider_id) return "提供方不一致"
+  if (runtime.gateway_profile_id !== primary.gateway_profile_id) return "Gateway 不一致"
+  if (runtime.config.control_plane_managed !== true
+    || primary.config.control_plane_managed !== true) return "连接未受管"
+  if (!runtime.config.backend_url || !runtime.config.backend_path
+    || !primary.config.backend_url || !primary.config.backend_path) return "后端地址或路径缺失"
+  if (apiFormat(runtime) !== apiFormat(primary)) return "API 协议不一致"
+  if (configValue(runtime, "backend_path") !== configValue(primary, "backend_path")) return "后端路径不一致"
+  if (!authCompatible(runtime, primary)) return "认证配置不兼容"
+  if (configValue(runtime, "streaming_mode", "native")
+    !== configValue(primary, "streaming_mode", "native")) return "流式模式不一致"
+  return null
 }
 
 export function nativeRouteUpstreamIdentity(model: ManagedModel) {
@@ -65,7 +62,25 @@ export function compatibleNativeRouteRuntimes(
   if (model.capabilities.includes("image_generation")) return []
   const primary = registry.runtimes.find((runtime) => runtime.id === model.runtime_id)
   if (!primary) return []
-  return registry.runtimes.filter((runtime) => runtimeCompatible(runtime, primary))
+  return registry.runtimes.filter((runtime) => runtimeCompatibilityIssue(runtime, primary) === null)
+}
+
+export function nativeRouteRuntimeIssue(
+  model: ManagedModel,
+  runtime: ModelRuntime,
+  registry: ModelRegistry,
+) {
+  if (model.capabilities.includes("image_generation")) return "此模型不支持 APIM 后端池"
+  const primary = registry.runtimes.find((candidate) => candidate.id === model.runtime_id)
+  if (!primary) return "主部署连接不可用"
+  const issue = runtimeCompatibilityIssue(runtime, primary)
+  if (issue) return issue
+  const upstream = nativeRouteUpstreamIdentity(model)
+  return registry.models.some((candidate) => candidate.enabled
+    && candidate.provider_id === model.provider_id
+    && candidate.runtime_id === runtime.id
+    && nativeRouteUpstreamIdentity(candidate) === upstream)
+    ? null : "缺少同名 Deployment"
 }
 
 export function equivalentNativeRouteRuntimes(
@@ -95,4 +110,31 @@ export function hasNativeRouteCounterpart(
 ) {
   return equivalentNativeRouteRuntimes(model, registry)
     .some((runtime) => runtime.id !== model.runtime_id)
+}
+
+export function previewNativeRouteDeployments(model: ManagedModel, registry: ModelRegistry) {
+  if (!model.enabled || !model.capabilities.includes("chat")
+    || model.capabilities.some(capability => capability === "image_generation" || capability === "decision")) return []
+  const primary = registry.runtimes.find(runtime => runtime.id === model.runtime_id)
+  if (!primary) return []
+  const upstream = nativeRouteUpstreamIdentity(model)
+  const numberedReplica = (base: string, candidate: string) => candidate.startsWith(`${base}-`)
+    && /^[0-9]+$/.test(candidate.slice(base.length + 1))
+  const seen = new Set<string>()
+  return registry.models.filter(candidate => {
+    if (!candidate.enabled || candidate.provider_id !== model.provider_id
+      || (candidate.family_key ?? "generic") !== (model.family_key ?? "generic")
+      || !model.capabilities.every(capability => candidate.capabilities.includes(capability))
+      || candidate.capabilities.some(capability => capability === "image_generation" || capability === "decision")) return false
+    const runtime = registry.runtimes.find(item => item.id === candidate.runtime_id)
+    if (!runtime || runtimeCompatibilityIssue(runtime, primary) !== null) return false
+    const deployment = nativeRouteUpstreamIdentity(candidate)
+    if (deployment !== upstream && (primary.brand_key !== "microsoft_foundry"
+      || runtime.brand_key !== "microsoft_foundry"
+      || !numberedReplica(upstream, deployment) && !numberedReplica(deployment, upstream))) return false
+    const identity = `${candidate.runtime_id}:${deployment}`
+    if (seen.has(identity)) return false
+    seen.add(identity)
+    return true
+  })
 }

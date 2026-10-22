@@ -8,6 +8,8 @@ import { runInNewContext } from "node:vm"
 
 import { cachePolicies } from "../../../frontend/src/api/cache-policies.ts"
 import { createModelPriceDraft, validateModelPricing } from "../../../frontend/src/components/model-management/model-edit-form.ts"
+import * as nativeRouteEligibility from "../../../frontend/src/components/model-management/apim-native-route-eligibility.ts"
+import * as poolAffinity from "../../../frontend/src/components/model-management/pool-session-affinity.ts"
 import * as gatewayForms from "../../../frontend/src/lib/gateway-forms.ts"
 import { consumeGatewayBootstrap, downloadGatewayEnvironment } from "../../../frontend/src/lib/gateway-bootstrap.ts"
 import * as gatewayTopology from "../../../frontend/src/lib/gateway-topology.ts"
@@ -225,7 +227,7 @@ test("selects and filter dropdowns share one compact theme contract", () => {
   const declarations = Object.fromEntries(rule.nodes.filter(node => node.type === "decl").map(node => [node.prop, node.value]))
   const expected = {
     height: "28px", "font-size": "12px", "font-weight": "500", border: "1px solid var(--border)",
-    "border-radius": "7px", padding: "0 10px", background: "var(--background)", color: "var(--muted-foreground)",
+    "border-radius": "7px", padding: "0 10px", background: "var(--background)", color: "var(--foreground)",
   }
   assert.deepEqual(Object.fromEntries(Object.keys(expected).map(name => [name, declarations[name]])), expected)
   const focus = sheet.nodes.find(node => node.type === "rule" && node.selector.startsWith(':is([data-slot="select-trigger"]') && node.selector.endsWith(":focus-visible"))
@@ -271,15 +273,182 @@ async function bundleModule(relative, define = {}) {
   finally { await bundle.close() }
 }
 
+test("shared Button preserves trigger styling and AlertDialog slots", async () => {
+  const code = await bundleModule("../../../frontend/src/components/ui/button.tsx")
+  const exports = {}
+  const imports = {
+    "react/jsx-runtime": frontendRequire("react/jsx-runtime"),
+    "@base-ui/react/button": { Button: "ButtonPrimitive" },
+    "class-variance-authority": frontendRequire("class-variance-authority"),
+    "../../lib/utils": { cn: (...values) => values.filter(Boolean).join(" ") },
+  }
+  runInNewContext(code, { exports, require: name => imports[name] })
+  for (const variant of [undefined, "default", "outline", "secondary", "ghost", "destructive", "link"]) {
+    for (const slot of [undefined, "tooltip-trigger", "dropdown-menu-trigger", "alert-dialog-action", "alert-dialog-cancel"]) {
+      const button = exports.Button({ variant, disabled: true, title: "Unit action", type: "button", "data-slot": slot })
+      assert.equal(button.type, "ButtonPrimitive")
+      assert.equal(button.props["data-slot"], ["alert-dialog-action", "alert-dialog-cancel"].includes(slot) ? slot : "button")
+      assert.equal(button.props["data-variant"], variant ?? "default")
+      assert.equal(button.props.disabled, true)
+      assert.equal(button.props.title, "Unit action")
+      assert.equal(button.props.type, "button")
+    }
+  }
+})
+
 const apiModule = await bundleModule("../../../frontend/src/data-sources/apim/api.ts")
 const apiClientModule = await bundleModule("../../../frontend/src/api/client.ts", { "import.meta.env": "{}" })
 const queriesModule = await bundleModule("../../../frontend/src/data-sources/apim/queries.ts")
 const workspaceModule = await bundleModule("../../../frontend/src/components/model-management/apim-gateway-workspace.tsx")
 const gatewayDialogModule = await bundleModule("../../../frontend/src/components/model-management/self-hosted-gateway-dialog.tsx")
 const diagnosticModule = await bundleModule("../../../frontend/src/components/model-management/runtime-diagnostic-dialog.tsx")
+const poolEditorModule = await bundleModule("../../../frontend/src/components/model-management/deployment-resilience-editor.tsx")
 const availabilityModule = await bundleModule("../../../frontend/src/components/model-management/model-availability.tsx")
 const releasesModule = await bundleModule("../../../frontend/src/pages/gateway-releases-page.tsx")
 const modelPageModule = await bundleModule("../../../frontend/src/pages/model-management-page.tsx")
+
+function poolEditorHarness({ cachedPools = [], role = "owner", poolPending = false } = {}) {
+  const runtime = connection("unit-runtime", "gateway-a", {
+    name: "Unit connection", brand_key: "microsoft_foundry",
+    config: { control_plane_managed: true, backend_url: "https://unit.example.com",
+      backend_path: "/openai/v1/chat/completions", auth_strategy: "managed_identity" },
+  })
+  const primary = { id: "unit-primary", model_key: "unit-chat", display_name: "Unit chat",
+    upstream_model_id: "unit-chat", runtime_id: runtime.id, provider_id: runtime.provider_id,
+    provider_name: "Unit provider", enabled: true, family_key: "generic", capabilities: ["chat"] }
+  const replica = { ...primary, id: "unit-replica", model_key: "unit-replica",
+    upstream_model_id: "unit-chat-2" }
+  const data = registry({ models: [primary, replica], runtimes: [runtime],
+    backend_pool_session_affinity_supported: true })
+  const states = [], queries = [], writes = []
+  let cursor = 0
+  let candidates = { data: undefined, isSuccess: false, isPending: true, error: null }
+  const useState = initial => {
+    const index = cursor++
+    if (!(index in states)) states[index] = typeof initial === "function" ? initial() : initial
+    return [states[index], value => { states[index] = typeof value === "function" ? value(states[index]) : value }]
+  }
+  const imports = {
+    react: { useState, useEffect() {}, useRef: initial => useState({ current: initial })[0] },
+    "react/jsx-runtime": frontendRequire("react/jsx-runtime"),
+    "@tanstack/react-query": {
+      useQueryClient: () => ({ getQueryData: () => poolPending ? undefined : cachedPools, getQueryState: () => ({ dataUpdatedAt: 101 }) }),
+      useQuery: options => {
+        queries.push(options)
+        if (options.queryKey[0] === "registry") return { data, isLoading: false }
+        if (options.queryKey[0] === "candidates") return candidates
+        if (options.queryKey[0] === "pool") {
+          const initial = options.initialData()
+          return { data: initial, isSuccess: initial !== undefined, isLoading: initial === undefined }
+        }
+        return { data: undefined }
+      },
+      useMutation: options => ({ isPending: false, error: null, mutate: () => writes.push(options) }),
+    },
+    "../../data-sources/apim/queries": {
+      finopsKeys: { modelBackendPools: ["pools"] },
+      finopsQueries: Object.fromEntries([["registry", "registry"], ["modelBackendPool", "pool"],
+        ["modelBackendPoolCandidates", "candidates"], ["gatewayPublication", "publication"]]
+        .map(([name, key]) => [name, id => ({ queryKey: [key, id] })])),
+    },
+    "../../providers/auth-provider": { useAuth: () => ({ user: { role } }) },
+    "../../data-sources/apim/api": {
+      dataSource: { saveModelBackendPool: (_id, payload) => payload },
+    },
+    "../brand-logos": { providerBrandFromIdentity: () => "generic", providerBrandLabel: () => "Provider" },
+    "./apim-native-route-eligibility": nativeRouteEligibility,
+    "./pool-session-affinity": poolAffinity,
+  }
+  const exports = {}
+  runInNewContext(poolEditorModule, { exports, structuredClone,
+    require: name => imports[name] ?? new Proxy({}, { get: (_target, key) => key }) })
+  const flatten = node => Array.isArray(node) ? node.flatMap(flatten)
+    : node?.props ? [node, ...flatten(node.props.children)] : []
+  return {
+    queries, writes,
+    render() { cursor = 0; return flatten(exports.DeploymentResilienceEditor({ model: primary })) },
+    confirm(allowed = [primary, replica]) {
+      candidates = { isSuccess: true, isPending: false, error: null,
+        data: allowed.map(model => ({ model_id: model.id, runtime_id: runtime.id,
+          runtime_name: runtime.name, deployment_name: model.upstream_model_id })) }
+    },
+    fail() { candidates = { data: undefined, isSuccess: false, isPending: false, error: new Error("Unit validation failure") } },
+  }
+}
+
+test("Pool draft can submit compatible cached deployments without waiting for redundant prevalidation", () => {
+  for (const outcome of ["accepted", "rejected", "error"]) {
+    const harness = poolEditorHarness()
+    let nodes = harness.render()
+    const members = nodes.filter(node => node.type === "Checkbox")
+    assert.equal(members.length, 2)
+    assert.equal(members[1].props.disabled, false)
+    const create = tree => tree.find(node => node.type === "Button" && node.props.className === "router-action-primary")
+    assert.equal(create(nodes).props.disabled, true)
+    members[1].props.onCheckedChange(true)
+    nodes = harness.render()
+    assert.equal(create(nodes).props.disabled, false)
+    if (outcome === "error") harness.fail()
+    else harness.confirm(outcome === "rejected" ? [] : undefined)
+    nodes = harness.render()
+    assert.equal(create(nodes).props.disabled, outcome !== "accepted")
+    assert.equal(harness.writes.length, 0)
+  }
+})
+
+test("Pool candidate validation starts without waiting for the individual Pool read", () => {
+  const harness = poolEditorHarness({ poolPending: true })
+    let nodes = harness.render()
+    nodes.filter(node => node.type === "Checkbox")[1].props.onCheckedChange(true)
+    nodes = harness.render()
+    assert.equal(nodes.find(node => node.type === "Button"
+      && node.props.className === "router-action-primary").props.disabled, true)
+  assert.equal(harness.queries.find(query => query.queryKey[0] === "candidates").enabled, true)
+  const pool = harness.queries.find(query => query.queryKey[0] === "pool")
+  assert.equal(pool.initialData(), undefined)
+  assert.equal(pool.initialDataUpdatedAt(), 101)
+  assert.equal(harness.writes.length, 0)
+})
+
+test("cached Pool previews do not grant member edit or creation permission", () => {
+  const harness = poolEditorHarness({ role: "member" })
+  const nodes = harness.render()
+  assert.equal(harness.queries.find(query => query.queryKey[0] === "candidates").enabled, false)
+  assert.equal(nodes.filter(node => node.type === "Checkbox").every(node => node.props.disabled), true)
+  assert.equal(nodes.some(node => node.type === "Button" && node.props.className === "router-action-primary"), false)
+  assert.equal(harness.writes.length, 0)
+})
+
+test("Pool first publication includes weighted mode and affinity in one submission", () => {
+  const harness = poolEditorHarness()
+  let nodes = harness.render()
+  assert.equal(nodes.some(node => node.props?.className === "router-deployment-mode"), false)
+  nodes.filter(node => node.type === "Checkbox")[1].props.onCheckedChange(true)
+  nodes = harness.render()
+  const weighted = nodes.find(node => node.type === "button"
+    && node.props.children?.some(child => child?.props?.children === "加权分流"))
+  assert.ok(weighted)
+  weighted.props.onClick()
+  nodes = harness.render()
+  const weights = nodes.filter(node => node.type === "Input" && node.props.type === "number")
+  assert.equal(weights.length, 2)
+  weights[0].props.onChange({ target: { value: "1" } })
+  weights[1].props.onChange({ target: { value: "3" } })
+  nodes = harness.render()
+  const affinity = nodes.filter(node => node.type === "Checkbox").at(-1)
+  assert.equal(affinity.props.disabled, false)
+  affinity.props.onCheckedChange(true)
+  nodes = harness.render()
+  const create = nodes.find(node => node.type === "Button"
+    && node.props.className === "router-action-primary")
+  assert.equal(create.props.disabled, false)
+  create.props.onClick()
+  assert.equal(harness.writes.length, 1)
+  const payload = JSON.parse(JSON.stringify(harness.writes[0].mutationFn()))
+  assert.deepEqual(payload.members.map(member => [member.priority, member.weight]), [[0, 1], [0, 3]])
+  assert.equal(payload.session_affinity, true)
+})
+
 const modelDetailModule = await bundleModule("../../../frontend/src/components/model-management/model-usage-detail.tsx")
 const modelDetailExports = {}
 const modelDetailNavigation = { pushed: [], events: [] }

@@ -307,7 +307,7 @@ def test_native_pool_snapshot_preserves_members_resilience_and_versioned_credent
         values["session_cookie_name"] = "foreign-cookie"
     elif fault == "secret-version":
         values["credential_versions"] = {"unit-key": "https://unitvault.vault.azure.net/secrets/key"}
-    if fault not in {None, "self-backend", "primary-key"}:
+    if fault not in {None, "duplicate-runtime", "self-backend", "primary-key"}:
         with pytest.raises(ValueError):
             RouteBackendPool.model_validate_json(json.dumps(values))
         return
@@ -327,6 +327,9 @@ def test_native_pool_snapshot_preserves_members_resilience_and_versioned_credent
             }))
         return
     assert [member.priority for member in pool.members] == [0, 0]
+    if fault == "duplicate-runtime":
+        assert pool.members[0].runtime_id == pool.members[1].runtime_id
+        assert pool.members[0].backend_id != pool.members[1].backend_id
     assert pool.rate_limit.max_attempts_per_request == 2
     updated = RouteContent.model_validate_json(canonical_document({
         **route.model_dump(mode="json"), "connection": {
@@ -336,6 +339,113 @@ def test_native_pool_snapshot_preserves_members_resilience_and_versioned_credent
     assert updated.connection.pool == pool
     assert "pool" not in route.connection.model_dump(mode="json")
     assert changed_route_aliases([route], [updated]) == (route.alias,)
+
+
+@pytest.mark.parametrize("fault", [None, "header-limit", "runtime-limit", "missing", "mixed"])
+def test_deployment_pool_reader_checks_real_compiled_parent(fault: str | None) -> None:
+    from pathlib import Path
+    from unittest.mock import Mock
+    from xml.etree import ElementTree as ET
+
+    import httpx
+    from pydantic import SecretStr
+
+    from tests.backend.model_platform.test_apim_onboarding import (
+        onboarding_configuration,
+        onboarding_plan,
+    )
+    from turnstile_core.domain.gateway_targets import CapabilitySupport
+    from turnstile_core.integrations.apim_control_plane_contract import PolicyCompilationError
+    from turnstile_core.integrations.apim_onboarding_policy import render_onboarding_fixed_program
+    from turnstile_core.integrations.apim_policy_components import parse_policy, serialize_policy
+    from turnstile_core.integrations.apim_storage_routes import (
+        READ_FIXED_CONTENT,
+        FixedProgramVerifier,
+        deployment_pool_reader_supported,
+    )
+
+    plan = onboarding_plan(service_tier="Developer")
+    source = Path(__file__).resolve().parents[3] / "infra/policies/foundry-finops-policy.xml"
+    program = render_onboarding_fixed_program(
+        plan.request, onboarding_configuration(), source.read_text(),
+        self_hosted_gateway=CapabilitySupport.SUPPORTED,
+    )
+    assert all(parse_policy(policy).find(".//set-variable[@name='routeContent']") is None
+               for _, policy in program.operation_policies)
+    root = parse_policy(program.parent_policy)
+    reader = root.find(".//set-variable[@name='routeContent']")
+    assert reader is not None
+    if fault == "header-limit":
+        reader.set("value", READ_FIXED_CONTENT.replace("headers.Count > 90", "headers.Count > 60"))
+    elif fault == "runtime-limit":
+        reader.set("value", READ_FIXED_CONTENT.replace(
+            '|| poolMember["backend_id"]?.Type',
+            '|| !runtimeIds.Add((string)poolMember["runtime_id"])'
+            '\n || poolMember["backend_id"]?.Type',
+        ))
+    elif fault == "missing":
+        parent = next(node for node in root.iter() if reader in list(node))
+        parent.remove(reader)
+    elif fault == "mixed":
+        inbound = root.find("inbound")
+        assert inbound is not None
+        ET.SubElement(inbound, "set-variable", {
+            "name": "routeContent",
+            "value": READ_FIXED_CONTENT.replace("headers.Count > 90", "headers.Count > 60"),
+        })
+    assert deployment_pool_reader_supported(serialize_policy(root)) is (fault is None)
+    if fault is None:
+        installed = program.installation("b" * 64, "https://managed.example.test/api")
+        policies = dict(program.operation_policies)
+        management = Mock()
+        management.current_revision.return_value = installed.program.api_revision
+        management.revision_api_policy.return_value = program.parent_policy
+        management.route_program_operations.return_value = {
+            name: (*contract, policies[name])
+            for name, contract in installed.operation_contracts.items()
+        }
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            assert request.method == "HEAD"
+            values = {
+                "abi": "2", "nonce": request.headers["x-turnstile-route-probe"],
+                "target": installed.program.scope.target_id, "api": installed.program.scope.api_id,
+                "revision": installed.program.api_revision,
+                "gateway": installed.program.scope.gateway_id,
+                "instance": installed.program.instance_id,
+                "program": installed.program.program_sha256,
+                "trust": installed.program.trust_binding_sha256,
+            }
+            return httpx.Response(204, headers={
+                "x-turnstile-route-" + name: value for name, value in values.items()
+            })
+
+        with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+            verifier = FixedProgramVerifier(
+                installed, management, SecretStr("unit-only-key"), client, clock=lambda: 1000,
+            )
+            with pytest.raises(PolicyCompilationError, match="API parent policy"):
+                verifier.require_deployment_pool_reader()
+            verifier.verify()
+            verifier.require_deployment_pool_reader()
+            management.revision_api_policy.return_value = "<policies/>"
+            with pytest.raises(PolicyCompilationError, match="parent changed"):
+                verifier.verify()
+            with pytest.raises(PolicyCompilationError, match="API parent policy"):
+                verifier.require_deployment_pool_reader()
+
+
+def test_native_pool_reader_preserves_deployment_identity_and_header_bound() -> None:
+    from turnstile_core.integrations.apim_storage_routes import READ_FIXED_CONTENT
+
+    assert "runtimeIds.Add" not in READ_FIXED_CONTENT
+    assert "var runtimeIds =" not in READ_FIXED_CONTENT
+    assert '!backendIds.Add((string)poolMember["backend_id"])' in READ_FIXED_CONTENT
+    assert 'Guid.TryParseExact((string)poolMember["runtime_id"], "D", out runtimeId)' in (
+        READ_FIXED_CONTENT
+    )
+    assert "headers.Count > 90" in READ_FIXED_CONTENT
+    assert "headers.Count > 60" not in READ_FIXED_CONTENT
 
 
 @pytest.mark.parametrize("fault", [None, "intent", "binding", "not-empty", "base"])

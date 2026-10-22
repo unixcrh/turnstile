@@ -192,6 +192,9 @@ class ApimPolicyCompiler:
                         member_url,
                         member_upstream,
                         pool_runtime_name=member.runtime_name,
+                        pool_deployment=(member.upstream_model_id
+                                         if member.upstream_model_id != binding.model.upstream_model_id
+                                         else None),
                     )
                     member_auth_headers = self._pool_member_auth_headers(
                         binding,
@@ -431,8 +434,11 @@ class ApimPolicyCompiler:
         upstream: Any,
         *,
         pool_runtime_name: str | None = None,
+        pool_deployment: str | None = None,
     ) -> tuple[str, tuple[tuple[str, str], ...]]:
         if self._usage_observer_url is None:
+            if pool_deployment is not None:
+                raise PolicyCompilationError("Deployment-specific pools require the Observer")
             return source_backend_url, ()
         headers = [
             ("x-adapter-key", f"{{{{{self._usage_observer_key_named_value}}}}}"),
@@ -441,6 +447,8 @@ class ApimPolicyCompiler:
         if pool_runtime_name is not None:
             headers.append(("x-hive-runtime", pool_runtime_name))
             headers.append(("x-turnstile-pool-runtime", pool_runtime_name))
+        if pool_deployment is not None:
+            headers.append(("x-turnstile-pool-deployment", pool_deployment))
         return (
             self._usage_observer_url + upstream.path.rstrip("/"),
             tuple(headers),
@@ -458,7 +466,10 @@ class ApimPolicyCompiler:
         if pool is None or not pool.session_affinity:
             return self._pool_member_backend_id(publication, binding, member, upstream)
         backend_url, backend_headers = self._observer_backend(
-            source_url, upstream, pool_runtime_name=member.runtime_name
+            source_url, upstream, pool_runtime_name=member.runtime_name,
+            pool_deployment=(member.upstream_model_id
+                             if member.upstream_model_id != binding.model.upstream_model_id
+                             else None),
         )
         identity = {
             "gateway": str(publication.gateway_profile_id),
@@ -480,6 +491,11 @@ class ApimPolicyCompiler:
         upstream: Any | None = None,
     ) -> str:
         parsed = upstream or urlsplit(str(member.backend_url).rstrip("/"))
+        deployment_identity = (
+            ("deployment:" + member.upstream_model_id,)
+            if member.upstream_model_id is not None
+            and member.upstream_model_id != binding.model.upstream_model_id else ()
+        )
         member_digest = hashlib.sha256(
             "\n".join(
                 (
@@ -491,6 +507,7 @@ class ApimPolicyCompiler:
                     member.auth_strategy.value,
                     member.named_value_name or "",
                     "pool-runtime-attribution-v2",
+                    *deployment_identity,
                 )
             ).encode("utf-8")
         ).hexdigest()[:10]
@@ -1807,6 +1824,7 @@ class ApimPolicyCompiler:
             "x-hive-model",
             "x-hive-runtime",
             "x-turnstile-pool-member",
+            "x-turnstile-pool-deployment",
         )
         codex_header_names = (
             "originator",

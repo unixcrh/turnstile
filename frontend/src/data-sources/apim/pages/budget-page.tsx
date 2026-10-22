@@ -703,8 +703,12 @@ function BulkPeopleEditor({
   const [threshold, setThreshold] = useState(
     String(singlePerson?.warning_threshold_percent ?? 80),
   )
+  const availableModelIds = useMemo(
+    () => new Set(models.map((model) => model.id)),
+    [models],
+  )
   const [modelIds, setModelIds] = useState<Set<string>>(
-    new Set(singlePerson?.allowed_model_ids ?? []),
+    () => new Set((singlePerson?.allowed_model_ids ?? []).filter((id) => availableModelIds.has(id))),
   )
   const [formError, setFormError] = useState<string | null>(null)
   const submit = (event: React.FormEvent<HTMLFormElement>) => {
@@ -736,7 +740,7 @@ function BulkPeopleEditor({
       token_limit: updateBudget && mode === "fixed" && !usdMode ? parsedLimit : undefined,
       usd_limit: updateBudget && mode === "fixed" && usdMode ? usdLimit : undefined,
       warning_threshold_percent: parsedThreshold,
-      model_ids: updateModels ? [...modelIds] : undefined,
+      model_ids: updateModels ? [...modelIds].filter((id) => availableModelIds.has(id)) : undefined,
     })
   }
   const projected = updateBudget && mode === "fixed" && Number(tokenLimit) > 0

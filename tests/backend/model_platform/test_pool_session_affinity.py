@@ -36,6 +36,157 @@ from turnstile_core.integrations.apim_publisher_client import AzureApimPublisher
 from turnstile_core.persistence.in_memory import InMemoryRepository
 
 
+@pytest.mark.parametrize(
+    "difference", [None, "modelName", "modelVersion", "modelPublisher", "missing"],
+)
+def test_foundry_pool_equivalence_uses_catalog_model_identity(difference: str | None) -> None:
+    from turnstile_core.integrations.gateway_connection_probe import (
+        foundry_deployment_metadata,
+        foundry_model_identity,
+    )
+
+    primary = {"name": "deployment-a", "modelName": "gpt-5.6",
+               "modelVersion": "2026-10-01", "modelPublisher": "OpenAI"}
+    secondary = {**primary, "name": "deployment-b"}
+    if difference == "missing":
+        secondary.pop("modelVersion")
+    elif difference is not None:
+        secondary[difference] = "another-model-identity"
+    requests: list[httpx.Request] = []
+
+    def metadata(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.method == "GET"
+        assert request.url.path == "/api/projects/main/deployments"
+        assert request.url.params["api-version"] == "v1"
+        return httpx.Response(200, json={"value": [primary, secondary]})
+
+    project = "https://pool-project.services.ai.azure.com/api/projects/main"
+    with httpx.Client(transport=httpx.MockTransport(metadata)) as client:
+        first = foundry_deployment_metadata(client, project, project, "deployment-a", lambda: {})
+        second = foundry_deployment_metadata(client, project, project, "deployment-b", lambda: {})
+    assert len(requests) == 2
+    if difference == "missing":
+        with pytest.raises(PolicyCompilationError, match="model identity is unavailable"):
+            foundry_model_identity(second)
+    elif difference is None:
+        assert foundry_model_identity(first) == foundry_model_identity(second)
+    else:
+        assert foundry_model_identity(first) != foundry_model_identity(second)
+
+
+@pytest.mark.parametrize("fault", [None, "old-version", "wrong-model", "redirect", "bad-json"])
+def test_deployment_pool_requires_a_working_observer_rewriter(fault: str | None) -> None:
+    from turnstile_core.integrations.gateway_connection_probe import verify_pool_deployment_observer
+
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.url.path == "/_turnstile/pool-deployment-probe"
+        assert request.headers["x-turnstile-upstream-host"] == "127.0.0.1:1"
+        assert request.headers["x-turnstile-pool-deployment"] == "turnstile-deployment-probe"
+        assert json.loads(request.content) == {"model": "turnstile-original-probe"}
+        if fault == "bad-json":
+            return httpx.Response(200, content=b"invalid")
+        return httpx.Response(
+            302 if fault == "redirect" else 200,
+            headers={} if fault == "old-version" else {
+                "x-turnstile-pool-deployment-version": "1",
+            },
+            json={"model": "wrong" if fault == "wrong-model" else "turnstile-deployment-probe"},
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        if fault:
+            with pytest.raises(PolicyCompilationError, match="rewrite upgrade"):
+                verify_pool_deployment_observer(client, "https://observer.example.com", "unit-key")
+        else:
+            verify_pool_deployment_observer(client, "https://observer.example.com", "unit-key")
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize("mismatch", [False, True])
+def test_new_pool_members_are_rechecked_even_when_deployment_names_match(
+    mismatch: bool, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from turnstile_core.domain.runtime_models import BrandKey
+    from turnstile_core.services.storage_route_publisher import FixedRoutePublisherFactory
+
+    publication = _pooled_publication()
+    binding = publication.desired_spec.bindings[0]
+    pool = binding.backend_pool
+    assert pool is not None
+    members = [member.model_copy(update={
+        "model_id": UUID(int=index + 900),
+        "upstream_model_id": binding.model.upstream_model_id,
+    }) for index, member in enumerate(pool.members)]
+    updated = binding.model_copy(update={"provider_brand_key": BrandKey.MICROSOFT_FOUNDRY,
+                                        "runtime_config": {
+        **binding.runtime_config,
+        "apim_backend_pool": pool.model_copy(update={"members": members}).model_dump(mode="json"),
+    }})
+    publication = publication.model_copy(update={"desired_spec":
+        publication.desired_spec.model_copy(update={"bindings": [updated]}),
+    })
+    factory = FixedRoutePublisherFactory(
+        InMemoryRepository(), {}, active_fence=lambda _gateway: {},
+        availability_projector=lambda _model: None,
+    )
+    checked = []
+
+    def metadata(*args: Any, binding: Any) -> dict[str, str]:
+        checked.append(binding.runtime_id)
+        return {"modelPublisher": "OpenAI", "modelName": "gpt-5.6",
+                "modelVersion": "other-version" if mismatch and len(checked) == 2 else "v1"}
+
+    monkeypatch.setattr(factory, "_validate_deployment", metadata)
+    if mismatch:
+        with pytest.raises(PolicyCompilationError, match="same model and version"):
+            factory._validate_pool_deployments(publication, None, None, None)
+    else:
+        factory._validate_pool_deployments(publication, None, None, None)
+    assert checked == [member.runtime_id for member in members]
+
+
+@pytest.mark.parametrize("add_member", [False, True])
+def test_legacy_foundry_pool_members_keep_their_own_project(add_member: bool) -> None:
+    from turnstile_core.domain.runtime_models import BrandKey
+    from turnstile_core.services.route_publication import pool_member_bindings
+
+    binding = _pooled_publication().desired_spec.bindings[0]
+    pool = binding.backend_pool
+    assert pool is not None
+    primary_project = "https://primary.services.ai.azure.com/api/projects/main"
+    secondary_project = "https://secondary.services.ai.azure.com/api/projects/backup"
+    members = [member.model_copy(update={"backend_url": HttpUrl(project)})
+               for member, project in zip(
+                   pool.members, (primary_project, secondary_project), strict=True,
+               )]
+    if add_member:
+        members.append(members[0].model_copy(update={
+            "model_id": UUID(int=903), "upstream_model_id": "another-deployment",
+            "project_endpoint": HttpUrl(primary_project),
+        }))
+    raw_pool = pool.model_copy(update={"members": members}).model_dump(mode="json")
+    pooled = binding.model_copy(update={
+        "provider_brand_key": BrandKey.MICROSOFT_FOUNDRY,
+        "backend_url": HttpUrl(primary_project),
+        "runtime_config": {
+            **binding.runtime_config, "project_endpoint": primary_project,
+            "apim_backend_pool": raw_pool,
+        },
+    })
+
+    expanded = pool_member_bindings(pooled)
+
+    assert [source.runtime_config["project_endpoint"] for source in expanded] == [
+        primary_project, secondary_project,
+    ] + ([primary_project] if add_member else [])
+    assert "project_endpoint" not in raw_pool["members"][1]
+    assert pooled.runtime_config["apim_backend_pool"] == raw_pool
+
+
 def _pooled_publication(affinity: bool = False) -> GatewayPublication:
     publication = GatewayControlPlaneService(InMemoryRepository()).publish(
         bedrock_publication("affinity-model"), "owner@example.com"

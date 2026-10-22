@@ -356,8 +356,18 @@ class InMemoryBudgetRepositoryMixin(InMemoryBudgetEvidenceRepositoryMixin):
     def list_user_model_policies(
         self, user_ids: Sequence[str]
     ) -> list[dict[str, Any]]:
+        enabled_model_ids = {
+            model["id"] for model in self.models if model.get("enabled", True)
+        }
         return [
-            self.user_model_policies[user_id]
+            {
+                **self.user_model_policies[user_id],
+                "model_ids": [
+                    model_id
+                    for model_id in self.user_model_policies[user_id]["model_ids"]
+                    if model_id in enabled_model_ids
+                ],
+            }
             for user_id in user_ids
             if user_id in self.user_model_policies
         ]

@@ -49,16 +49,32 @@ def _managed_program_publication(
         if result is None:
             return None
         if config.get("fixed_route_program_upgrade_history"):
-            from ..domain.storage_routes import FixedProgramInstallation, canonical_document
+            from ..domain.storage_routes import (
+                FixedProgramInstallation,
+                FixedProgramUpgrade,
+                canonical_document,
+            )
 
             original = FixedProgramInstallation.model_validate_json(canonical_document(
                 result["resource_manifest"]["fixed_route_program"],
             ))
-            installed = _registered_program_installation(str(result["id"]), original, {
-                "fixed_route_program_upgrade_history": config[
-                    "fixed_route_program_upgrade_history"
-                ],
-            })
+            current_upgrade = (
+                FixedProgramUpgrade.model_validate_json(
+                    canonical_document(config["fixed_route_program_upgrade"]),
+                )
+                if config.get("fixed_route_program_upgrade") is not None else None
+            )
+            if current_upgrade is not None and (
+                current_upgrade.previous_publication_id != str(result["id"])
+                and current_upgrade.installation == original
+            ):
+                installed = _registered_program_installation(str(result["id"]), original, config)
+            else:
+                installed = _registered_program_installation(str(result["id"]), original, {
+                    "fixed_route_program_upgrade_history": config[
+                        "fixed_route_program_upgrade_history"
+                    ],
+                })
             result["resource_manifest"] = {
                 **result["resource_manifest"],
                 "fixed_route_program": installed.model_dump(mode="json"),
@@ -120,9 +136,31 @@ def _registered_program_installation(
     records = list(config.get("fixed_route_program_upgrade_history", []))
     if config.get("fixed_route_program_upgrade") is not None:
         records.append(config["fixed_route_program_upgrade"])
-    approved_programs = [installation.program.program_sha256]
-    for record in records:
-        upgrade = FixedProgramUpgrade.model_validate_json(canonical_document(record))
+    upgrades = [
+        FixedProgramUpgrade.model_validate_json(canonical_document(record))
+        for record in records
+    ]
+    absorbed = -1
+    for index, upgrade in enumerate(upgrades):
+        if (
+            upgrade.previous_publication_id != publication_id
+            and upgrade.installation == installation
+        ):
+            absorbed = index
+    if absorbed >= 0:
+        for index in range(1, absorbed + 1):
+            upgrades[index].require_previous(
+                upgrades[index].previous_publication_id, upgrades[index - 1].installation,
+            )
+        approved_programs = [
+            *([installation.legacy_program_sha256] if installation.legacy_program_sha256 else []),
+            *installation.predecessor_program_sha256,
+            installation.program.program_sha256,
+        ]
+        upgrades = upgrades[absorbed + 1:]
+    else:
+        approved_programs = [installation.program.program_sha256]
+    for upgrade in upgrades:
         upgrade.require_previous(publication_id, installation)
         predecessors = upgrade.installation.predecessor_program_sha256
         if predecessors and predecessors != tuple(
@@ -272,6 +310,55 @@ def _model_addition_credential_retry(
         "attempt_count": publication["attempt_count"], "manifest_sha256": document_digest(manifest),
         "previous_error_code": publication["error_code"],
         "previous_error_sha256": document_digest({"message": message})}
+
+
+def _route_reconcile_credential_read_denied(publication: Mapping[str, Any]) -> bool:
+    if (publication.get("publication_kind") != "route_reconcile"
+            or publication.get("error_code") != "PolicyCompilationError"):
+        return False
+    message = publication.get("error_message") or ""
+    if not message.startswith("APIM management failed: "):
+        return False
+    try:
+        diagnostic = json.loads(message.removeprefix("APIM management failed: "))
+    except (ValueError, TypeError):
+        return False
+    return (isinstance(diagnostic, dict)
+        and diagnostic.get("code") == "AuthorizationFailed"
+        and diagnostic.get("method") == "POST" and diagnostic.get("status") == 403
+        and re.fullmatch(r"/namedValues/[A-Za-z0-9._-]{1,256}/listValue",
+                         str(diagnostic.get("path", ""))) is not None)
+
+
+def _route_reconcile_preparation_failed(publication: Mapping[str, Any]) -> bool:
+    if publication.get("publication_kind") != "route_reconcile":
+        return False
+    keys = set(publication.get("resource_manifest") or {})
+    message = publication.get("error_message") or ""
+    return (
+        publication.get("error_code") == "ValueError"
+        and message == "An existing model is missing its approved budget contract"
+        and keys == {
+            "route_credentials", "route_preparation", "route_dependencies",
+            "route_last_progress_attempt",
+        }
+    ) or (
+        publication.get("error_code") == "ValidationError"
+        and message.startswith("1 validation error for RoutePublicationTask")
+        and "Value error, ROUTE_PUBLICATION_TASK_INVALID [type=value_error," in message
+        and keys == {"route_credentials", "route_dependencies", "route_last_progress_attempt"}
+    ) or (
+        publication.get("error_code") == "ValueError"
+        and message == "MODEL_PROGRAM_UPGRADE_BINDING_CHANGED"
+        and not keys
+    ) or (
+        publication.get("error_code") == "PolicyCompilationError"
+        and message == "Route credential version is unavailable"
+        and keys == {
+            "route_credentials", "route_dependencies", "route_configuration",
+            "route_last_progress_attempt",
+        }
+    )
 
 
 def _program_migration_manifest(
@@ -788,6 +875,13 @@ def model_router_v3_view(router: Mapping[str, Any]) -> dict[str, Any]:
     return row
 
 
+ROUTER_ATTEMPT_PRICE_FIELDS = (
+    "input_price_per_million",
+    "cached_price_per_million",
+    "cache_write_price_per_million",
+    "output_price_per_million",
+)
+
 ROUTER_ATTEMPT_USAGE_FIELDS = (
     "input_tokens",
     "cached_tokens",
@@ -795,6 +889,7 @@ ROUTER_ATTEMPT_USAGE_FIELDS = (
     "output_tokens",
     "total_tokens",
     "estimated_cost",
+    *ROUTER_ATTEMPT_PRICE_FIELDS,
 )
 
 
@@ -804,8 +899,23 @@ def enrich_router_attempts(
 ) -> list[dict[str, Any]]:
     enriched = [dict(item) for item in attempts]
     for index, attempt in enumerate(enriched):
-        if attempt.get("attempt_role") is None:
+        if attempt.get("sequence") is None:
+            attempt["sequence"] = int(attempt.get("attempt_number") or (index + 1))
+        if attempt.get("attempt_role") in {None, "candidate_invocation"}:
             attempt["attempt_role"] = "candidate"
+        if attempt.get("outcome") == "skipped":
+            attempt["outcome"] = "cost_limit_exceeded"
+        if attempt.get("decision_basis") == "policy_filtered":
+            attempt["decision_basis"] = "cost_limit_exceeded"
+        probs = attempt.get("decision_probabilities")
+        if isinstance(probs, list):
+            attempt["decision_probabilities"] = {
+                str(p["model_id"]): float(p["probability"])
+                for p in probs
+                if isinstance(p, Mapping)
+                and p.get("model_id") is not None
+                and p.get("probability") is not None
+            }
         if attempt.get("strategy_type") is None:
             attempt["strategy_type"] = "priority"
         if attempt.get("priority") is None and attempt["attempt_role"] == "candidate":
@@ -827,9 +937,48 @@ def enrich_router_attempts(
         usage = usage_by_request.get(str(attempt.get("request_id") or ""))
         if usage is None:
             continue
+        has_price_keys = (
+            "input_price_per_million" in usage and "output_price_per_million" in usage
+        )
+        if (
+            has_price_keys
+            and usage.get("input_price_per_million") is None
+            and usage.get("output_price_per_million") is None
+            and (usage.get("estimated_cost") or 0) == 0
+            and (attempt.get("estimated_cost") or 0) == 0
+            and all((attempt.get(f) or 0) == 0 for f in ROUTER_ATTEMPT_PRICE_FIELDS)
+        ):
+            for price_field in ROUTER_ATTEMPT_PRICE_FIELDS:
+                if price_field in attempt:
+                    attempt[price_field] = None
+        has_context_tier = usage.get("price_context_tier") is not None
         for field in ROUTER_ATTEMPT_USAGE_FIELDS:
-            if attempt.get(field) is None:
-                attempt[field] = usage[field]
+            usage_val = usage.get(field)
+            if usage_val is None:
+                continue
+            current_val = attempt.get(field)
+            if (
+                current_val is None
+                or (current_val == 0 and usage_val > 0)
+                or (field in ROUTER_ATTEMPT_PRICE_FIELDS and has_context_tier)
+            ):
+                attempt[field] = (
+                    float(usage_val)
+                    if field.endswith("_price_per_million") or field == "estimated_cost"
+                    else usage_val
+                )
+        if (
+            attempt.get("price_context_tier") is None
+            and usage.get("price_context_tier") is not None
+        ):
+            attempt["price_context_tier"] = str(usage["price_context_tier"])
+        if (
+            attempt.get("price_context_snapshot") is None
+            and usage.get("price_context_snapshot") is not None
+        ):
+            attempt["price_context_snapshot"] = deepcopy(
+                usage["price_context_snapshot"]
+            )
     return enriched
 
 

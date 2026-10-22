@@ -230,11 +230,15 @@ def test_route_backend_creation_unknown_is_recoveronly_and_keeps_exact_tls_contr
             client.verify_route_connection(connection)
 
 
-def test_route_pool_preparation_caps_four_creates_and_resumes_from_exact_readback() -> None:
+@pytest.mark.parametrize("maximum_pool", [False, True])
+def test_route_pool_preparation_caps_four_creates_and_resumes_from_exact_readback(
+    maximum_pool: bool,
+) -> None:
     settings = publisher_settings().model_copy(update={"apim_gateway_profile_id": APIM_ID})
     scope = RouteScope(target_id=str(APIM_ID), api_id=settings.apim_api_id, gateway_id="managed")
     rows: dict[str, dict[str, Any]] = {}
     writes: list[str] = []
+    reads: list[str] = []
     intents: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -243,6 +247,7 @@ def test_route_pool_preparation_caps_four_creates_and_resumes_from_exact_readbac
             writes.append(request.url.path)
             rows[request.url.path] = json.loads(request.content)["properties"]
             return httpx.Response(201, json={"properties": rows[request.url.path]})
+        reads.append(request.url.path)
         return httpx.Response(200, json={"properties": rows[request.url.path]}) \
             if request.url.path in rows else httpx.Response(404)
 
@@ -251,8 +256,9 @@ def test_route_pool_preparation_caps_four_creates_and_resumes_from_exact_readbac
         tokens.token.return_value = "unit-only-token"
         client = AzureApimPublisherClient(settings, token_provider=tokens, client=transport)
         backends = tuple(BackendResource(
-            f"unit-member-{index}", "unit", "https://unit.example.test", (), None,
-        ) for index in range(5))
+            f"unit-member-{index}", "unit", "https://unit.example.test",
+            (("api-key", "{{unit-key-" + str(index) + "}}"),) if maximum_pool else (), None,
+        ) for index in range(30 if maximum_pool else 5))
         pool = RouteBackendPool(members=tuple(RoutePoolMember(
             runtime_id=str(UUID(int=index + 1)), backend_id=backend.id,
             dependency_sha256=document_digest(client.route_backend_properties(backend)),
@@ -261,7 +267,13 @@ def test_route_pool_preparation_caps_four_creates_and_resumes_from_exact_readbac
             max_attempts_per_request=2, retry_interval_seconds=1, first_fast_retry=True,
             circuit_breaker=GatewayRateLimitCircuitBreaker(failure_count=1, interval_seconds=60,
                 trip_duration_seconds=60, accept_retry_after=True),
-        ))
+        ), credential_versions={
+            "unit-key-" + str(index): "https://unitvault.vault.azure.net/secrets/key/"
+            + format(index + 1, "032x") for index in range(30 if maximum_pool else 0)
+        }, header_values={
+            "unit-data-" + str(index): "deployment-" + str(index)
+            for index in range(90 if maximum_pool else 0)
+        })
         native_pool = BackendPoolResource(id="unit-pool", title="unit", url="", members=tuple(
             BackendPoolMemberResource(member.backend_id, member.priority, member.weight)
             for member in pool.members
@@ -271,14 +283,28 @@ def test_route_pool_preparation_caps_four_creates_and_resumes_from_exact_readbac
             origin="https://unit.example.test", path="/chat/completions", pool=pool,
             credential=RouteCredential(mode="none"),
             dependency_sha256=document_digest(client.route_backend_properties(native_pool)))
-        with pytest.raises(RuntimeError, match="slice completed"):
-            client.prepare_route_pool(connection, backends, lambda intent: intents.append(intent))
-        assert len(writes) == 4
+        resource_count = (
+            1 + len(pool.members) + len(pool.credential_versions) + len(pool.header_values)
+        )
+        while len(writes) < resource_count:
+            expected = min(len(writes) + 4, resource_count)
+            if expected < resource_count:
+                with pytest.raises(RuntimeError, match="slice completed"):
+                    client.prepare_route_pool(connection, backends, intents.append)
+            else:
+                client.prepare_route_pool(connection, backends, intents.append)
+            assert len(writes) == expected
         client.prepare_route_pool(connection, backends, lambda intent: intents.append(intent))
-        assert len(writes) == 6
-        client.prepare_route_pool(connection, backends, lambda intent: intents.append(intent))
-        assert len(writes) == 6
+        assert len(writes) == resource_count
+        reads.clear()
         assert client.verify_route_pool(connection) == connection.dependency_sha256
+        assert len(reads) == resource_count
+        assert set(reads) == set(rows)
+        if maximum_pool:
+            assert resource_count == 151
+            assert client.verify_route_pool_slice(connection, 0, maximum=151) == 151
+            with pytest.raises(ValueError, match="cursor is invalid"):
+                client.verify_route_pool_slice(connection, 0, maximum=152)
 
 
 @pytest.mark.parametrize("payload", [
@@ -289,6 +315,81 @@ def test_route_pool_preparation_caps_four_creates_and_resumes_from_exact_readbac
 def test_permission_inventory_rejects_incomplete_evidence(payload: object) -> None:
     with pytest.raises(ValueError):
         missing_management_actions(payload, PUBLICATION_REQUIRED_ACTIONS)
+
+
+@pytest.mark.parametrize("granted", [False, True])
+def test_observer_permission_preflight_is_named_value_scoped(granted: bool) -> None:
+    action = "Microsoft.ApiManagement/service/namedValues/listValue/action"
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        assert request.method == "GET"
+        assert request.url.path.endswith(
+            "/namedValues/unit-observer-key/providers/Microsoft.Authorization/permissions"
+        )
+        return httpx.Response(200, json={"value": [{"actions": [action] if granted else []}]})
+
+    client = AzureApimPublisherClient(
+        publisher_settings(), cast(Any, StubTokenProvider()),
+        httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    if granted:
+        client.verify_observer_permissions("unit-observer-key")
+    else:
+        with pytest.raises(PublisherPermissionError) as failed:
+            client.verify_observer_permissions("unit-observer-key")
+        assert failed.value.missing_actions == (action,)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("materialized", [False, True])
+def test_pool_catalog_key_auth_never_reads_business_named_values(materialized: bool) -> None:
+    from cryptography.fernet import Fernet
+
+    from tests.backend.model_platform.control_plane_support import (
+        external_tenant_foundry_publication,
+    )
+
+    repository = InMemoryRepository()
+    publication = GatewayControlPlaneService(repository).publish(
+        external_tenant_foundry_publication(repository), "unit-owner",
+    )
+    binding = publication.desired_spec.bindings[-1]
+    secret_id = "https://unit-vault.vault.azure.net/secrets/unit-key/" + "a" * 32
+    if materialized:
+        binding = binding.model_copy(update={"key_vault_secret_id": secret_id})
+    settings = publisher_settings().model_copy(update={
+        "credential_encryption_key": SecretStr(Fernet.generate_key().decode()),
+    })
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.method == "GET"
+        assert "/namedValues/" not in request.url.path
+        if request.url.host == "unit-vault.vault.azure.net":
+            assert request.url.path == "/secrets/unit-key/" + "a" * 32
+            return httpx.Response(200, json={
+                "id": secret_id, "value": "unit-only-key", "attributes": {"enabled": True},
+            })
+        assert request.url.path == "/api/projects/unit-foundry-project/deployments"
+        assert request.headers["api-key"] == "unit-only-key"
+        return httpx.Response(200, json={"value": [{"name": binding.model.upstream_model_id}]})
+
+    token = Mock()
+    token.token.return_value = "unit-token"
+    client = AzureApimPublisherClient(
+        settings, token, httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    if materialized:
+        assert binding.model.upstream_model_id in client.pool_deployment_catalog(binding)
+        token.token.assert_called_once_with("https://vault.azure.net")
+        assert len(requests) == 2
+    else:
+        with pytest.raises(ValueError, match="credential is unavailable"):
+            client.pool_deployment_catalog(binding)
+        assert not requests
 
 
 def test_publication_permission_preflight_uses_current_source_and_readonly_recovery() -> None:
@@ -1121,7 +1222,7 @@ def test_foundry_candidate_probes_chat_and_responses_before_promotion() -> None:
     ]
     publication = GatewayControlPlaneService(
         repository,
-        apim_principal_id="39deeba0-9799-4806-96c4-2f65eb0f22d1",
+        apim_principal_id="00000000-0000-0000-0000-000000000705",
     ).publish(foundry_publication("gpt-5.6-luna"), "owner@example.com")
     alias = publication.desired_spec.bindings[-1].model.model_key
     requests: list[httpx.Request] = []

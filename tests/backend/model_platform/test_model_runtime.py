@@ -1740,13 +1740,13 @@ def test_managed_foundry_runtime_defaults_to_provider_temperature() -> None:
             "api_format": "openai_chat",
             "control_plane_managed": True,
         },
-        "model_key": "gpt-5.6-sol-foundry-bd33e608",
-        "runtime_name": "Microsoft Foundry admin-8382 via APIM",
+        "model_key": "unit-foundry-model",
+        "runtime_name": "Microsoft Foundry unit-foundry-project via APIM",
         "gateway_base_url": "https://gateway.test",
         "gateway_auth_type": "none",
         "gateway_config": {},
     }
-    invocation = request(model="gpt-5.6-sol-foundry-bd33e608").model_copy(
+    invocation = request(model="unit-foundry-model").model_copy(
         update={"temperature": 0}
     )
 

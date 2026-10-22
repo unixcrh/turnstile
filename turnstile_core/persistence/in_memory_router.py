@@ -253,12 +253,28 @@ class InMemoryRouterRepositoryMixin:
         return True
 
     def list_assigned_model_routers(self, user_id: str) -> list[dict[str, Any]]:
-        assigned = self.user_model_router_access.get(user_id, set())
+        folded_user = user_id.strip().casefold()
+        assigned: set[UUID] = set()
+        for uid, rids in self.user_model_router_access.items():
+            if uid.strip().casefold() == folded_user:
+                assigned.update(rids)
         return [
             published_model_router_view(row)
             for row in sorted(self.model_routers, key=lambda item: str(item["name"]))
-            if row["id"] in assigned
+            if (
+                row["id"] in assigned
+                or str(row.get("created_by") or "").strip().casefold() == folded_user
+            )
             and row["status"] == "published"
+            and row["deleted_at"] is None
+            and row["published_config"] is not None
+        ]
+
+    def list_published_model_routers(self) -> list[dict[str, Any]]:
+        return [
+            published_model_router_view(row)
+            for row in sorted(self.model_routers, key=lambda item: str(item["name"]))
+            if row["status"] == "published"
             and row["deleted_at"] is None
             and row["published_config"] is not None
         ]
@@ -266,8 +282,33 @@ class InMemoryRouterRepositoryMixin:
     def get_callable_model_router(
         self, router_id: UUID, user_id: str
     ) -> dict[str, Any] | None:
-        if router_id not in self.user_model_router_access.get(user_id, set()):
+        folded_user = user_id.strip().casefold()
+        assigned: set[UUID] = set()
+        for uid, rids in self.user_model_router_access.items():
+            if uid.strip().casefold() == folded_user:
+                assigned.update(rids)
+        row = next(
+            (
+                item
+                for item in self.model_routers
+                if item["id"] == router_id
+                and (
+                    router_id in assigned
+                    or str(item.get("created_by") or "").strip().casefold() == folded_user
+                )
+                and item["status"] == "published"
+                and item["deleted_at"] is None
+                and item["published_config"] is not None
+            ),
+            None,
+        )
+        if row is None:
             return None
+        return published_model_router_view(row)
+
+    def get_published_model_router(
+        self, router_id: UUID
+    ) -> dict[str, Any] | None:
         row = next(
             (
                 item
@@ -567,6 +608,33 @@ class InMemoryRouterRepositoryMixin:
             )
         return True
 
+    def set_model_router_assignments_bulk(
+        self,
+        router_id: UUID,
+        assignments: Mapping[str, bool],
+        changed_by: str,
+    ) -> list[str] | None:
+        router = next(
+            (
+                item
+                for item in self.model_routers
+                if item["id"] == router_id
+                and item["status"] == "published"
+                and item["deleted_at"] is None
+                and item["published_config"] is not None
+            ),
+            None,
+        )
+        if router is None:
+            return None
+        changed_users: list[str] = []
+        for user_id, assigned in assignments.items():
+            was_assigned = router_id in self.user_model_router_access.get(user_id, set())
+            self.set_model_router_assignment(router_id, user_id, assigned, changed_by)
+            if was_assigned != assigned:
+                changed_users.append(user_id)
+        return changed_users
+
     def list_model_router_assignees(self, router_id: UUID) -> list[str]:
         return sorted(
             user_id
@@ -574,17 +642,71 @@ class InMemoryRouterRepositoryMixin:
             if router_id in router_ids
         )
 
+    def list_model_router_policy_users(
+        self, user_ids: Sequence[str] | None = None
+    ) -> list[str]:
+        wanted = None if user_ids is None else set(user_ids)
+        users = set(self.user_model_router_policies.keys()) | {
+            user_id
+            for user_id, router_ids in self.user_model_router_access.items()
+            if router_ids
+        }
+        if wanted is not None:
+            users &= wanted
+        return sorted(users)
+
     def get_model_router_run_binding(
         self,
         router_id: UUID,
         router_version: int,
         user_id: str,
         run_id: str,
+        *,
+        ttl_seconds: int = 1800,
     ) -> UUID | None:
-        row = self.model_router_run_bindings.get(
+        now = datetime.now(UTC)
+        exact = self.model_router_run_bindings.get(
             (router_id, router_version, user_id, run_id)
         )
-        return UUID(str(row["selected_model_id"])) if row is not None else None
+        if exact is not None and (now - exact["updated_at"]).total_seconds() <= ttl_seconds:
+            return UUID(str(exact["selected_model_id"]))
+        candidates = [
+            row
+            for (r_id, _ver, u_id, r_run), row in self.model_router_run_bindings.items()
+            if r_id == router_id
+            and u_id == user_id
+            and r_run == run_id
+            and (now - row["updated_at"]).total_seconds() <= ttl_seconds
+        ]
+        if not candidates:
+            return None
+        best = max(
+            candidates,
+            key=lambda item: (item["router_version"], item["updated_at"]),
+        )
+        return UUID(str(best["selected_model_id"]))
+
+    def get_model_router_run_bindings_batch(
+        self,
+        router_id: UUID,
+        router_version: int,
+        user_id: str,
+        run_ids: Sequence[str],
+        *,
+        ttl_seconds: int = 1800,
+    ) -> dict[str, UUID]:
+        result: dict[str, UUID] = {}
+        for run_id in dict.fromkeys(k for k in run_ids if k):
+            found = self.get_model_router_run_binding(
+                router_id,
+                router_version,
+                user_id,
+                run_id,
+                ttl_seconds=ttl_seconds,
+            )
+            if found is not None:
+                result[run_id] = found
+        return result
 
     def save_model_router_run_binding(
         self,
@@ -611,6 +733,25 @@ class InMemoryRouterRepositoryMixin:
             "updated_at": now,
         }
 
+    def save_model_router_run_bindings_batch(
+        self,
+        router_id: UUID,
+        router_version: int,
+        user_id: str,
+        run_ids: Sequence[str],
+        selected_model_id: UUID,
+        selected_model_name: str,
+    ) -> None:
+        for run_id in dict.fromkeys(k for k in run_ids if k):
+            self.save_model_router_run_binding(
+                router_id,
+                router_version,
+                user_id,
+                run_id,
+                selected_model_id,
+                selected_model_name,
+            )
+
     def save_model_router_invocation(
         self,
         request_id: str,
@@ -621,15 +762,12 @@ class InMemoryRouterRepositoryMixin:
         selected_model_name: str,
         attempts: Sequence[Mapping[str, Any]],
     ) -> None:
-        self.model_router_invocations.setdefault(
-            request_id,
-            {
-                "router_id": router_id,
-                "router_name": router_name,
-                "router_version": router_version,
-                "selected_model_id": selected_model_id,
-                "selected_model_name": selected_model_name,
-                "router_attempts": [dict(item) for item in attempts],
-            },
-        )
+        self.model_router_invocations[request_id] = {
+            "router_id": router_id,
+            "router_name": router_name,
+            "router_version": router_version,
+            "selected_model_id": selected_model_id,
+            "selected_model_name": selected_model_name,
+            "router_attempts": [dict(item) for item in attempts],
+        }
 

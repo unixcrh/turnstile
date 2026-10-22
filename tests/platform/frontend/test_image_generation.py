@@ -33,7 +33,7 @@ def test_image_invocation_keeps_results_in_memory_and_excludes_text_models() -> 
     assert "image_configuration_schema_version === 4" in page
     assert "setImageResult(null)" in page
     assert 'setPrompt(next === "decision" ?' in page
-    assert 'DECISION_STATE_SAMPLE) : "")' in page
+    assert 'DECISION_STATE_SAMPLE) : next === "chat" ? CHAT_PROMPT_SAMPLE : "")' in page
     assert "URL.createObjectURL" in result and "URL.revokeObjectURL" in result
     assert "naturalWidth" in result and "naturalHeight" in result
     for forbidden in (

@@ -1598,6 +1598,11 @@ class ModelRuntimeService:
             in {"model-router-decision", "model-router-decision-trial"}
         ):
             return
+        if (
+            isinstance(request, ModelInvocationRequest)
+            and request.router_context.get("_router_authorized_id")
+        ):
+            return
         if self._model_policy_allows(route, self._person_model_policy(user_id)):
             return
         self._deny(
@@ -1706,6 +1711,24 @@ class ModelRuntimeService:
             raise HTTPException(
                 status_code=403, detail="Budget delegation requires a verified person",
             )
+        auth_router_id = ""
+        if isinstance(request, ModelInvocationRequest):
+            auth_router_id = str(
+                request.router_context.get("_router_authorized_id") or ""
+            ).strip()
+        elif isinstance(request, DecisionInvocationRequest) and request.metadata.workflow in {
+            "model-router-decision",
+            "model-router-decision-trial",
+        }:
+            list_assigned = getattr(self._repository, "list_assigned_model_routers", None)
+            if callable(list_assigned):
+                assigned_rows = list(list_assigned(request.metadata.user_id))
+                if assigned_rows:
+                    auth_router_id = str(assigned_rows[0]["id"]).strip()
+        if auth_router_id and not self._model_policy_allows(
+            route, self._person_model_policy(request.metadata.user_id)
+        ):
+            route["delegated_model_id_header"] = f"router:{auth_router_id.lower()}"
         try:
             token = ManagedIdentityTokenProvider().token(configuration.audience)
         except Exception as error:

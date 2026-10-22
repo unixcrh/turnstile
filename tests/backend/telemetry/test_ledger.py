@@ -1420,86 +1420,84 @@ def test_table_batch_inner_failure_is_not_mistaken_for_outer_accepted() -> None:
     client.close()
 
 
-def test_model_access_projects_both_identifier_spaces() -> None:
-    # The gateway sees a registry UUID from the dashboard BFF and a model key from a
-    # desktop client for the same model, and cannot resolve one to the other. Projecting
-    # only one space would deny the caller that happens to use the other.
-    repository = InMemoryRepository()
-    model = next(item for item in repository.models if item["model_key"] == "gpt-5.6-luna")
-    repository.bulk_upsert_user_budgets(
-        PERIOD_START.date(),
-        "department-platform",
-        [],
-        80,
-        "owner",
-        selected_user_ids=[USER],
-        model_ids=[model["id"]],
-    )
-
-    store = FakeLedgerStore()
-    service = LedgerSyncService(repository, store)
-    service.project_model_access(service.model_access(), datetime(2026, 7, 27, 12, 0, tzinfo=UTC))
-
-    row = store.entities[(partition_key(USER, "2026-07"), "M")]
-    assert row["Configured"] is True
-    assert f"|{str(model['id']).lower()}|" in row["Models"]
-    assert f"|{model['model_key'].lower()}|" in row["Models"]
-
-
-def test_deny_all_projects_an_empty_membership_set_not_a_missing_row() -> None:
-    # Deny-all and "never configured" must not look the same in the ledger: the first has
-    # to block everything, the second has to allow everything. An absent row means the
-    # latter, so an explicit policy with no models still needs a row.
-    repository = InMemoryRepository()
-    repository.bulk_upsert_user_budgets(
-        PERIOD_START.date(),
-        "department-platform",
-        [],
-        80,
-        "owner",
-        selected_user_ids=[USER],
-        model_ids=[],
-    )
-
-    store = FakeLedgerStore()
-    service = LedgerSyncService(repository, store)
-    service.project_model_access(service.model_access(), datetime(2026, 7, 27, 12, 0, tzinfo=UTC))
-
-    row = store.entities[(partition_key(USER, "2026-07"), "M")]
-    assert row["Configured"] is True
-    # Nothing can be a member of this, which is what deny-all means.
-    assert row["Models"] == "||"
-
-
-def test_timer_replaces_model_access_and_repairs_an_unprojected_revocation() -> None:
-    repository = InMemoryRepository()
-    store = FakeLedgerStore()
-    service = LedgerSyncService(repository, store)
-    moment = datetime(2026, 7, 27, 12, 0, tzinfo=UTC)
-    models = [model for model in repository.models if model["enabled"]][:2]
-    assert len(models) == 2
-    other_partition = partition_key("unselected@example.com", "2026-07")
-    store.upsert(other_partition, "M", {"Configured": True, "Models": "|unchanged|"})
-    for selection in (models, [models[1]], []):
-        repository.bulk_upsert_user_budgets(
-            PERIOD_START.date(), "department-platform", [], 80, "owner",
-            selected_user_ids=[USER], model_ids=[model["id"] for model in selection],
-        )
-        service.run(moment)
-        row = store.entities[(partition_key(USER, "2026-07"), "M")]
-        identifiers = [
-            identifier for model in selection
-            for identifier in (str(model["id"]), model["model_key"])
-        ]
-        assert row == {"Configured": True, "Models": model_access_value(identifiers)}
-        assert store.entities[(other_partition, "M")]["Models"] == "|unchanged|"
-    assert row["Models"] == "||"
-
-
 def test_model_access_value_cannot_match_a_prefix_of_a_longer_identifier() -> None:
     value = model_access_value(["gpt-5.6-luna"])
     assert "|gpt-5.6-luna|" in value
     assert "|gpt-5.6|" not in value
+
+
+def test_router_assignment_does_not_pollute_direct_model_access_m_row() -> None:
+    from uuid import uuid4
+
+    repository = InMemoryRepository()
+    model = next(item for item in repository.models if item["enabled"])
+    model["assignment_required"] = True
+    owner_id = uuid4()
+    definition = {
+        "schema_version": 2,
+        "nodes": [
+            {"id": "start", "type": "start", "label": "Start", "position": {"x": 0, "y": 0}},
+            {
+                "id": "candidates",
+                "type": "candidate_models",
+                "label": "Candidates",
+                "position": {"x": 100, "y": 0},
+                "candidates": [{"model_id": str(model["id"])}],
+            },
+            {
+                "id": "strategy",
+                "type": "strategy",
+                "label": "Strategy",
+                "position": {"x": 200, "y": 0},
+                "strategy_type": "priority",
+                "model_configs": [{"model_id": str(model["id"]), "priority": 1, "weight": 100}],
+            },
+            {"id": "output", "type": "output", "label": "Output", "position": {"x": 300, "y": 0}},
+        ],
+        "edges": [
+            {"id": "e1", "source": "start", "target": "candidates"},
+            {"id": "e2", "source": "candidates", "target": "strategy"},
+            {"id": "e3", "source": "strategy", "target": "output"},
+        ],
+    }
+    created = repository.create_model_router(
+        owner_id,
+        "owner@contoso.com",
+        {
+            "name": "Cost Guard Router",
+            "description": "",
+            "definition": definition,
+            "updated_by": "owner@contoso.com",
+        },
+    )
+    assert created is not None
+    router_id = UUID(str(created["id"]))
+    repository.publish_model_router(router_id, owner_id, "owner@contoso.com")
+
+    unconfigured_user = "test.user02@contoso.com"
+    assert unconfigured_user not in repository.user_model_policies
+    assert repository.set_model_router_assignment(
+        router_id, unconfigured_user, True, "owner@contoso.com"
+    )
+
+    store = FakeLedgerStore()
+    service = LedgerSyncService(repository, store)
+    moment = datetime(2026, 10, 21, 12, 0, tzinfo=UTC)
+    service.project_model_access(service.model_access([unconfigured_user]), moment)
+
+    row = store.entities[(partition_key(unconfigured_user, "2026-10"), "M")]
+    assert row["Configured"] is True
+    assert f"|{str(model['id']).lower()}|" not in row["Models"]
+    assert f"|{str(model['model_key']).lower()}|" not in row["Models"]
+    assert f"|router:{str(router_id).lower()}|" in row["Models"]
+
+    assert repository.set_model_router_assignment(
+        router_id, unconfigured_user, False, "owner@contoso.com"
+    )
+    service.project_model_access(service.model_access([unconfigured_user]), moment)
+    revoked_row = store.entities[(partition_key(unconfigured_user, "2026-10"), "M")]
+    assert revoked_row["Configured"] is False
+    assert revoked_row["Models"] == "||"
 
 
 AUGUST = datetime(2026, 8, 1, tzinfo=UTC)

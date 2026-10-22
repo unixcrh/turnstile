@@ -115,8 +115,8 @@ const emptyApimForm: ApimTargetWrite = {
   api_id: "",
   gateway_endpoint: "",
   management_auth_profile_ref: "system_managed_identity",
-  dashboard_subscription_id: "finops-dashboard",
-  probe_subscription_id: "finops-publisher-probe",
+  dashboard_subscription_id: "turnstile-dashboard",
+  probe_subscription_id: "turnstile-publisher-probe",
 }
 const emptyGatewayForm: SelfHostedGatewayWrite = {
   native_gateway_id: "",
@@ -736,7 +736,7 @@ function InfrastructureNameEditor({ kind, identity, name, supported, available =
           {!available && <InfrastructureErrorNotice>所选网关已不可用</InfrastructureErrorNotice>}
           {Boolean(error) && <div className="registry-error" role="alert">{errorMessage(error)}</div>}
         </div>
-        <DialogFooter className="registry-editor-footer"><DialogClose render={<Button type="button" variant="outline" disabled={busy} />}>取消</DialogClose><Button type="submit" disabled={!supported || busy || !valid}>{busy ? <RefreshCw size={14} className="spin" /> : <Save size={14} />}{busy ? "正在保存" : "保存"}</Button></DialogFooter>
+        <DialogFooter className="registry-editor-footer"><DialogClose render={<Button type="button" variant="outline" disabled={busy} />}>取消</DialogClose><Button type="submit" disabled={!supported || busy || !valid}>{busy && <RefreshCw size={14} className="spin" />}{busy ? "正在保存" : "保存"}</Button></DialogFooter>
       </form>
     </DialogContent>
   </Dialog>

@@ -378,6 +378,16 @@ module controlPlaneApimRbac 'modules/control-plane-apim-rbac.bicep' = if (provis
   }
 }
 
+module publisherObserverKeyAccess 'modules/observer-named-value-rbac.bicep' = if (provisionControlPlane && !empty(apimUsageObserver.keyNamedValue)) {
+  name: 'turnstile-publisher-observer-key-${take(suffix, 13)}'
+  scope: resourceGroup(effectiveApimResourceGroupName)
+  params: {
+    apimName: effectiveApimName
+    observerKeyNamedValue: apimUsageObserver.keyNamedValue
+    publisherPrincipalId: controlPlane!.outputs.principalId
+  }
+}
+
 module applicationKeyManagementRbac 'modules/application-key-management-rbac.bicep' = if (gatewayApplicationKeyManagementEnabled) {
   name: 'turnstile-application-key-management-rbac-${take(suffix, 13)}'
   scope: resourceGroup(effectiveApimResourceGroupName)

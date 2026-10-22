@@ -972,14 +972,33 @@ def test_owner_resolution_service_never_waives_a_settlement_decision(settled: bo
                             "owner@example.test")
 
 
-@pytest.mark.parametrize("condition", ["ready", "held", "unpriced", "drifted", "stale"])
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "ready",
+        "held",
+        "upper_bound",
+        "stuck_upper_bound",
+        "pending_dispatch",
+        "stuck_pending_dispatch",
+        "unpriced",
+        "drifted",
+        "stale",
+    ],
+)
 def test_policy_unit_switch_requires_drained_actual_usage_not_converted_consumption(
     condition: str,
 ) -> None:
     update = LedgerPolicyUpdate(scope=SCOPE, epoch=EPOCH, revision=2, token_limit=0,
                                 budget_mode="usd", usd_limit=Decimal("10"),
                                 enforce=True, enabled=True)
-    current = summary(1000, confirmed_tokens=500, policy_revision=3 if condition == "stale" else 1)
+    current = summary(
+        1000,
+        confirmed_tokens=500,
+        upper_bound_tokens=200 if "upper_bound" in condition else 0,
+        policy_revision=3 if condition == "stale" else 1,
+        enabled=not condition.startswith("stuck_"),
+    )
     repository, ledger = Mock(), Mock(spec=AtomicTableLedger)
     repository.pending_budget_policies.return_value = [update]
     repository.registry.return_value = {"models": []}
@@ -991,7 +1010,9 @@ def test_policy_unit_switch_requires_drained_actual_usage_not_converted_consumpt
     ledger.quiesce_budget_scope.return_value = current.model_copy(update={
         "enabled": False, "active_reserved_tokens": 1 if condition == "held" else 0,
     })
-    ledger.pending_dispatch_page.return_value = ([], None, None)
+    ledger.pending_dispatch_page.return_value = (
+        ([Mock()], None, None) if "pending_dispatch" in condition else ([], None, None)
+    )
     ledger.write_policy.return_value = summary(0, budget_mode="usd", usd_limit=Decimal("10"),
                                               policy_revision=2, confirmed_usd=Decimal("0.12"))
     applied = BudgetRecoveryService(repository, ledger).policies()
@@ -1004,8 +1025,12 @@ def test_policy_unit_switch_requires_drained_actual_usage_not_converted_consumpt
         assert applied == 0
         ledger.write_policy.assert_not_called()
         repository.complete_budget_policy.assert_not_called()
-    if condition == "stale":
+    if condition in {"stale", "upper_bound", "pending_dispatch", "unpriced", "drifted"}:
         ledger.quiesce_budget_scope.assert_not_called()
+    elif condition.startswith("stuck_"):
+        ledger.quiesce_budget_scope.assert_called_once_with(
+            SCOPE, EPOCH, 2, enabled=True,
+        )
 
 
 def test_switch_balance_sql_binds_actual_usage_and_applied_request_evidence() -> None:
@@ -1029,7 +1054,28 @@ def test_switch_balance_sql_binds_actual_usage_and_applied_request_evidence() ->
     assert "budget_pre_dispatch_denial" in query and "dispatched.dispatch_id IS NOT NULL" in query
     assert "task.applied_revision < task.revision" in query
     assert b"NOT LIKE 'rejection:%'" in prepared.query
+    assert b"NOT LIKE 'resolution:%'" in prepared.query
     assert parameters[-2:] == (2, "usd")
+
+
+def test_budget_reservation_receipts_sql_excludes_cancelled_and_settled_attempts() -> None:
+    from psycopg._queries import PostgresQuery
+    from psycopg.adapt import Transformer
+
+    connection, context = MagicMock(), MagicMock()
+    context.__enter__.return_value = connection
+    connection.execute.return_value.fetchall.return_value = []
+    repository = PostgreSqlBudgetExecutionMixin()
+    with patch.object(repository, "_connection", return_value=context):
+        assert repository.budget_reservation_receipts(SCOPE, limit=1) == []
+    query, parameters = connection.execute.call_args.args
+    prepared = PostgresQuery(Transformer())
+    prepared.convert(query, parameters)
+    assert "(execution.dispatch_id IS NOT NULL OR execution.usage_id IS NOT NULL)" in query
+    assert "task.applied_revision < task.revision" in query
+    assert b"NOT LIKE 'rejection:%'" in prepared.query
+    assert b"NOT LIKE 'resolution:%'" in prepared.query
+    assert parameters[-2:] == (False, 1)
 
 
 def test_completion_reader_retains_usd_amount_and_original_admission_price() -> None:

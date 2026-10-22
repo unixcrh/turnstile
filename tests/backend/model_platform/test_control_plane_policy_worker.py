@@ -777,7 +777,7 @@ def test_foundry_publication_waits_for_rbac_and_resumes_the_same_candidate() -> 
     ]
     service = GatewayControlPlaneService(
         repository,
-        apim_principal_id="39deeba0-9799-4806-96c4-2f65eb0f22d1",
+        apim_principal_id="00000000-0000-0000-0000-000000000705",
     )
     service.publish(foundry_publication(), "owner@example.com")
     client = AuthorizationClient()
@@ -827,7 +827,7 @@ def test_failed_foundry_publication_retries_without_an_api_key() -> None:
     ]
     service = GatewayControlPlaneService(
         repository,
-        apim_principal_id="39deeba0-9799-4806-96c4-2f65eb0f22d1",
+        apim_principal_id="00000000-0000-0000-0000-000000000705",
     )
     publication = service.publish(foundry_publication(), "owner@example.com")
     transition_publication(
@@ -889,7 +889,7 @@ def test_managed_foundry_removal_preserves_the_shared_project_connection() -> No
     ]
     service = GatewayControlPlaneService(
         repository,
-        apim_principal_id="39deeba0-9799-4806-96c4-2f65eb0f22d1",
+        apim_principal_id="00000000-0000-0000-0000-000000000705",
     )
     client = FakeApimClient()
     worker = GatewayPublicationWorker(repository, client, client.policy)
@@ -1044,7 +1044,7 @@ def test_first_foundry_regression_probe_reports_missing_authorization() -> None:
     ]
     publication = GatewayControlPlaneService(
         repository,
-        apim_principal_id="39deeba0-9799-4806-96c4-2f65eb0f22d1",
+        apim_principal_id="00000000-0000-0000-0000-000000000705",
     ).publish(foundry_publication(), "owner@example.com")
     alias = publication.desired_spec.bindings[-1].model.model_key
 

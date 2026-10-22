@@ -1162,3 +1162,180 @@ def test_model_access_projection_failure_reports_saved_but_not_projected(
     assert repository.list_user_model_policies([user_id])[0]["model_ids"] == []
     assert "saved but not projected" in caplog.text
     assert "next ledger sync will repair it" in caplog.text
+
+
+@pytest.mark.parametrize("blocker", ["unpriced_usage", "upper_bound_finalization"])
+def test_organization_switch_rejects_unpriced_usage_or_unresolved_upper_bound_reservations(
+    blocker: str,
+) -> None:
+    from types import SimpleNamespace
+
+    repository = InMemoryRepository()
+    service = TokenBudgetService(repository)
+    user_id = "test.user01@contoso.com"
+    for scope_type, scope_id, tokens in (
+        ("organization", "org-contoso-global", 200_000_000),
+        ("department", "department-platform", 100_000_000),
+        ("user", user_id, 50_000_000),
+    ):
+        service.save(
+            "2026-07",
+            cast(BudgetScopeType, scope_type),
+            scope_id,
+            TokenBudgetWrite(token_limit=tokens),
+            "owner",
+        )
+    if blocker == "unpriced_usage":
+        _write_usage(repository, user_id, 99)
+        repository.usage_records[-1] = repository.usage_records[-1].model_copy(
+            update={"usd_cost": None}
+        )
+        expected_match = "unpriced usage"
+    else:
+        repository.budget_reservation_finalizations[("person", user_id, "corr-upper")] = (  # type: ignore[assignment]
+            SimpleNamespace(
+                scope_type="person",
+                scope_id=user_id,
+                period_start=date(2026, 7, 1),
+                finalization_kind="unverified_upper_bound",
+                reservation_created_at=datetime(2026, 7, 15, tzinfo=UTC),
+                correlation_id="corr-upper",
+                total_tokens=4096,
+            )
+        )
+        expected_match = "unresolved upper-bound reservations"
+    before = deepcopy(repository.token_budgets)
+    with pytest.raises(BudgetConflictError, match=expected_match):
+        service.save(
+            "2026-07",
+            "organization",
+            "org-contoso-global",
+            TokenBudgetWrite(budget_mode="usd", usd_limit=Decimal("1000.00")),
+            "owner",
+        )
+    assert repository.token_budgets == before
+
+
+def test_organization_switch_ignores_cancelled_tombstones_and_allows_reverting_torn_unit() -> None:
+    from types import SimpleNamespace
+    from uuid import UUID
+
+    from turnstile_core.domain.ledger import LedgerAdmissionReceipt, LedgerAttemptIdentity
+    from turnstile_core.persistence.repository_budget_execution import (
+        PostgreSqlBudgetExecutionMixin,
+    )
+
+    class ExecutionAwareRepository(InMemoryRepository, PostgreSqlBudgetExecutionMixin):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts: list[dict[str, Any]] = []
+            self.scope_statuses: dict[tuple[str, str, date], dict[str, Any]] = {}
+
+        def budget_execution_status(self, scope: Any) -> dict[str, Any] | None:
+            return self.scope_statuses.get(
+                (scope.scope_type, scope.scope_id, scope.period_start)
+            )
+
+        def budget_reservation_receipts(
+            self, scope: Any, *, limit: int = 20, include_resolved: bool = False
+        ) -> list[LedgerAdmissionReceipt]:
+            connection, context = MagicMock(), MagicMock()
+            context.__enter__.return_value = connection
+            matching = [
+                row["receipt"]
+                for row in self.attempts
+                if (row["dispatch_id"] is not None or row["usage_id"] is not None)
+                and (include_resolved or not row.get("resolved", False))
+            ][:limit]
+            connection.execute.return_value.fetchall.return_value = matching
+            with patch.object(self, "_connection", return_value=context):
+                result = super().budget_reservation_receipts(
+                    scope, limit=limit, include_resolved=include_resolved
+                )
+            sql = connection.execute.call_args.args[0]
+            assert "(execution.dispatch_id IS NOT NULL OR execution.usage_id IS NOT NULL)" in sql
+            return result
+
+    repository = ExecutionAwareRepository()
+    service = TokenBudgetService(repository)
+    user_id = "test.user01@contoso.com"
+    period = date(2026, 7, 1)
+    for scope_type, scope_id, tokens in (
+        ("organization", "org-contoso-global", 200_000_000),
+        ("department", "department-platform", 100_000_000),
+        ("user", user_id, 50_000_000),
+    ):
+        service.save(
+            "2026-07",
+            cast(BudgetScopeType, scope_type),
+            scope_id,
+            TokenBudgetWrite(token_limit=tokens),
+            "owner",
+        )
+    receipt = LedgerAdmissionReceipt(
+        identity=LedgerAttemptIdentity.model_validate(
+            {
+                "scope": {
+                    "scope_type": "person",
+                    "scope_id": user_id,
+                    "period_start": period,
+                },
+                "gateway_profile_id": str(UUID(int=1)),
+                "native_gateway_id": "managed",
+                "correlation_id": "cancelled-attempt",
+                "model_id": str(UUID(int=2)),
+                "admitted_at": datetime(2026, 7, 15, tzinfo=UTC),
+            }
+        ),
+        epoch=UUID(int=3),
+        reserved_tokens=4096,
+        budget_mode="tokens",
+    )
+    # 1. A cancelled attempt (dispatch_id=None, usage_id=None) must NOT block switching to USD
+    repository.attempts.append(
+        {"receipt": receipt.model_dump(mode="json"), "dispatch_id": None, "usage_id": None}
+    )
+    service.save(
+        "2026-07",
+        "organization",
+        "org-contoso-global",
+        TokenBudgetWrite(budget_mode="usd", usd_limit=Decimal("1000.00")),
+        "owner",
+    )
+    assert (
+        repository.token_budgets[(period, "organization", "org-contoso-global")]["budget_mode"]
+        == "usd"
+    )
+    # 2. If the control plane is in USD but the underlying ledger is still in tokens with an
+    # unresolved token upper-bound reservation, reverting from USD back to tokens MUST succeed.
+    repository.attempts.append(
+        {
+            "receipt": receipt.model_dump(mode="json"),
+            "dispatch_id": str(UUID(int=4)),
+            "usage_id": None,
+        }
+    )
+    repository.budget_reservation_finalizations[("person", user_id, "corr-upper")] = (  # type: ignore[assignment]
+        SimpleNamespace(
+            scope_type="person",
+            scope_id=user_id,
+            period_start=period,
+            finalization_kind="unverified_upper_bound",
+            reservation_created_at=datetime(2026, 7, 15, tzinfo=UTC),
+            correlation_id="corr-upper",
+            total_tokens=4096,
+            budget_mode="tokens",
+        )
+    )
+    service.save(
+        "2026-07",
+        "organization",
+        "org-contoso-global",
+        TokenBudgetWrite(budget_mode="tokens", token_limit=200_000_000),
+        "owner",
+    )
+    assert (
+        repository.token_budgets[(period, "organization", "org-contoso-global")]["budget_mode"]
+        == "tokens"
+    )
+

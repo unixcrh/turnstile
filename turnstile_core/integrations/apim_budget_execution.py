@@ -91,6 +91,8 @@ REQUEST_ANALYSIS = """@{
       if (!anthropic && !chat && !responses && !images) { return result; }
       var features = new HashSet<string>();
       var controls = new HashSet<string>();
+      var mediaSources = new HashSet<string>();
+      long inlineMediaCount = 0L, inlineMediaBytes = 0L, remoteMediaCount = 0L, remoteMediaBytes = 0L;
       bool complete = true, remote = false;
       var fields = anthropic
         ? new[] { "model", "messages", "max_tokens", "metadata", "service_tier", "stop_sequences", "stream", "system",
@@ -186,7 +188,12 @@ REQUEST_ANALYSIS = """@{
           pending.Enqueue(new KeyValuePair<string, JToken>(kind == "anthropic-message" ? "anthropic-content" : "chat-content", value["content"]));
           if (kind == "chat-message") {
             pending.Enqueue(new KeyValuePair<string, JToken>("chat-calls", value["tool_calls"]));
-            if (value["audio"] != null && value["audio"].Type != JTokenType.Null) { features.Add("multimodal_input"); remote = true; }
+            if (value["audio"] != null && value["audio"].Type != JTokenType.Null) {
+              features.Add("multimodal_input"); remote = true;
+              remoteMediaCount = checked(remoteMediaCount + 1L);
+              remoteMediaBytes = checked(remoteMediaBytes + Encoding.UTF8.GetByteCount(value["audio"].ToString(Newtonsoft.Json.Formatting.None)));
+              mediaSources.Add("audio_reference");
+            }
           }
           continue;
         }
@@ -302,10 +309,29 @@ REQUEST_ANALYSIS = """@{
         if (kind == "anthropic-source") {
           if (type == "url") {
             if (value["url"]?.Type != JTokenType.String) { result["error"] = "budget_request_invalid"; return result; }
-            remote = true; continue;
+            remote = true;
+            remoteMediaCount = checked(remoteMediaCount + 1L);
+            remoteMediaBytes = checked(remoteMediaBytes + Encoding.UTF8.GetByteCount((string)value["url"]));
+            mediaSources.Add("url");
+            continue;
           }
-          if (type == "file") { remote = true; pending.Enqueue(new KeyValuePair<string, JToken>("required-text", value["file_id"])); continue; }
-          if (type == "base64" || type == "text") { pending.Enqueue(new KeyValuePair<string, JToken>("required-text", value["data"])); continue; }
+          if (type == "file") {
+            remote = true;
+            if (value["file_id"]?.Type == JTokenType.String) {
+              remoteMediaCount = checked(remoteMediaCount + 1L);
+              remoteMediaBytes = checked(remoteMediaBytes + Encoding.UTF8.GetByteCount((string)value["file_id"]));
+              mediaSources.Add("file_id");
+            }
+            pending.Enqueue(new KeyValuePair<string, JToken>("required-text", value["file_id"])); continue;
+          }
+          if (type == "base64" || type == "text") {
+            if (type == "base64" && value["data"]?.Type == JTokenType.String) {
+              inlineMediaCount = checked(inlineMediaCount + 1L);
+              inlineMediaBytes = checked(inlineMediaBytes + Encoding.UTF8.GetByteCount((string)value["data"]));
+              mediaSources.Add("base64");
+            }
+            pending.Enqueue(new KeyValuePair<string, JToken>("required-text", value["data"])); continue;
+          }
           if (type == "content") { pending.Enqueue(new KeyValuePair<string, JToken>("anthropic-content", value["content"])); continue; }
           complete = false; continue;
         }
@@ -315,11 +341,27 @@ REQUEST_ANALYSIS = """@{
             features.Add("multimodal_input");
             var image = value["image_url"] as JObject;
             if (image == null || image["url"]?.Type != JTokenType.String) { result["error"] = "budget_request_invalid"; return result; }
-            remote = remote || !((string)image["url"]).StartsWith("data:", StringComparison.OrdinalIgnoreCase); continue;
+            var imageUrl = (string)image["url"];
+            if (imageUrl.StartsWith("data:", StringComparison.OrdinalIgnoreCase)) {
+              inlineMediaCount = checked(inlineMediaCount + 1L);
+              inlineMediaBytes = checked(inlineMediaBytes + Encoding.UTF8.GetByteCount(imageUrl));
+              mediaSources.Add("data_url");
+            } else {
+              remote = true;
+              remoteMediaCount = checked(remoteMediaCount + 1L);
+              remoteMediaBytes = checked(remoteMediaBytes + Encoding.UTF8.GetByteCount(imageUrl));
+              mediaSources.Add("url");
+            }
+            continue;
           }
           if (type == "input_audio") {
             var audio = value["input_audio"] as JObject;
             if (audio == null) { result["error"] = "budget_request_invalid"; return result; }
+            if (audio["data"]?.Type == JTokenType.String) {
+              inlineMediaCount = checked(inlineMediaCount + 1L);
+              inlineMediaBytes = checked(inlineMediaBytes + Encoding.UTF8.GetByteCount((string)audio["data"]));
+              mediaSources.Add("base64");
+            }
             pending.Enqueue(new KeyValuePair<string, JToken>("required-text", audio["data"]));
             features.Add("multimodal_input"); continue;
           }
@@ -327,7 +369,22 @@ REQUEST_ANALYSIS = """@{
             features.Add("multimodal_input");
             var file = value["file"] as JObject;
             if (file == null) { result["error"] = "budget_request_invalid"; return result; }
-            remote = remote || (file["file_id"] != null && file["file_id"].Type != JTokenType.Null); continue;
+            if (file["file_id"] != null && file["file_id"].Type != JTokenType.Null) {
+              remote = true;
+              remoteMediaCount = checked(remoteMediaCount + 1L);
+              if (file["file_id"].Type == JTokenType.String) {
+                remoteMediaBytes = checked(remoteMediaBytes + Encoding.UTF8.GetByteCount((string)file["file_id"]));
+              }
+              mediaSources.Add("file_id");
+            }
+            if (file["file_data"] != null && file["file_data"].Type != JTokenType.Null) {
+              if (file["file_data"].Type != JTokenType.String) { result["error"] = "budget_request_invalid"; return result; }
+              var fileData = (string)file["file_data"];
+              inlineMediaCount = checked(inlineMediaCount + 1L);
+              inlineMediaBytes = checked(inlineMediaBytes + Encoding.UTF8.GetByteCount(fileData));
+              mediaSources.Add(fileData.StartsWith("data:", StringComparison.OrdinalIgnoreCase) ? "data_url" : "base64");
+            }
+            continue;
           }
           complete = false; continue;
         }
@@ -338,13 +395,34 @@ REQUEST_ANALYSIS = """@{
           if (new[] { "input_image", "input_file", "computer_screenshot" }.Contains(type)) {
             features.Add("multimodal_input");
             if (type == "input_file" && value["file_data"] != null && value["file_data"].Type != JTokenType.Null) {
+              if (value["file_data"].Type == JTokenType.String) {
+                var fileData = (string)value["file_data"];
+                inlineMediaCount = checked(inlineMediaCount + 1L);
+                inlineMediaBytes = checked(inlineMediaBytes + Encoding.UTF8.GetByteCount(fileData));
+                mediaSources.Add(fileData.StartsWith("data:", StringComparison.OrdinalIgnoreCase) ? "data_url" : "base64");
+              }
               pending.Enqueue(new KeyValuePair<string, JToken>("required-text", value["file_data"]));
             }
             foreach (var field in new[] { "image_url", "file_url", "file_id" }) {
               var reference = value[field];
               if (reference == null || reference.Type == JTokenType.Null) { continue; }
               if (reference.Type != JTokenType.String) { result["error"] = "budget_request_invalid"; return result; }
-              remote = remote || field == "file_id" || !((string)reference).StartsWith("data:", StringComparison.OrdinalIgnoreCase);
+              var refText = (string)reference;
+              if (field == "file_id") {
+                remote = true;
+                remoteMediaCount = checked(remoteMediaCount + 1L);
+                remoteMediaBytes = checked(remoteMediaBytes + Encoding.UTF8.GetByteCount(refText));
+                mediaSources.Add("file_id");
+              } else if (refText.StartsWith("data:", StringComparison.OrdinalIgnoreCase)) {
+                inlineMediaCount = checked(inlineMediaCount + 1L);
+                inlineMediaBytes = checked(inlineMediaBytes + Encoding.UTF8.GetByteCount(refText));
+                mediaSources.Add("data_url");
+              } else {
+                remote = true;
+                remoteMediaCount = checked(remoteMediaCount + 1L);
+                remoteMediaBytes = checked(remoteMediaBytes + Encoding.UTF8.GetByteCount(refText));
+                mediaSources.Add("url");
+              }
             }
             continue;
           }
@@ -356,6 +434,13 @@ REQUEST_ANALYSIS = """@{
       result["version"] = 1; result["complete"] = complete; result["remote_content"] = remote;
       result["required_features"] = new JArray(features.OrderBy(feature => feature, StringComparer.Ordinal));
       result["request_controls"] = new JArray(controls.OrderBy(control => control, StringComparer.Ordinal));
+      if (features.Contains("multimodal_input")) {
+        result["inline_media_count"] = inlineMediaCount;
+        result["inline_media_bytes"] = inlineMediaBytes;
+        result["remote_media_count"] = remoteMediaCount;
+        result["remote_media_bytes"] = remoteMediaBytes;
+        result["media_sources"] = new JArray(mediaSources.OrderBy(source => source, StringComparer.Ordinal));
+      }
       return result;
     } catch { return result; }
 }"""
@@ -452,6 +537,21 @@ PLAN = """@{
       var supported = contract["supported_features"] as JArray ?? new JArray();
       var knownFeatures = new[] { "conversation_state", "opaque_state", "multimodal_input", "server_tools", "background", "compaction" };
       if (supported.Any(value => value.Type != JTokenType.String || !knownFeatures.Contains((string)value))) { return result; }
+      if ((contract["require_verified_bound"] != null && contract["require_verified_bound"].Type != JTokenType.Boolean)
+        || (config["require_verified_bound"] != null && config["require_verified_bound"].Type != JTokenType.Boolean)) { return result; }
+      if (((bool?)contract["require_verified_bound"] == true || (bool?)config["require_verified_bound"] == true)
+        && legacyEstimate) {
+        result["error"] = "budget_count_bound_unavailable"; return result;
+      }
+      if (contract["multimodal_item_ceiling"] != null
+        && (contract["multimodal_item_ceiling"].Type != JTokenType.Integer
+          || (long)contract["multimodal_item_ceiling"] <= 0
+          || algorithm == "request_total_ceiling_v1"
+          || (algorithm == "context_input_ceiling_v1"
+            && (!supported.Values<string>().Contains("multimodal_input")
+              || (long)contract["multimodal_item_ceiling"] > (long)contract["input_ceiling"])))) {
+        return result;
+      }
       result["error"] = "budget_request_analysis_failed";
       var analysis = context.Variables.GetValueOrDefault<JObject>("executionRequestAnalysis", null);
       if (analysis == null || analysis["error"]?.Type != JTokenType.String) { return result; }
@@ -470,6 +570,13 @@ PLAN = """@{
         || requiredFeatures.Any(feature => !supported.Values<string>().Contains(feature)))) {
         result["error"] = "budget_count_bound_unavailable"; return result;
       }
+      long inlineMediaCount = (long?)analysis["inline_media_count"] ?? 0L;
+      long inlineMediaBytes = (long?)analysis["inline_media_bytes"] ?? 0L;
+      long remoteMediaCount = (long?)analysis["remote_media_count"] ?? 0L;
+      long remoteMediaBytes = (long?)analysis["remote_media_bytes"] ?? 0L;
+      var mediaSources = analysis["media_sources"] as JArray ?? new JArray();
+      if (inlineMediaCount < 0 || inlineMediaBytes < 0 || remoteMediaCount < 0 || remoteMediaBytes < 0
+        || mediaSources.Any(value => value.Type != JTokenType.String)) { return result; }
       result["error"] = "budget_plan_failed";
       var body = context.Request.Body.As<JObject>(preserveContent: true);
       if ((bool?)body["stream"] == true && !context.Variables.GetValueOrDefault<bool>("selectedBudgetObserver", false)) {
@@ -543,14 +650,42 @@ PLAN = """@{
       long bodyBytes = normalizedBody == null
         ? context.Request.Body.As<byte[]>(preserveContent: true).LongLength
         : Encoding.UTF8.GetByteCount(normalizedBody);
-      long bound = legacyEstimate ? checked(bodyBytes + (passthrough ? (long)contract["output_estimate"] : checked(output * samples)))
-        : passthrough ? (long)contract["request_token_ceiling"] : checked((long)contract["input_ceiling"] + checked(output * samples));
+      long mediaItemCount = checked(inlineMediaCount + remoteMediaCount);
+      long mediaPayloadBytes = checked(inlineMediaBytes + remoteMediaBytes);
+      long nonMediaBodyBytes = Math.Max(0L, bodyBytes - mediaPayloadBytes);
+      long mediaItemCeiling = contract["multimodal_item_ceiling"]?.Type == JTokenType.Integer
+        ? (long)contract["multimodal_item_ceiling"]
+        : (legacyEstimate && mediaItemCount > 0 ? 4096L : 0L);
+      long mediaReserveTokens = mediaItemCeiling > 0 && mediaItemCount > 0
+        ? checked(mediaItemCount * mediaItemCeiling) : 0L;
+      long outputReserveTokens = passthrough
+        ? (legacyEstimate ? (long)contract["output_estimate"] : 0L)
+        : checked(output * samples);
+      long inputReserveTokens;
+      if (legacyEstimate) {
+        inputReserveTokens = mediaItemCount > 0
+          ? checked(nonMediaBodyBytes + mediaReserveTokens)
+          : bodyBytes;
+        long contextWindow = context.Variables.GetValueOrDefault<long>("selectedContextWindow", 0L);
+        if (contextWindow > 0 && mediaItemCount > 0 && inputReserveTokens > contextWindow) {
+          inputReserveTokens = contextWindow;
+        }
+      } else if (passthrough) {
+        inputReserveTokens = (long)contract["request_token_ceiling"];
+      } else if (mediaItemCount > 0 && contract["multimodal_item_ceiling"]?.Type == JTokenType.Integer
+        && requiredFeatures.All(feature => feature == "multimodal_input")) {
+        inputReserveTokens = Math.Min((long)contract["input_ceiling"], checked(nonMediaBodyBytes + mediaReserveTokens));
+      } else {
+        inputReserveTokens = (long)contract["input_ceiling"];
+      }
+      long bound = checked(inputReserveTokens + outputReserveTokens);
       if (normalizedBody != null) { result["normalized_body"] = normalizedBody; }
       if (!hasPerson && context.Subscription != null && (string)applicationMapping["status"] == "ok"
         && (string)applicationMapping["applicationType"] == "system") {
         result["error"] = ""; result["bypass"] = true; result["receipts"] = new JArray(); return result;
       }
       var now = (DateTime)context.Variables["requestStarted"];
+      var admissionStarted = DateTime.UtcNow;
       var scopes = new JArray();
       if (context.Variables.GetValueOrDefault<bool>("hasEmployeeToken", false)) {
         if (context.Variables.GetValueOrDefault<string>("modelAdmission", "") == "ledger_unavailable") {
@@ -585,7 +720,7 @@ PLAN = """@{
             new JProperty("gateway_profile_id", "__GATEWAY_PROFILE_ID__"),
             new JProperty("native_gateway_id", context.Deployment.Gateway.Id),
             new JProperty("correlation_id", context.RequestId.ToString()),
-            new JProperty("model_id", model), new JProperty("admitted_at", now.ToString("o"))))));
+            new JProperty("model_id", model), new JProperty("admitted_at", admissionStarted.ToString("o"))))));
       }
       result["error"] = ""; result["attempt_key"] = key; result["receipts"] = receipts;
       result["model_id"] = model;
@@ -600,6 +735,15 @@ PLAN = """@{
       result["request_controls"] = controls.DeepClone();
       result["request_analysis"] = analysis.DeepClone();
       result["body_bytes_estimate"] = bodyBytes;
+      result["non_media_body_bytes_estimate"] = nonMediaBodyBytes;
+      result["inline_media_count"] = inlineMediaCount;
+      result["inline_media_bytes"] = inlineMediaBytes;
+      result["remote_media_count"] = remoteMediaCount;
+      result["remote_media_bytes"] = remoteMediaBytes;
+      result["media_sources"] = mediaSources.DeepClone();
+      result["media_reserve_tokens"] = mediaReserveTokens;
+      result["input_reserve_tokens"] = inputReserveTokens;
+      result["output_reserve_tokens"] = outputReserveTokens;
       return result;
     } catch { return result; }
 }"""
@@ -677,7 +821,7 @@ NATIVE_COUNT_APPLY = """@{
       long input = Math.Min((long)plan["input_ceiling"], checked((long)value + (long)count["padding"]));
       long bound = checked(input + checked((long)plan["output_limit"] * (long)plan["output_samples"]));
       foreach (JObject receipt in (JArray)plan["receipts"]) { receipt["reserved_tokens"] = bound; }
-      plan["input_ceiling"] = input; plan["algorithm"] = "provider_input_count_v1";
+      plan["input_ceiling"] = input; plan["input_reserve_tokens"] = input; plan["algorithm"] = "provider_input_count_v1";
       plan["count_status"] = "verified_upper_bound";
       return plan;
     } catch { return plan; }
@@ -758,7 +902,7 @@ USD_RESERVATION = """@{
       decimal amount;
       if ((string)plan["algorithm"] == "context_input_ceiling_v1"
         || (string)plan["algorithm"] == "provider_input_count_v1") {
-        long input = checked((long)plan["input_ceiling"]);
+        long input = checked((long)(plan["input_reserve_tokens"] ?? plan["input_ceiling"]));
         long output = checked((long)plan["output_limit"] * (long)plan["output_samples"]);
         amount = (input * maxInputRate + output * maxOutputRate) / 100000000000000m;
       } else if ((string)plan["algorithm"] == "request_total_ceiling_v1") {
@@ -790,9 +934,20 @@ RESERVATION = """@{
         || !JToken.DeepEquals(state["scope"], receipt["identity"]["scope"])) { return result; }
       var mode = (string)state["budget_mode"] ?? "tokens";
       if (mode != "tokens" && mode != "usd") { return result; }
+      if (state["require_verified_bound"] != null && state["require_verified_bound"].Type != JTokenType.Null
+        && state["require_verified_bound"].Type != JTokenType.Boolean) { return result; }
       if (mode == "usd" && (state["enabled"]?.Type != JTokenType.Boolean || !(bool)state["enabled"]
         || state["enforce"]?.Type != JTokenType.Boolean)) {
         result["error"] = "budget_consumer_disabled"; return result;
+      }
+      if ((bool?)state["require_verified_bound"] == true && (bool?)state["enabled"] == true
+        && (bool?)state["enforce"] == true) {
+        var plan = context.Variables.GetValueOrDefault<JObject>("executionPlan", null);
+        if ((string)plan?["count_assurance"] != "verified_upper_bound") {
+          result["snapshot"] = state.DeepClone();
+          result["error"] = "budget_count_bound_unavailable";
+          return result;
+        }
       }
       JObject priceEvidence = null;
       string priceEtag = null;
@@ -1436,10 +1591,28 @@ def _deny(
       var snapshot = prepared["snapshot"] as JObject ?? new JObject();
       var plan = context.Variables.GetValueOrDefault<JObject>("executionPlan", new JObject());
       var receipt = context.Variables.GetValueOrDefault<JObject>("executionReceipt", new JObject());
+      var analysis = plan["request_analysis"] as JObject;
       return new JObject(new JProperty("code", (string)context.Variables["executionError"]), new JProperty("error_path", plan["error_path"]),
         new JProperty("limit", snapshot["token_limit"]), new JProperty("confirmed", snapshot["confirmed_tokens"]),
         new JProperty("active_reserved", snapshot["active_reserved_tokens"]), new JProperty("upper_bound", snapshot["upper_bound_tokens"]),
         new JProperty("request_bound", receipt["reserved_tokens"]), new JProperty("algorithm", plan["algorithm"]),
+        new JProperty("count_assurance", plan["count_assurance"]),
+        new JProperty("body_bytes_estimate", plan["body_bytes_estimate"]),
+        new JProperty("non_media_body_bytes_estimate", plan["non_media_body_bytes_estimate"]),
+        new JProperty("input_ceiling", plan["input_ceiling"]),
+        new JProperty("input_reserve_tokens", plan["input_reserve_tokens"]),
+        new JProperty("output_field", plan["output_field"]),
+        new JProperty("output_limit", plan["output_limit"]),
+        new JProperty("output_samples", plan["output_samples"]),
+        new JProperty("output_reserve_tokens", plan["output_reserve_tokens"]),
+        new JProperty("required_features", plan["required_features"]),
+        new JProperty("remote_content", analysis?["remote_content"]),
+        new JProperty("inline_media_count", plan["inline_media_count"]),
+        new JProperty("inline_media_bytes", plan["inline_media_bytes"]),
+        new JProperty("remote_media_count", plan["remote_media_count"]),
+        new JProperty("remote_media_bytes", plan["remote_media_bytes"]),
+        new JProperty("media_sources", plan["media_sources"]),
+        new JProperty("media_reserve_tokens", plan["media_reserve_tokens"]),
         new JProperty("ledger_version", snapshot["version"]), new JProperty("ledger_updated_at", snapshot["updated_at"]));
     }""",
     )
@@ -1627,9 +1800,12 @@ def _admission() -> ET.Element:
         "executionDispatch",
         """@{
       var plan = (JObject)context.Variables["executionPlan"];
-      var now = (DateTime)context.Variables["requestStarted"];
+      var admissionStarted = DateTime.UtcNow;
+      foreach (JObject receipt in (JArray)plan["receipts"]) {
+        receipt["identity"]["admitted_at"] = admissionStarted.ToString("o");
+      }
       var counting = new JObject();
-      foreach (var field in new[] { "algorithm", "count_assurance", "body_bytes_estimate", "contract_sha256", "required_features", "input_ceiling", "output_limit", "output_samples", "input_estimate", "count_status", "count_fingerprint" }) {
+      foreach (var field in new[] { "algorithm", "count_assurance", "body_bytes_estimate", "non_media_body_bytes_estimate", "inline_media_count", "inline_media_bytes", "remote_media_count", "remote_media_bytes", "media_sources", "media_reserve_tokens", "input_reserve_tokens", "output_reserve_tokens", "contract_sha256", "required_features", "input_ceiling", "output_limit", "output_samples", "input_estimate", "count_status", "count_fingerprint" }) {
         if (plan[field] != null) { counting[field] = plan[field].DeepClone(); }
       }
       return new JObject(new JProperty("owner", Guid.NewGuid().ToString()),
@@ -1637,7 +1813,7 @@ def _admission() -> ET.Element:
         new JProperty("recovery_complete", false),
         new JProperty("counting_basis", counting),
         new JProperty("receipts", plan["receipts"].DeepClone()), new JProperty("state", "preparing"),
-        new JProperty("expires_at", now.AddSeconds(45).ToString("o")), new JProperty("updated_at", now.ToString("o")));
+        new JProperty("expires_at", admissionStarted.AddSeconds(45).ToString("o")), new JProperty("updated_at", admissionStarted.ToString("o")));
     }""",
     )
     initial_dispatch = '@(((JObject)context.Variables["executionDispatch"]).DeepClone())'

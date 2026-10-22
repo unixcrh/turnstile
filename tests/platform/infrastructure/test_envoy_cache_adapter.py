@@ -29,6 +29,73 @@ def load_shipper() -> ModuleType:
     return module
 
 
+def load_entrypoint() -> ModuleType:
+    spec = importlib.util.spec_from_file_location(
+        "envoy_cache_entrypoint", ADAPTER / "entrypoint.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("body,expected", [
+    (b'{"model":"primary","number":900719925474099312345}',
+     b'{"model":"secondary","number":900719925474099312345}'),
+    (b'{"model":"primary","number":0.1234567890123456789012345}',
+     b'{"model":"secondary","number":0.1234567890123456789012345}'),
+    (b'{"nested":{"model":"nested"},"model":"primary","stream":true}',
+     b'{"nested":{"model":"nested"},"model":"secondary","stream":true}'),
+    (b' { "mo\\u0064el" : "primary", "text" : "primary" } \n',
+     b' { "mo\\u0064el" : "secondary", "text" : "primary" } \n'),
+])
+def test_pool_deployment_rewrite_preserves_all_other_request_bytes(
+    body: bytes, expected: bytes,
+) -> None:
+    assert load_entrypoint().rewrite_pool_deployment(body, "secondary") == expected
+
+
+@pytest.mark.parametrize("body,deployment", [
+    (b'{}', "secondary"),
+    (b'[]', "secondary"),
+    (b'{"model":12}', "secondary"),
+    (b'{"model":"one","model":"two"}', "secondary"),
+    (b'{"model":"one",}', "secondary"),
+    (b'{"model":"one"}extra', "secondary"),
+    (b'{"model":"one"}', "../other"),
+])
+def test_pool_deployment_rewrite_rejects_ambiguous_or_invalid_requests(
+    body: bytes, deployment: str,
+) -> None:
+    with pytest.raises(ValueError):
+        load_entrypoint().rewrite_pool_deployment(body, deployment)
+
+
+def test_pool_deployment_rewriter_is_loopback_only_and_fails_closed() -> None:
+    template = yaml.safe_load(
+        (ADAPTER / "envoy.yaml.template").read_text(encoding="utf-8")
+    )
+    config = template["static_resources"]
+    cluster = next(
+        item for item in config["clusters"] if item["name"] == "pool_deployment_rewriter"
+    )
+    address = cluster["load_assignment"]["endpoints"][0]["lb_endpoints"][0]["endpoint"]["address"]
+    assert address["socket_address"] == {"address": "127.0.0.1", "port_value": 9081}
+    listener = config["listeners"][0]
+    manager = listener["filter_chains"][0]["filters"][0]["typed_config"]
+    filters = manager["http_filters"]
+    lua = next(item for item in filters if item["name"] == "envoy.filters.http.lua")
+    metadata = next(item for item in filters
+                    if item["name"] == "envoy.filters.http.header_to_metadata")
+    assert filters.index(metadata) < filters.index(lua)
+    assert lua["typed_config"]["clear_route_cache"] is False
+    source = lua["typed_config"]["default_source_code"]["inline_string"]
+    assert 'metadata["adapter_authorized"] ~= "__ADAPTER_SHARED_KEY__"' in source
+    assert 'headers:remove("x-turnstile-pool-deployment")' in source
+    assert 'if not success or not result or result[":status"] ~= "200"' in source
+    assert 'handle:respond({[":status"] = "502"}' in source
+
+
 def access_row(**overrides: object) -> dict[str, object]:
     row: dict[str, object] = {
         "timestamp": "2026-08-15T01:02:03.000Z",

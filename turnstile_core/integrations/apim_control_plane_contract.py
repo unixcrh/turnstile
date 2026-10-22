@@ -239,6 +239,7 @@ class ApimClientSettings(Protocol):
 
     databricks_oauth_enabled: bool
     apim_principal_id: str | None
+    credential_encryption_key: SecretStr | None
     azure_subscription_id: str | None
     apim_resource_group: str | None
     apim_service_name: str | None

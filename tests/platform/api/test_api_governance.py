@@ -905,6 +905,41 @@ def test_people_budgets_support_server_paging_and_bulk_allocation() -> None:
         assert unavailable_model.status_code == 409
         assert "unavailable" in unavailable_model.json()["detail"]
 
+        # If an already-assigned model is later disabled in the catalog,
+        # list_user_model_policies / people() must exclude it so re-saving does not 409.
+        re_enabled_policy = client.post(
+            "/api/v1/budgets/users/bulk",
+            params={"period": period},
+            headers=headers,
+            json={
+                "department_id": "department-platform",
+                "selection": "ids",
+                "user_ids": ["test.user01@contoso.com"],
+                "status": "all",
+                "allocation_mode": "preserve",
+                "model_ids": [allowed_model_id],
+            },
+        )
+        assert re_enabled_policy.status_code == 200
+        target_model_row = next(
+            row for row in repository.models if str(row["id"]) == allowed_model_id
+        )
+        target_model_row["enabled"] = False
+        try:
+            after_disable = client.get(
+                "/api/v1/budgets/users",
+                params={
+                    "period": period,
+                    "department_id": "department-platform",
+                    "query": "test.user01",
+                },
+                headers=headers,
+            ).json()["items"][0]
+            assert after_disable["model_policy_configured"] is True
+            assert after_disable["allowed_model_ids"] == []
+        finally:
+            target_model_row["enabled"] = True
+
         overallocated = client.post(
             "/api/v1/budgets/users/bulk",
             params={"period": period},

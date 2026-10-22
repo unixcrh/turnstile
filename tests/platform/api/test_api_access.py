@@ -106,7 +106,21 @@ def test_every_business_api_route_requires_the_shared_session_dependency() -> No
         route for route in copilot_protected.routes if isinstance(route, APIRoute)
     ]
 
-    assert len(apim_routes) == 144
+    assert len(apim_routes) == 150
+    pool_reads = {
+        route.path: route for route in apim_routes
+        if route.path in {
+            "/api/v1/model-management/backend-pools",
+            "/api/v1/model-management/models/{item_id}/backend-pool/candidates",
+        }
+    }
+    assert len(pool_reads) == 2
+    assert all(route.methods == {"GET"} for route in pool_reads.values())
+    candidates = pool_reads[
+        "/api/v1/model-management/models/{item_id}/backend-pool/candidates"
+    ]
+    assert any(dependency.call is require_publication_owner
+               for dependency in candidates.dependant.dependencies)
     availability_routes = [route for route in apim_routes if "availability" in route.path]
     assert len(availability_routes) == 5
     for route in availability_routes:

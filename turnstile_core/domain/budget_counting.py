@@ -147,6 +147,13 @@ class ProtocolCountContract(StrictModel):
     output_field: Literal["max_tokens", "max_completion_tokens", "max_output_tokens", "none"]
     request_token_ceiling: int | None = Field(default=None, gt=0, le=2**63 - 1, strict=True)
     output_estimate: int | None = Field(default=None, gt=0, le=2**63 - 1, strict=True)
+    multimodal_item_ceiling: int | None = Field(
+        default=None, gt=0, le=2**63 - 1, strict=True,
+        exclude_if=lambda value: value is None,
+    )
+    require_verified_bound: bool = Field(
+        default=False, exclude_if=lambda value: value is False,
+    )
     supported_features: list[BudgetRequestFeature] = Field(default_factory=list)
     operations: tuple[BudgetOperation, ...] = Field(
         default=("chat-completions", "responses", "anthropic-messages"),
@@ -184,7 +191,8 @@ class ProtocolCountContract(StrictModel):
             raise ValueError("Request controls require a compatible Responses output contract")
         if self.algorithm == "legacy_request_estimate_v1":
             if (
-                self.output_estimate is None or self.native_counter is not None
+                self.require_verified_bound
+                or self.output_estimate is None or self.native_counter is not None
                 or self.input_ceiling or self.output_ceiling
                 or self.request_token_ceiling is not None
                 or (self.output_field == "none") != all(
@@ -210,6 +218,7 @@ class ProtocolCountContract(StrictModel):
                 self.request_token_ceiling is None
                 or self.output_field != "none"
                 or self.native_counter is not None
+                or self.multimodal_item_ceiling is not None
             ):
                 raise ValueError("A whole-request ceiling preserves provider output parameters")
         elif (
@@ -221,6 +230,13 @@ class ProtocolCountContract(StrictModel):
                 value in self.operations for value in ("responses-compact", "images-generations")
             )
             or self.request_token_ceiling is not None
+            or (
+                self.multimodal_item_ceiling is not None
+                and (
+                    "multimodal_input" not in self.supported_features
+                    or self.multimodal_item_ceiling > self.input_ceiling
+                )
+            )
         ):
             raise ValueError("Input counting requires a valid enforced text output ceiling")
         return self
@@ -291,12 +307,16 @@ class BudgetPublicationContracts(StrictModel):
         previous: GatewayPublication | None = None,
         *,
         new_model_key: str | None = None,
+        inherited_publications: Sequence[GatewayPublication] = (),
     ) -> BudgetPublicationContracts:
         if (
             fence.get("protocol_version") != 2 or fence.get("mode") != "active"
             or fence.get("gateway_profile_id") != str(publication.gateway_profile_id)
         ):
             raise ValueError("Budget publication requires its active Gateway fence")
+        require_verified_bound = fence.get("require_verified_bound", False)
+        if not isinstance(require_verified_bound, bool):
+            raise ValueError("Gateway fence verified bound requirement must be a boolean")
         epoch = UUID(str(fence.get("epoch")))
         raw_contracts = fence.get("model_contracts")
         if not isinstance(raw_contracts, dict):
@@ -331,7 +351,33 @@ class BudgetPublicationContracts(StrictModel):
         )
         for binding in publication.desired_spec.bindings:
             alias = binding.model.model_key
+            prior_snapshot = inherited
             prior = inherited.model_contracts.get(alias) if inherited is not None else None
+            if prior is None and alias not in raw_contracts:
+                for source in inherited_publications:
+                    saved = source.resource_manifest.get("budget_contracts")
+                    if saved is None:
+                        continue
+                    candidate = cls.model_validate(saved)
+                    if alias not in candidate.model_contracts:
+                        continue
+                    candidate.validate_publication(source)
+                    if (
+                        source.status.value != "active"
+                        or candidate.gateway_profile_id != publication.gateway_profile_id
+                        or candidate.epoch != epoch
+                    ):
+                        raise ValueError(
+                            "Inherited model contracts require an active Gateway publication epoch"
+                        )
+                    prior_snapshot = candidate
+                    prior = candidate.model_contracts[alias]
+                    if any(
+                        contract.verified_at > publication.created_at
+                        for contract in (prior, *prior.protocols.values())
+                    ):
+                        raise ValueError("Inherited model evidence must precede publication")
+                    break
             identity_hint = binding.logical_model_id
             if identity_hint is None and prior is not None:
                 identity_hint = prior.model_id
@@ -391,7 +437,8 @@ class BudgetPublicationContracts(StrictModel):
                 contracts[alias] = approved.contract.model_copy(deep=True)
             elif prior is not None and prior.model_id == model_id:
                 if (
-                    inherited is not None and inherited.binding_sha256.get(alias) != digest
+                    prior_snapshot is not None
+                    and prior_snapshot.binding_sha256.get(alias) != digest
                     and any(
                         contract.algorithm != "legacy_request_estimate_v1"
                         or contract.request_policy is not None
@@ -436,6 +483,13 @@ class BudgetPublicationContracts(StrictModel):
                 contracts[alias] = ModelCountContract.model_validate({
                     **contract.model_dump(), "protocols": protocols,
                 })
+            if require_verified_bound and any(
+                item.algorithm == "legacy_request_estimate_v1"
+                for item in (contracts[alias], *contracts[alias].protocols.values())
+            ):
+                raise ValueError(
+                    "Hard budget fence requires an approved verified count contract"
+                )
             digests[alias] = digest
         return cls(
             publication_id=publication.id, gateway_profile_id=publication.gateway_profile_id,

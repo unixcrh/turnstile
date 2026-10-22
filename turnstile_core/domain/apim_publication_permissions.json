@@ -28,6 +28,9 @@
     "Microsoft.ApiManagement/service/subscriptions/read",
     "Microsoft.ApiManagement/service/subscriptions/listSecrets/action"
   ],
+  "observer": [
+    "Microsoft.ApiManagement/service/namedValues/listValue/action"
+  ],
   "gateway_provision": [
     "Microsoft.Authorization/permissions/read",
     "Microsoft.ApiManagement/service/read",

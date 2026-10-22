@@ -214,6 +214,17 @@ def test_applications_use_two_level_inventory_and_detail_routes() -> None:
     assert "var(--muted)" in styles
 
 
+def test_application_summary_does_not_double_its_bottom_border() -> None:
+    styles = (FRONTEND_SOURCE / "styles/applications.css").read_text(encoding="utf-8")
+    facts_rule = re.search(r"\.application-facts \{([^}]+)\}", styles)
+    assert facts_rule is not None
+    assert "border-bottom:" not in facts_rule.group(1)
+    assert (
+        ".application-facts:not(:last-child) { border-bottom: 1px solid var(--border); }"
+        in styles
+    )
+
+
 def test_application_sync_exposes_every_enabled_apim_target() -> None:
     page = (FRONTEND_SOURCE / "pages/applications-page.tsx").read_text(encoding="utf-8")
     assert 'gateway.enabled && gateway.implementation === "apim"' in page

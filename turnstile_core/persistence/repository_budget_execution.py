@@ -55,7 +55,7 @@ class PostgreSqlBudgetExecutionMixin:
     def budget_execution_status(self, scope: LedgerScope) -> dict[str, Any] | None:
         with self._connection() as connection:
             row = connection.execute(
-                """SELECT epoch, state, policy_revision, policy_applied_revision
+                """SELECT epoch, state, budget_mode, policy_revision, policy_applied_revision
                    FROM budget_execution_scope WHERE scope_type = %s AND scope_id = %s
                    AND period_start = %s""",
                 (scope.scope_type, scope.scope_id, scope.period_start),
@@ -608,7 +608,11 @@ class PostgreSqlBudgetExecutionMixin:
                    LEFT JOIN budget_settlement_task task
                                          USING (scope_type, scope_id, period_start, attempt_key)
                    WHERE scope_type = %s AND scope_id = %s AND period_start = %s
-                     AND (%s OR task.id IS NULL OR task.applied_revision < task.revision)
+                     AND (execution.dispatch_id IS NOT NULL OR execution.usage_id IS NOT NULL)
+                     AND (%s OR task.id IS NULL OR task.applied_revision < task.revision
+                          OR (task.evidence_rank <> 3
+                              AND task.evidence_key NOT LIKE 'rejection:%%'
+                              AND task.evidence_key NOT LIKE 'resolution:%%'))
                    ORDER BY execution.admitted_at DESC, execution.attempt_key LIMIT %s""",
                 (scope.scope_type, scope.scope_id, scope.period_start,
                  include_resolved, max(1, min(limit, 20))),
@@ -773,7 +777,8 @@ class PostgreSqlBudgetExecutionMixin:
                 "AND attempt.period_start = scope.period_start "
                 "AND (attempt.dispatch_id IS NOT NULL OR attempt.usage_id IS NOT NULL) "
                 "AND (task.id IS NULL OR task.applied_revision < task.revision "
-                "OR (task.evidence_rank <> 3 AND task.evidence_key NOT LIKE 'rejection:%%'))) ",
+                "OR (task.evidence_rank <> 3 AND task.evidence_key NOT LIKE 'rejection:%%' "
+                "AND task.evidence_key NOT LIKE 'resolution:%%'))) ",
                 (scope.scope_type, scope.scope_id, scope.period_start,
                  update.epoch, update.revision, update.budget_mode),
             ).fetchone()

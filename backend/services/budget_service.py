@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime, time
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 from typing import Any, cast
@@ -11,6 +11,7 @@ from turnstile_core.domain.enterprise import (
     merge_application_owners,
     merge_observed_users,
 )
+from turnstile_core.domain.ledger import LedgerScope
 from turnstile_core.domain.models import (
     BudgetScopeType,
     DepartmentEnforcementWrite,
@@ -24,6 +25,10 @@ from turnstile_core.domain.models import (
     TokenBudgetWrite,
 )
 from turnstile_core.persistence.repository import BudgetConstraintViolation, QueryRepository
+from turnstile_core.services.budget_settlement import (
+    BudgetResolutionRepository,
+    BudgetStatusRepository,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +113,103 @@ class TokenBudgetService:
         if entity is None:
             raise BudgetNotFoundError(f"Unknown {scope_type} budget scope: {scope_id}")
         return entity
+
+    def _scope_needs_unit_switch(
+        self, user_id: str, period_start: date, target_mode: str
+    ) -> bool:
+        scope = LedgerScope(
+            scope_type="person", scope_id=user_id, period_start=period_start
+        )
+        if isinstance(self._repository, BudgetStatusRepository):
+            status = self._repository.budget_execution_status(scope)
+            if status is not None:
+                scope_mode = status.get("budget_mode")
+                applied = int(status.get("policy_applied_revision") or 0)
+                revision = int(status.get("policy_revision") or 0)
+                if scope_mode in {"tokens", "usd"}:
+                    if applied < revision and scope_mode != target_mode:
+                        return False
+                    if applied >= revision and scope_mode == target_mode:
+                        return False
+        return True
+
+    def _require_unit_switch_ready(
+        self,
+        period_start: date,
+        organization_id: str,
+        target_mode: str,
+        budgets: Mapping[tuple[str, str], Mapping[str, Any]],
+        entities: Mapping[BudgetScopeType, Sequence[EnterpriseEntity]],
+    ) -> None:
+        _, period_end = period_bounds(f"{period_start:%Y-%m}")
+        department_ids = {
+            entity.id
+            for entity in entities["department"]
+            if entity.parent_id == organization_id
+        } | {
+            scope_id
+            for (scope_type, scope_id), row in budgets.items()
+            if scope_type == "department" and row.get("parent_scope_id") == organization_id
+        }
+        user_ids = {
+            entity.id
+            for entity in entities["user"]
+            if entity.parent_id in department_ids
+        } | {
+            scope_id
+            for (scope_type, scope_id), row in budgets.items()
+            if scope_type == "user" and row.get("parent_scope_id") in department_ids
+        }
+        allocated_users = sorted(
+            user_id for user_id in user_ids if ("user", user_id) in budgets
+        )
+        switching_users = [
+            user_id
+            for user_id in allocated_users
+            if self._scope_needs_unit_switch(user_id, period_start, target_mode)
+        ]
+        if target_mode == "usd" and (switching_users or not allocated_users):
+            usage_rows = self._repository.token_usage_by_budget_scope(
+                datetime.combine(period_start, time.min, tzinfo=UTC),
+                datetime.combine(period_end, time.min, tzinfo=UTC),
+            )
+            for row in usage_rows:
+                row_scope = (row["scope_type"], row["scope_id"])
+                in_tree = (
+                    row_scope == ("organization", organization_id)
+                    or (row["scope_type"] == "department" and row["scope_id"] in department_ids)
+                    or (
+                        row["scope_type"] == "user"
+                        and row["scope_id"] in (set(switching_users) or user_ids)
+                    )
+                )
+                if in_tree and int(row.get("unpriced_usage_count") or 0) > 0:
+                    raise BudgetConflictError(
+                        "Cannot switch to USD budget while the period has unpriced usage"
+                    )
+        if isinstance(self._repository, BudgetResolutionRepository):
+            for user_id in switching_users:
+                scope = LedgerScope(
+                    scope_type="person", scope_id=user_id, period_start=period_start,
+                )
+                receipts = self._repository.budget_reservation_receipts(scope, limit=20)
+                if any(receipt.budget_mode != target_mode for receipt in receipts):
+                    raise BudgetConflictError(
+                        "Cannot switch budget unit while unresolved upper-bound reservations exist"
+                    )
+        finalizations = getattr(self._repository, "budget_reservation_finalizations", None)
+        if isinstance(finalizations, Mapping):
+            for item in finalizations.values():
+                if (
+                    getattr(item, "scope_type", None) == "person"
+                    and getattr(item, "period_start", None) == period_start
+                    and getattr(item, "scope_id", None) in switching_users
+                    and getattr(item, "finalization_kind", None) == "unverified_upper_bound"
+                    and getattr(item, "budget_mode", "tokens") != target_mode
+                ):
+                    raise BudgetConflictError(
+                        "Cannot switch budget unit while unresolved upper-bound reservations exist"
+                    )
 
     @staticmethod
     def _forecast_tokens(
@@ -442,13 +544,22 @@ class TokenBudgetService:
                 [item.scope_id for item in all_people]
             )
         }
+        enabled_model_ids = {
+            row["id"]
+            for row in self._repository.registry()["models"]
+            if row["enabled"]
+        }
         all_people = [
             item.model_copy(
                 update={
                     "model_policy_configured": item.scope_id in policies,
-                    "allowed_model_ids": policies.get(item.scope_id, {}).get(
-                        "model_ids", []
-                    ),
+                    "allowed_model_ids": [
+                        model_id
+                        for model_id in policies.get(item.scope_id, {}).get(
+                            "model_ids", []
+                        )
+                        if model_id in enabled_model_ids
+                    ],
                 }
             )
             for item in all_people
@@ -680,6 +791,9 @@ class TokenBudgetService:
             self._require_atomic_budget()
         if (scope_type == "organization" and previous is not None
             and previous.get("budget_mode", "tokens") != write.budget_mode):
+            self._require_unit_switch_ready(
+                period_start, scope_id, write.budget_mode, budgets, entities,
+            )
             try:
                 self._repository.switch_organization_budget(
                     period_start, scope_id, write.budget_mode, amount,

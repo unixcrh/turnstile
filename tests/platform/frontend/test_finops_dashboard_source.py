@@ -5,6 +5,25 @@ from tests.support.paths import (
 )
 
 
+def test_shared_tool_buttons_keep_styling_when_composed_as_triggers() -> None:
+    button = (FRONTEND_SOURCE / "components/ui/button.tsx").read_text(encoding="utf-8")
+    css = read_frontend_styles()
+    shared_rule = css.split('[data-slot="button"] {', 1)[1].split("}", 1)[0]
+
+    assert button.index("{...props}") < button.index("data-slot={slot}")
+    assert 'requestedSlot === "alert-dialog-action"' in button
+    assert 'requestedSlot === "alert-dialog-cancel"' in button
+    assert ': "button"' in button
+    assert "appearance: none;" in shared_rule
+    assert (
+        '[data-slot="button"][data-variant="ghost"] { '
+        "background: transparent; color: inherit; }" in css
+    )
+    assert '[data-slot="button"][data-variant="ghost"]:hover:not(:disabled)' in css
+    assert '[data-slot="button"][data-variant="ghost"][aria-expanded="true"]' in css
+    assert '[data-slot="button"]:focus-visible' in css
+
+
 def test_centered_page_loading_states_share_one_visual_scale() -> None:
     css = read_frontend_styles()
     shared_rule = css.split(

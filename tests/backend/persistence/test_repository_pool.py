@@ -4,6 +4,7 @@ import inspect
 from contextlib import contextmanager
 from typing import Any
 
+from turnstile_core.config import Settings
 from turnstile_core.persistence.repository import PostgreSqlOpsDbProxy, QueryRepository
 
 UNREACHABLE = "postgresql://nobody@127.0.0.1:1/does-not-exist"
@@ -25,6 +26,10 @@ def test_constructing_the_repository_does_not_connect() -> None:
     proxy = PostgreSqlOpsDbProxy(UNREACHABLE)
 
     assert proxy._pool_opened is False
+    assert proxy._apim_api_id == Settings.model_fields["apim_api_id"].default
+    configured = PostgreSqlOpsDbProxy(UNREACHABLE, apim_api_id="unit-configured-api")
+    assert configured._apim_api_id == "unit-configured-api"
+    assert configured._pool_opened is False
 
 
 class _Cursor:

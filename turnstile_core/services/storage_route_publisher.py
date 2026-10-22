@@ -8,7 +8,6 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 from datetime import UTC, datetime
 from functools import partial
-from hmac import compare_digest
 from threading import Lock
 from time import monotonic, time
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
@@ -100,8 +99,18 @@ from ..integrations.apim_target_client_factory import (
 )
 from ..integrations.gateway import _decision_usage, _openai_usage
 from ..integrations.image_generation import generated_image, image_usage
-from ..integrations.ledger import StorageTokenProvider, TableStorageLedger
+from ..integrations.ledger import TableStorageLedger
 from ..integrations.reconciliation import ManagedIdentityTokenProvider
+from ..integrations.route_credential_vault import (
+    RouteCredentialVault as RouteCredentialVault,
+)
+from ..integrations.route_credential_vault import (
+    VaultCheckpoint as _VaultCheckpoint,
+)
+from ..integrations.route_credential_vault import (
+    _CredentialBindings as _CredentialBindings,
+)
+from ..integrations.route_credential_vault import credential_bindings
 from ..integrations.storage_route_projection import (
     RouteActivationIntent,
     RouteProjectionConflict,
@@ -185,175 +194,6 @@ class _PreparationCheckpoint(RouteModel):
     oauth: dict[Identifier, _OAuthPreparation] = Field(
         default_factory=dict, max_length=10000, exclude_if=lambda value: not value,
     )
-
-
-class _CredentialBindings(RouteModel):
-    version: Literal[1] = 1
-    bindings: dict[Digest, str] = Field(max_length=10000)
-
-
-class _VaultCheckpoint(RouteModel):
-    version: Literal[1] = 1
-    publication_id: str
-    source_sha256: Digest
-    url: str
-    issued_epoch: EpochSeconds
-    body_ciphertext: str = Field(repr=False, min_length=1, max_length=131072)
-    body_sha256: Digest
-    secret_id: str | None = None
-
-
-class RouteCredentialVault:
-    def __init__(
-        self, origin: str, cipher: CredentialCipher, token_provider: StorageTokenProvider,
-        client: httpx.Client, *, clock: Callable[[], int] = lambda: int(time()),
-    ) -> None:
-        if not re.fullmatch(r"https://[a-z0-9-]{3,24}\.vault\.azure\.net", origin):
-            raise ValueError("ROUTE_CREDENTIAL_VAULT_ORIGIN_INVALID")
-        self._origin = origin
-        self._cipher = cipher
-        self._tokens = token_provider
-        self._client = client
-        self._clock = clock
-
-    def _request(self, method: str, url: str, body: str | None = None) -> httpx.Response:
-        address = urlsplit(url)
-        if (
-            address.scheme + "://" + address.netloc != self._origin
-            or address.query or address.fragment or method not in {"GET", "PUT"}
-            or not re.fullmatch(
-                r"/secrets/[a-zA-Z0-9-]{1,127}(?:/[0-9a-f]{32})?", address.path,
-            )
-        ):
-            raise ValueError("ROUTE_CREDENTIAL_REQUEST_TARGET_INVALID")
-        try:
-            with self._client.stream(
-                method, url, params={"api-version": "7.4"}, headers={
-                    "Authorization": "Bearer " + self._tokens.token("https://vault.azure.net"),
-                    "Content-Type": "application/json", "Accept-Encoding": "identity",
-                }, content=body.encode("utf-8") if body is not None else None,
-                timeout=10.0, follow_redirects=False,
-            ) as response:
-                raw = bytearray()
-                for chunk in response.iter_bytes():
-                    if len(raw) + len(chunk) > 131072:
-                        raise PolicyCompilationError("Route credential response is too large")
-                    raw.extend(chunk)
-                return httpx.Response(response.status_code, content=bytes(raw))
-        except httpx.HTTPError:
-            raise RetryablePublicationError(
-                "Route credential transport outcome is unconfirmed",
-            ) from None
-
-    def verify(self, secret_id: str, expected: SecretStr | None = None) -> SecretStr:
-        RouteCredential(mode="key_vault_bearer", header="Authorization", secret_id=secret_id)
-        response = self._request("GET", secret_id)
-        if response.status_code != 200:
-            raise PolicyCompilationError("Route credential version is unavailable")
-        try:
-            document = response.json()
-            attributes = document["attributes"]
-            value = document["value"]
-            valid = (
-                document["id"] == secret_id and isinstance(value, str) and bool(value)
-                and len(value.encode("utf-8")) <= 25600 and attributes.get("enabled") is True
-                and ("nbf" not in attributes or type(attributes["nbf"]) is int
-                     and attributes["nbf"] <= self._clock())
-                and ("exp" not in attributes or type(attributes["exp"]) is int
-                     and attributes["exp"] > self._clock())
-            )
-            if expected is not None:
-                valid = valid and compare_digest(
-                    value.encode("utf-8"), expected.get_secret_value().encode("utf-8"),
-                )
-        except (ValueError, KeyError, TypeError, AttributeError):
-            raise PolicyCompilationError("Route credential version readback is invalid") from None
-        if not valid:
-            raise PolicyCompilationError("Route credential version changed or is inactive")
-        return SecretStr(value)
-
-    def materialize(
-        self, publication_id: UUID, source: str, value: SecretStr,
-        *, checkpoint: Mapping[str, Any] | None,
-        persist: Callable[[Mapping[str, Any] | None, dict[str, Any]], None],
-    ) -> str:
-        if not re.fullmatch(r"[0-9a-f]{64}", source):
-            raise ValueError("ROUTE_CREDENTIAL_SOURCE_INVALID")
-        secret = value.get_secret_value()
-        if not secret or len(secret.encode("utf-8")) > 25600:
-            raise ValueError("ROUTE_CREDENTIAL_VALUE_INVALID")
-        url = self._origin + "/secrets/turnstile-route-" + publication_id.hex + "-" + source[:24]
-        tags = {"turnstile-publication": str(publication_id), "turnstile-source": source}
-        body = canonical_document({"value": secret, "tags": tags, "attributes": {"enabled": True}})
-        if checkpoint is None:
-            existing = self._request("GET", url)
-            if existing.status_code != 404:
-                raise PolicyCompilationError("Route credential name is not an unclaimed resource")
-            candidate = _VaultCheckpoint(
-                publication_id=str(publication_id), source_sha256=source, url=url,
-                issued_epoch=self._clock(),
-                body_ciphertext=self._cipher.encrypt(body).decode("ascii"),
-                body_sha256=text_digest(body),
-            )
-            persist(None, candidate.model_dump(mode="json"))
-            checkpoint = candidate.model_dump(mode="json")
-            try:
-                response = self._request("PUT", url, body)
-            except RetryablePublicationError:
-                response = None
-            if (
-                response is not None and response.status_code < 500
-                and response.status_code not in {200, 201, 202, 429}
-            ):
-                raise PolicyCompilationError("Route credential creation was rejected")
-        else:
-            try:
-                candidate = _VaultCheckpoint.model_validate_json(canonical_document(checkpoint))
-                restored = self._cipher.decrypt(candidate.body_ciphertext.encode("ascii"))
-            except ValueError:
-                raise ValueError("ROUTE_CREDENTIAL_CHECKPOINT_INVALID") from None
-            if (
-                candidate.publication_id != str(publication_id) or candidate.source_sha256 != source
-                or candidate.url != url or restored is None
-                or not compare_digest(restored.encode("utf-8"), body.encode("utf-8"))
-                or candidate.body_sha256 != text_digest(body)
-                or candidate.secret_id is not None and (
-                    candidate.secret_id.rsplit("/", 1)[0] != url
-                    or not re.fullmatch(r"[0-9a-f]{32}", candidate.secret_id.rsplit("/", 1)[-1])
-                )
-            ):
-                raise ValueError("ROUTE_CREDENTIAL_CHECKPOINT_CHANGED")
-        observed = self._request("GET", candidate.secret_id or url)
-        if observed.status_code != 200:
-            raise RetryablePublicationError("Route credential creation requires read-only recovery")
-        try:
-            document = observed.json()
-            secret_id = document["id"]
-            approved = RouteCredential(
-                mode="key_vault_bearer", header="Authorization", secret_id=secret_id,
-            )
-            attributes = document["attributes"]
-            valid = (
-                approved.secret_id.rsplit("/", 1)[0] == url
-                and document.get("tags") == tags
-                and attributes.get("enabled") is True
-                and ("nbf" not in attributes or type(attributes["nbf"]) is int
-                     and attributes["nbf"] <= self._clock())
-                and ("exp" not in attributes or type(attributes["exp"]) is int
-                     and attributes["exp"] > self._clock())
-                and isinstance(document.get("value"), str)
-                and compare_digest(document["value"].encode("utf-8"), secret.encode("utf-8"))
-                and candidate.secret_id in {None, secret_id}
-            )
-        except (ValueError, KeyError, TypeError, AttributeError):
-            raise PolicyCompilationError("Route credential readback is invalid") from None
-        if not valid:
-            raise PolicyCompilationError("Route credential readback differs from its source")
-        if candidate.secret_id is None:
-            persist(checkpoint, candidate.model_copy(update={"secret_id": secret_id}).model_dump(
-                mode="json",
-            ))
-        return str(secret_id)
 
 
 def register_verified_managed_program(
@@ -1893,6 +1733,12 @@ class FixedRoutePublisherFactory:
             publication, registry if registry is not None else self._repository.registry(),
             fence if fence is not None else self._active_fence(publication.gateway_profile_id),
             previous,
+            inherited_publications=tuple(
+                GatewayPublication.model_validate(row)
+                for row in self._repository.active_model_route_publications(
+                    publication.gateway_profile_id,
+                )
+            ) if publication.publication_kind is PublicationKind.ROUTE_RECONCILE else (),
         )
 
     @staticmethod
@@ -2043,12 +1889,7 @@ class FixedRoutePublisherFactory:
 
     @staticmethod
     def _credential_bindings(publication: GatewayPublication) -> dict[str, str]:
-        raw = publication.resource_manifest.get("route_credentials")
-        if raw is None:
-            return {}
-        if not isinstance(raw, dict):
-            raise PolicyCompilationError("Route credential bindings are invalid")
-        return _CredentialBindings.model_validate_json(canonical_document(raw)).bindings
+        return credential_bindings(publication.resource_manifest)
 
     def _prepare_credentials(
         self, publication: GatewayPublication, previous: GatewayPublication,
@@ -2530,6 +2371,10 @@ class FixedRoutePublisherFactory:
         public_headers: dict[str, str] = {}
         observer = bool(config.settings.apim_usage_observer_url)
         for source, member in zip(pool_member_bindings(binding), pool.members, strict=True):
+            deployment = source.model.upstream_model_id
+            deployment_override = deployment != binding.model.upstream_model_id
+            if deployment_override and not observer:
+                raise PolicyCompilationError("Deployment-specific pools require the Observer")
             origin = _binding_route_origin(source)
             address = urlsplit(str(source.backend_url))
             _, _, credential = _binding_route_contract(
@@ -2560,6 +2405,10 @@ class FixedRoutePublisherFactory:
                         ("x-turnstile-pool-runtime", "{{" + runtime_name + "}}"),
                     ]
                 )
+                if deployment_override:
+                    deployment_name = pool_header_name(installation.program.scope, deployment)
+                    public_headers[deployment_name] = deployment
+                    headers.append(("x-turnstile-pool-deployment", "{{" + deployment_name + "}}"))
             if credential.secret_id:
                 name = pool_credential_name(
                     source, installation.program.scope, credential.secret_id,
@@ -2592,6 +2441,11 @@ class FixedRoutePublisherFactory:
         snapshot = RouteBackendPool(
             members=tuple(members), rate_limit=pool.rate_limit,
             session_cookie_name=cookie, credential_versions=versions, header_values=public_headers,
+            configuration_sha256=(document_digest(pool) if any(
+                member.upstream_model_id is not None
+                and member.upstream_model_id != binding.model.upstream_model_id
+                for member in pool.members
+            ) else None),
         )
         services: dict[str, Any] = {"services": [
             {"id": resource_base + "/backends/" + member.backend_id,
@@ -2703,7 +2557,7 @@ class FixedRoutePublisherFactory:
             if prior is not None and connection.pool is not None:
                 requests = prior.intent.get("requests")
                 if (set(prior.intent) != {"requests"} or not isinstance(requests, dict)
-                        or not 0 < len(requests) <= 121):
+                    or not 0 < len(requests) <= 151):
                     raise PolicyCompilationError("Fixed route Pool request history is invalid")
                 for resource_id, intent in requests.items():
                     if not isinstance(intent, dict):
@@ -2733,7 +2587,7 @@ class FixedRoutePublisherFactory:
                         raise RetryablePublicationError(
                             "Fixed route Pool requires read-only recovery",
                         )
-                    if len(requests) >= 121:
+                    if len(requests) >= 151:
                         raise PolicyCompilationError("Fixed route Pool request limit exceeded")
                     requests[resource_id] = candidate_intent
                     candidate_intent = {"requests": requests}
@@ -2858,6 +2712,7 @@ class FixedRoutePublisherFactory:
         raw_task = manifest.get("route_configuration")
         snapshot: RouteSnapshot | None = None
         previous_head: ActiveRouteHead | None = None
+        previous_program_sha256: str | None = None
         if migration is not None:
             dependency_source = previous.model_copy(
                 update={"desired_spec": publication.desired_spec}
@@ -2883,6 +2738,14 @@ class FixedRoutePublisherFactory:
             previous_head.approval.require_same_configuration(snapshot.approval)
             snapshot = snapshot.model_copy(update={"approval": previous_head.approval})
             snapshot.require_valid(previous_head.activated_epoch)
+            prior_program = previous_head.approval.required_program_sha256
+            if prior_program != installation.program.program_sha256:
+                if prior_program not in {
+                    installation.legacy_program_sha256,
+                    *installation.predecessor_program_sha256,
+                }:
+                    raise PolicyCompilationError("Fixed route previous program is not approved")
+                previous_program_sha256 = prior_program
             dependency_source, dependency_snapshot = self._rollback_source(
                 publication, previous, installation, snapshot,
             )
@@ -2901,9 +2764,29 @@ class FixedRoutePublisherFactory:
             if migration is not None and port.projection.read_writer() is not None:
                 raise PolicyCompilationError("Fixed route migration partition already has a writer")
             proof = port._verifier.verify()
+            from .route_publication import pool_member_bindings
+
+            if any(
+                source.model.upstream_model_id != binding.model.upstream_model_id
+                for binding in publication.desired_spec.bindings
+                for source in pool_member_bindings(binding)
+            ):
+                port._verifier.require_deployment_pool_reader()
+                from ..integrations.gateway_connection_probe import verify_pool_deployment_observer
+
+                observer = config.settings.apim_usage_observer_url
+                key_name = config.settings.apim_usage_observer_key_named_value
+                if not observer or not key_name:
+                    raise PolicyCompilationError("Deployment-specific pools require the Observer")
+                management.verify_observer_permissions(key_name)
+                verify_pool_deployment_observer(
+                    port._client, str(observer),
+                    management.route_credential_value(key_name).get_secret_value(),
+                )
             publication, credentials = self._prepare_credentials(
                 publication, dependency_source, installation, management, worker_id, heartbeat,
             )
+            self._validate_pool_deployments(publication, management, port._client, installation)
             publication = self._prepare_oauth(
                 publication, dependency_source, installation, management, worker_id, heartbeat,
             )
@@ -2943,6 +2826,7 @@ class FixedRoutePublisherFactory:
                 installation.target_identity_sha256, self._clock(),
                 previous_members=snapshot.members if snapshot else (),
                 credential_bindings=credentials,
+                previous_program_sha256=previous_program_sha256,
             )
 
     def remove_model(
@@ -3109,126 +2993,85 @@ class FixedRoutePublisherFactory:
         management: FixedProgramManagement,
         client: httpx.Client,
         installation: FixedProgramInstallation,
-    ) -> None:
-        binding = publication.desired_spec.bindings[0]
+        *, binding: GatewayModelBinding | None = None,
+    ) -> dict[str, Any] | None:
+        from ..integrations.gateway_connection_probe import foundry_deployment_metadata
+        from .route_publication import route_credential_source
+
+        binding = binding or publication.desired_spec.bindings[0]
         project = binding.runtime_config.get("project_endpoint")
         if project is None:
-            return
-        address, origin = urlsplit(str(project)), urlsplit(str(binding.backend_url))
-        if (
-            address.scheme != "https"
-            or address.username
-            or address.password
-            or address.query
-            or address.fragment
-            or address.port is not None
-            or not re.fullmatch(r"/api/projects/[a-zA-Z0-9_.-]{1,128}", address.path)
-            or not address.hostname
-            or not origin.hostname
-            or not address.hostname.endswith(".services.ai.azure.com")
-            or address.hostname.removesuffix(".services.ai.azure.com")
-            != origin.hostname.removesuffix(".openai.azure.com").removesuffix(
-                ".services.ai.azure.com",
-            )
-        ):
-            raise PolicyCompilationError(
-                "Foundry deployment metadata target does not match connection"
-            )
-        deployment = binding.model.upstream_model_id
-        if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,128}", deployment):
-            raise PolicyCompilationError("Foundry deployment name is invalid")
-        if binding.auth_strategy in {
-            AuthStrategy.NAMED_VALUE_API_KEY,
-            AuthStrategy.NAMED_VALUE_BEARER,
-        }:
-            encrypted = self._repository.gateway_publication_credential(publication.id)
-            if encrypted is not None and self._cipher is not None:
-                key = self._cipher.decrypt(encrypted)
-                if key is None:
-                    raise PolicyCompilationError("Deployment metadata credential is unavailable")
-            elif binding.key_vault_secret_id is not None:
-                secret_id = str(binding.key_vault_secret_id)
-                self._require_credential_vault(secret_id, installation)
-                if self._cipher is None or installation.credential_vault_origin is None:
-                    raise PolicyCompilationError("Deployment credential vault is unavailable")
-                vault = RouteCredentialVault(
-                    installation.credential_vault_origin, self._cipher, self._tokens, client,
-                )
-                key = vault.verify(secret_id).get_secret_value()
-            else:
-                if not binding.named_value_name:
-                    raise PolicyCompilationError(
-                        "Deployment metadata credential source is unavailable"
+            return None
+
+        def headers() -> dict[str, str]:
+            assert binding is not None
+            if binding.auth_strategy in {
+                AuthStrategy.NAMED_VALUE_API_KEY,
+                AuthStrategy.NAMED_VALUE_BEARER,
+            }:
+                materialized_secret_id = (
+                    str(binding.key_vault_secret_id) if binding.key_vault_secret_id is not None
+                    else self._credential_bindings(publication).get(
+                        route_credential_source(binding),
                     )
-                key = management.route_credential_value(binding.named_value_name).get_secret_value()
-            headers = {"api-key": key}
-        elif binding.auth_strategy is AuthStrategy.MANAGED_IDENTITY:
-            headers = {
-                "Authorization": "Bearer "
-                + self._tokens.token(
-                    "https://ai.azure.com",
                 )
-            }
-        else:
-            raise PolicyCompilationError("Deployment metadata authentication is unsupported")
-        try:
-            with client.stream(
-                "GET",
-                str(project).rstrip("/") + "/deployments",
-                params={"api-version": "v1"},
-                headers=headers,
-                timeout=5,
-                follow_redirects=False,
-            ) as response:
-                raw = bytearray()
-                for chunk in response.iter_bytes():
-                    if len(raw) + len(chunk) > 1024 * 1024:
+                encrypted = self._repository.gateway_publication_credential(
+                    publication.id,
+                ) if materialized_secret_id is None else None
+                if encrypted is not None and self._cipher is not None:
+                    key = self._cipher.decrypt(encrypted)
+                    if key is None:
                         raise PolicyCompilationError(
-                            "Deployment metadata response exceeds its bound"
+                            "Deployment metadata credential is unavailable"
                         )
-                    raw.extend(chunk)
-                if response.status_code != 200:
-                    raise PolicyCompilationError(
-                        "Deployment validation failed: "
-                        + json.dumps(
-                            {
-                                "code": "deployment_metadata_unavailable",
-                                "deployment": deployment,
-                                "http_status": response.status_code,
-                            }
+                else:
+                    secret_id = materialized_secret_id
+                    if secret_id is None:
+                        raise PolicyCompilationError(
+                            "Deployment metadata requires a materialized credential"
                         )
+                    self._require_credential_vault(secret_id, installation)
+                    if self._cipher is None or installation.credential_vault_origin is None:
+                        raise PolicyCompilationError("Deployment credential vault is unavailable")
+                    vault = RouteCredentialVault(
+                        installation.credential_vault_origin, self._cipher, self._tokens, client,
                     )
-                document = json.loads(raw)
-        except PolicyCompilationError:
-            raise
-        except httpx.HTTPError:
-            raise RetryablePublicationError(
-                "Deployment metadata transport is unavailable"
-            ) from None
-        except (ValueError, TypeError):
-            raise PolicyCompilationError("Deployment metadata response is invalid") from None
-        items = document.get("value") if isinstance(document, dict) else None
-        if (
-            not isinstance(items, list)
-            or len(items) > 10000
-            or document.get("nextLink")
-            or any(
-                not isinstance(item, dict) or not isinstance(item.get("name"), str)
-                for item in items
-            )
-        ):
-            raise PolicyCompilationError("Deployment metadata is incomplete or invalid")
-        if not any(item["name"] == deployment for item in items):
-            raise PolicyCompilationError(
-                "Deployment validation failed: "
-                + json.dumps(
-                    {
-                        "code": "deployment_not_found",
-                        "deployment": deployment,
-                        "http_status": 404,
-                    }
+                    key = vault.verify(secret_id).get_secret_value()
+                return {"api-key": key}
+            if binding.auth_strategy is AuthStrategy.MANAGED_IDENTITY:
+                return {"Authorization": "Bearer " + self._tokens.token("https://ai.azure.com")}
+            raise PolicyCompilationError("Deployment metadata authentication is unsupported")
+
+        return foundry_deployment_metadata(
+            client, str(project), str(binding.backend_url),
+            binding.model.upstream_model_id, headers,
+        )
+
+    def _validate_pool_deployments(
+        self, publication: GatewayPublication, management: FixedProgramManagement,
+        client: httpx.Client, installation: FixedProgramInstallation,
+    ) -> None:
+        from ..integrations.gateway_connection_probe import foundry_model_identity
+        from .route_publication import pool_member_bindings
+
+        for binding in publication.desired_spec.bindings:
+            pool = binding.backend_pool
+            if pool is None or binding.provider_brand_key.value != "microsoft_foundry" or not any(
+                member.model_id is not None or (
+                    member.upstream_model_id is not None
+                    and member.upstream_model_id != binding.model.upstream_model_id
                 )
-            )
+                for member in pool.members
+            ):
+                continue
+            identities = {
+                foundry_model_identity(self._validate_deployment(
+                    publication, management, client, installation, binding=source,
+                ))
+                for source in pool_member_bindings(binding)
+            }
+            if len(identities) != 1:
+                raise PolicyCompilationError("Pool deployments must use the same model and version")
 
     def _remove_model_scopes(
         self, publication: GatewayPublication, source: GatewayPublication,
@@ -3624,6 +3467,10 @@ class FixedRoutePublisherFactory:
             installation = programs[0]
         if task.plan.program != installation.program:
             raise PolicyCompilationError("Fixed route task program changed")
+        if task.previous_program_sha256 is not None and task.previous_program_sha256 not in {
+            installation.legacy_program_sha256, *installation.predecessor_program_sha256,
+        }:
+            raise PolicyCompilationError("Fixed route previous program approval changed")
         if task.model_addition and not installation.model_additions_enabled:
             raise PolicyCompilationError("Single-model publication program is not installed")
         with self._open(
@@ -4094,6 +3941,8 @@ def promote_program_once(
 
 
 class FixedProgramManagement(Protocol):
+    def verify_observer_permissions(self, named_value_id: str) -> None: ...
+
     def current_revision(self) -> str | None: ...
 
     def revision_api_policy(self, revision: str) -> str: ...

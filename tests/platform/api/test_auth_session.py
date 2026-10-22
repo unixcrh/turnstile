@@ -1,16 +1,25 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 from uuid import UUID
 
+import jwt
 import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 
 from backend.api import app, get_entra_verifier
 from backend.http.session import get_auth_store
-from backend.services.auth_service import EntraIdentity, hash_password
+from backend.services.auth_service import (
+    AuthError,
+    EntraIdentity,
+    EntraTokenVerifier,
+    hash_password,
+)
 from tests.support.paths import REPOSITORY_ROOT
 from turnstile_core.config import Settings, get_settings
 
@@ -226,3 +235,50 @@ def test_member_login_uses_the_longer_member_policy() -> None:
     assert response.status_code == 200
     assert response.json()["role"] == "member"
     assert "Max-Age=14400" in response.headers["set-cookie"]
+
+
+@pytest.mark.parametrize(
+    "scenario", ["valid", "audience", "issuer", "domain", "expired", "signature", "unconfigured"]
+)
+def test_entra_configuration_keeps_token_verification_strict(
+    scenario: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    signing_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    now = datetime.now(UTC)
+    tenant_id = "00000000-0000-4000-8000-000000000002"
+    claims: dict[str, Any] = {
+        "aud": "unit-entra-client",
+        "iss": f"https://login.microsoftonline.com/{tenant_id}/v2.0",
+        "tid": tenant_id,
+        "iat": now,
+        "exp": now + timedelta(minutes=5),
+        "preferred_username": "owner@contoso.com",
+    }
+    verifier = EntraTokenVerifier(
+        client_id="" if scenario == "unconfigured" else "unit-entra-client",
+        allowed_email_domains=("contoso.com",),
+    )
+    monkeypatch.setattr(
+        verifier._jwks,
+        "get_signing_key_from_jwt",
+        Mock(return_value=SimpleNamespace(key=signing_key.public_key())),
+    )
+    if scenario == "audience":
+        claims["aud"] = "another-client"
+    elif scenario == "issuer":
+        claims["iss"] = "https://login.microsoftonline.com/another-tenant/v2.0"
+    elif scenario == "domain":
+        claims["preferred_username"] = "owner@contoso.com.example.test"
+    elif scenario == "expired":
+        claims["exp"] = now - timedelta(minutes=1)
+    elif scenario == "signature":
+        signing_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    token = jwt.encode(claims, signing_key, algorithm="RS256")
+
+    if scenario == "valid":
+        identity = verifier.verify(token)
+        assert identity.email == "owner@contoso.com"
+        assert identity.tenant_id == tenant_id
+    else:
+        with pytest.raises(AuthError):
+            verifier.verify(token)

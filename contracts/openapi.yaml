@@ -168,6 +168,10 @@ paths:
     $ref: ./openapi/paths/model-platform.yaml#/paths/~1api~1v1~1model-management~1models~1{item_id}
   /api/v1/model-management/models/{item_id}/backend-pool:
     $ref: ./openapi/paths/model-platform.yaml#/paths/~1api~1v1~1model-management~1models~1{item_id}~1backend-pool
+  /api/v1/model-management/backend-pools:
+    $ref: ./openapi/paths/model-platform.yaml#/paths/~1api~1v1~1model-management~1backend-pools
+  /api/v1/model-management/models/{item_id}/backend-pool/candidates:
+    $ref: ./openapi/paths/model-platform.yaml#/paths/~1api~1v1~1model-management~1models~1{item_id}~1backend-pool~1candidates
   /api/v1/model-management/releases:
     $ref: ./openapi/paths/model-platform.yaml#/paths/~1api~1v1~1model-management~1releases
   /api/v1/model-management/releases/{release_id}:
@@ -196,8 +200,12 @@ paths:
     $ref: ./openapi/paths/model-platform.yaml#/paths/~1api~1v1~1model-management~1gateways~1{gateway_profile_id}~1budget-execution-verification
   /api/v1/model-gateway/decision:
     $ref: ./openapi/paths/model-platform.yaml#/paths/~1api~1v1~1model-gateway~1decision
+  /api/v1/model-gateway/models:
+    $ref: ./openapi/paths/model-platform.yaml#/paths/~1api~1v1~1model-gateway~1models
   /api/v1/model-gateway/invoke:
     $ref: ./openapi/paths/model-platform.yaml#/paths/~1api~1v1~1model-gateway~1invoke
+  /api/v1/model-gateway/chat/completions:
+    $ref: ./openapi/paths/model-platform.yaml#/paths/~1api~1v1~1model-gateway~1chat~1completions
   /api/v1/model-gateway/images/generations:
     $ref: ./openapi/paths/model-platform.yaml#/paths/~1api~1v1~1model-gateway~1images~1generations
   /api/v1/traffic/plan:
@@ -370,8 +378,12 @@ paths:
     $ref: ./openapi/paths/model-router.yaml#/paths/~1api~1v1~1model-routers~1{router_id}~1disable
   /api/v1/model-routers/{router_id}/assignees:
     $ref: ./openapi/paths/model-router.yaml#/paths/~1api~1v1~1model-routers~1{router_id}~1assignees
+  /api/v1/model-routers/{router_id}/people:
+    $ref: ./openapi/paths/model-router.yaml#/paths/~1api~1v1~1model-routers~1{router_id}~1people
   /api/v1/model-routers/{router_id}/assignment:
     $ref: ./openapi/paths/model-router.yaml#/paths/~1api~1v1~1model-routers~1{router_id}~1assignment
+  /api/v1/model-routers/{router_id}/assignments:
+    $ref: ./openapi/paths/model-router.yaml#/paths/~1api~1v1~1model-routers~1{router_id}~1assignments
   /api/v1/assistant/conversations/{conversation_id}/router-proposals/{proposal_id}/confirm:
     $ref: ./openapi/paths/assistant.yaml#/paths/~1api~1v1~1assistant~1conversations~1{conversation_id}~1router-proposals~1{proposal_id}~1confirm
 components:
@@ -689,6 +701,14 @@ components:
       $ref: ./openapi/schemas/model-platform.yaml#/schemas/ImageInvocationRequest
     ImageInvocationResponse:
       $ref: ./openapi/schemas/model-platform.yaml#/schemas/ImageInvocationResponse
+    ChatCompletionsRequest:
+      $ref: ./openapi/schemas/common.yaml#/schemas/ChatCompletionsRequest
+    ChatCompletionsResponse:
+      $ref: ./openapi/schemas/common.yaml#/schemas/ChatCompletionsResponse
+    GatewayModelCatalogItem:
+      $ref: ./openapi/schemas/common.yaml#/schemas/GatewayModelCatalogItem
+    GatewayModelCatalogResponse:
+      $ref: ./openapi/schemas/common.yaml#/schemas/GatewayModelCatalogResponse
     ImageInvocationUsage:
       $ref: ./openapi/schemas/model-platform.yaml#/schemas/ImageInvocationUsage
     GeneratedImage:
@@ -715,6 +735,10 @@ components:
       $ref: ./openapi/schemas/model-platform.yaml#/schemas/GatewayBackendPoolMember
     GatewayBackendPoolConfig:
       $ref: ./openapi/schemas/model-platform.yaml#/schemas/GatewayBackendPoolConfig
+    GatewayBackendPoolCandidate:
+      $ref: ./openapi/schemas/model-platform.yaml#/schemas/GatewayBackendPoolCandidate
+    GatewayBackendPoolSummary:
+      $ref: ./openapi/schemas/model-platform.yaml#/schemas/GatewayBackendPoolSummary
     GatewayProviderTarget:
       $ref: ./openapi/schemas/model-platform.yaml#/schemas/GatewayProviderTarget
     GatewayRuntimeTarget:
@@ -1261,6 +1285,18 @@ components:
       $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterDecisionTrialResult
     ModelRouterAssignedList:
       $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterAssignedList
+    ModelRouterDepartmentAccessSummary:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterDepartmentAccessSummary
+    ModelRouterPersonAccessItem:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterPersonAccessItem
+    ModelRouterPeopleAccessResponse:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterPeopleAccessResponse
+    ModelRouterDepartmentAssignmentWrite:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterDepartmentAssignmentWrite
+    ModelRouterBulkAssignmentWrite:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterBulkAssignmentWrite
+    ModelRouterBulkAssignmentResult:
+      $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterBulkAssignmentResult
     ModelRouterAssignmentWrite:
       $ref: ./openapi/schemas/model-router.yaml#/schemas/ModelRouterAssignmentWrite
     ModelRouterAssignment:

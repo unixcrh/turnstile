@@ -204,10 +204,10 @@ export function FinOpsDashboard({
         {(entityQuery.error || registryQuery.error) && <ErrorState error={entityQuery.error ?? registryQuery.error} />}
         {entities && registryQuery.data && tab === "overview" && <ExecutiveOverview filters={filters} costAvailable={costAvailable} />}
         {entities && registryQuery.data && tab === "analytics" && <ModelUsage filters={filters} costAvailable={costAvailable} />}
-        {entities && tab === "trends" && <UsageTrends filters={filters} />}
+        {entities && registryQuery.data && tab === "trends" && <UsageTrends filters={filters} />}
         {entities && registryQuery.data && tab === "governance" && <Governance filters={filters} entities={entities} models={registryQuery.data.models} onOpenRequest={onOpenRequest} />}
         {entities && registryQuery.data && tab === "requests" && <RequestTrace filters={filters} models={registryQuery.data.models} />}
-        {entities && tab === "invoke" && <AgentInvocation entities={entities} />}
+        {entities && registryQuery.data && tab === "invoke" && <AgentInvocation entities={entities} />}
       </div>
     </div>
   </div>
@@ -1349,9 +1349,22 @@ const budgetAdmissionWarnings: Record<string, { title: string; detail: string; t
 };
 
 const routerDecisionLabels: Record<string, string> = {
+  model_based_selection: "AI 判路由选中",
   model_based_fallback: "安全回退",
   interaction_sticky: "复用首轮模型",
+  session_sticky: "会话粘性复用",
+  weighted_selection_success: "权重分流命中",
+  highest_priority_success: "最高优先级命中",
   fallback_success: "Fallback 命中",
+  cost_limit_exceeded: "单价超限跳过",
+  candidate_unavailable: "不可用跳过",
+  provider_error: "失败触发回退",
+};
+
+const stickyBoundByLabels: Record<string, string> = {
+  interaction: "x-interaction-id 绑定",
+  session: "x-session-id 绑定",
+  derived_interaction: "x-initiator 自动推导绑定",
 };
 
 const routerStrategyLabels: Record<string, string> = {
@@ -1360,16 +1373,24 @@ const routerStrategyLabels: Record<string, string> = {
   model_based: "模型判路由",
 };
 
+const conditionFieldLabels: Record<string, string> = {
+  task_type: "任务类型",
+  request_parameter: "请求内容",
+  prompt_length: "问题长度",
+  user_id: "用户标识",
+  required_capability: "所需能力",
+};
+
 const conditionOperatorLabels: Record<string, string> = {
   equals: "=",
   not_equals: "≠",
-  contains: "contains",
-  matches_any: "matches_any",
+  contains: "包含",
+  matches_any: "匹配任一关键词",
   greater_than: ">",
   greater_than_or_equal: "≥",
   less_than: "<",
   less_than_or_equal: "≤",
-  exists: "exists",
+  exists: "存在",
 };
 
 function RequestTraceDetail({
@@ -1382,11 +1403,6 @@ function RequestTraceDetail({
   models?: ManagedModel[];
 }) {
   const { user: sessionUser } = useAuth();
-  const selectedModelId = request.selected_model_id ?? (request.router_name ? request.model_id : null);
-  const backendPool = useQuery({
-    ...finopsQueries.modelBackendPool(selectedModelId),
-    enabled: Boolean(request.router_name && selectedModelId),
-  });
   const routerConfig = useQuery({
     ...finopsQueries.modelRouter(request.router_id),
     enabled: Boolean(request.router_id && sessionUser?.role === "owner"),
@@ -1449,8 +1465,17 @@ function RequestTraceDetail({
     (total, attempt) => total + (attempt.estimated_cost ?? 0), 0,
   );
   const routerStrategy = request.router_attempts[0]?.strategy_type;
+  const routerDecisionAttempt = request.router_attempts.find(
+    (attempt) => attempt.attempt_role === "routing_decision",
+  );
   const routerCandidateAttempts = request.router_attempts.filter(
     (attempt) => attempt.attempt_role !== "routing_decision",
+  );
+  const routerWinningAttempt = routerCandidateAttempts.find(
+    (attempt) => attempt.outcome === "succeeded",
+  ) ?? routerCandidateAttempts.at(-1);
+  const routerCandidateLatency = routerCandidateAttempts.reduce(
+    (total, attempt) => total + (attempt.latency_ms ?? 0), 0,
   );
   const conditionEvaluations = request.router_attempts.flatMap(
     (attempt) => attempt.condition_evaluations ?? [],
@@ -1462,35 +1487,102 @@ function RequestTraceDetail({
     && !routerConfig.data.has_unpublished_changes
     ? routerConfig.data.definition
     : null;
-  const tracedConditions = new Map(
+  const tracedConditionNodes = new Map(
     (tracedRouterDefinition?.nodes ?? [])
-      .filter((node) => node.type === "condition" && node.condition)
-      .map((node) => [node.id, node.condition!]),
+      .filter((node) => node.type === "condition")
+      .map((node) => [node.id, node]),
   );
-  const poolMembers = backendPool.data?.members ?? [];
-  const poolPriorities = new Set(poolMembers.map((member) => member.priority));
-  const poolWeights = new Set(poolMembers.map((member) => member.weight));
-  const poolMode = poolMembers.length < 2
-    ? null
-    : poolWeights.size === 1 && poolPriorities.size === 1
-      ? "均衡分流"
-      : poolWeights.size === 1 && poolPriorities.size === 2
-        ? "主备切换"
-        : "自定义分组";
-  const selectedPoolMember = poolMembers.find(
-    (member) => member.runtime_name === request.runtime,
-  );
-  const primaryPoolPriority = poolMembers.length
-    ? Math.min(...poolMembers.map((member) => member.priority))
-    : null;
-  const selectedPoolRole = selectedPoolMember && primaryPoolPriority != null
-    ? selectedPoolMember.priority === primaryPoolPriority ? "主 Runtime" : "备用 Runtime"
-    : null;
+  const isStickyHit = routerWinningAttempt?.decision_basis === "interaction_sticky"
+    || routerWinningAttempt?.decision_basis === "session_sticky";
+  const effectivePathLabel = isStickyHit
+    ? "会话粘性复用"
+    : conditionEvaluations.length > 0
+      ? `条件分支 → ${routerStrategyLabels[routerStrategy ?? ""] ?? "优先级顺序"}`
+      : (routerStrategyLabels[routerStrategy ?? ""] ?? "优先级顺序");
+  const totalTimelineMs = Math.max(1, routerTotalLatency || request.latency_ms || 1);
+  const decisionLatencyMs = routerDecisionAttempt?.latency_ms ?? 0;
+  const decisionLatencySharePct = routerDecisionAttempt
+    ? Math.min(100, (decisionLatencyMs / totalTimelineMs) * 100)
+    : 0;
+  const decisionOverheadLabel = routerDecisionAttempt
+    ? `${formatLatency(decisionLatencyMs)} (${decisionLatencySharePct.toFixed(1)}%)`
+    : isStickyHit
+      ? "0 ms (会话直达 · 0%)"
+      : conditionEvaluations.length > 0
+        ? "0 ms (条件直达 · 0%)"
+        : "0 ms (规则直达 · 0%)";
+  const ganttSpans = (() => {
+    const spans: Array<{
+      id: string;
+      stageLabel: string;
+      modelLabel: string;
+      detailLabel: string;
+      tone: "rule" | "decision" | "selected" | "skipped" | "failed";
+      startMs: number;
+      durationMs: number;
+      leftPct: number;
+      widthPct: number;
+      sharePct: number;
+    }> = [];
+    if (conditionEvaluations.length > 0) {
+      spans.push({
+        id: "gantt-condition",
+        stageLabel: "条件分支评估",
+        modelLabel: `${conditionEvaluations.length} 个规则节点`,
+        detailLabel: conditionEvaluations.map((ev) => ev.matched ? "命中 Match" : "未命中 Else").join(" → "),
+        tone: "rule",
+        startMs: 0,
+        durationMs: 0,
+        leftPct: 0,
+        widthPct: 2.2,
+        sharePct: 0,
+      });
+    } else if (!routerDecisionAttempt) {
+      spans.push({
+        id: "gantt-direct-rule",
+        stageLabel: isStickyHit ? "会话粘性路由" : "静态策略路由",
+        modelLabel: isStickyHit ? "复用首轮模型" : (routerStrategyLabels[routerStrategy ?? ""] ?? "优先级顺序"),
+        detailLabel: "内存零延时匹配",
+        tone: "rule",
+        startMs: 0,
+        durationMs: 0,
+        leftPct: 0,
+        widthPct: 2.2,
+        sharePct: 0,
+      });
+    }
+    let cursorMs = 0;
+    for (const attempt of request.router_attempts) {
+      const isDecision = attempt.attempt_role === "routing_decision";
+      const dur = Math.max(0, attempt.latency_ms ?? 0);
+      const start = cursorMs;
+      cursorMs += dur;
+      const share = (dur / totalTimelineMs) * 100;
+      const rawLeft = Math.min(97.5, (start / totalTimelineMs) * 100);
+      const rawWidth = dur > 0 ? Math.max(2.5, share) : 2.0;
+      const clampedWidth = Math.min(100 - rawLeft, rawWidth);
+      spans.push({
+        id: `gantt-attempt-${attempt.sequence}`,
+        stageLabel: isDecision ? "智能判路由" : attempt.outcome === "succeeded" ? "目标模型推理" : "候选回退/跳过",
+        modelLabel: attempt.model_name,
+        detailLabel: isDecision
+          ? (attempt.decision_protocol === "system_one" ? "System One 分类器" : "LLM JSON 分类器")
+          : (attempt.decision_basis && routerDecisionLabels[attempt.decision_basis] ? routerDecisionLabels[attempt.decision_basis] : `HTTP ${attempt.status_code ?? 200}`),
+        tone: isDecision ? "decision" : attempt.outcome === "succeeded" ? "selected" : attempt.outcome === "failed" || attempt.outcome === "latency_exceeded" ? "failed" : "skipped",
+        startMs: start,
+        durationMs: dur,
+        leftPct: rawLeft,
+        widthPct: clampedWidth,
+        sharePct: share,
+      });
+    }
+    return spans;
+  })();
   return <div className="trace-detail-content">
     <div className={`trace-detail-hero ${request.router_name ? "has-router" : ""}`}>
       <span className={request.status_code == null ? "" : requestTraceFailed(request) ? "failed" : "success"}>{request.status_code ?? "未知"}</span>
       {request.router_name && <div className="trace-detail-router"><small>Router</small><b>{request.router_name} · v{request.router_version}</b></div>}
-      <div><b>{request.model_name}</b><small>{new Date(request.timestamp).toLocaleString(getIntlLocale())}</small></div>
+      <div><b>{request.selected_model_name ?? request.model_name}</b><small>{new Date(request.timestamp).toLocaleString(getIntlLocale())}</small></div>
       <strong>{formatLatency(request.latency_ms)}</strong>
     </div>
     {errorMessage && <div className="trace-error"><CircleAlert size={15} /><div><b>{request.ingest_source === "policy" ? "策略拒绝" : "请求失败"}</b><span>{errorMessage}</span></div></div>}
@@ -1501,67 +1593,141 @@ function RequestTraceDetail({
       ["Gateway", request.gateway_status_code == null ? request.ingest_source === "platform" ? "网关记录未匹配" : "未知" : String(request.gateway_status_code)],
     ]} />}
     {request.router_name && <section className="trace-detail-section trace-router-decision">
-      <div className="trace-section-heading"><h3>Router 决策</h3><strong>{request.router_name} · v{request.router_version}</strong></div>
-      <div className="trace-routing-chain" aria-label="两阶段路由执行链">
-        <div className="trace-routing-stage" data-layer="router">
-          <div className="trace-routing-stage-label"><span>1</span><small>TURNSTILE</small></div>
-          <div className="trace-routing-stage-body">
-            <div><Workflow size={15} /><b>Router 选择逻辑模型</b><strong>请求证据</strong></div>
-            <p>{routerStrategyLabels[routerStrategy ?? ""] ?? "历史优先级策略"} → {request.selected_model_name ?? request.model_name}</p>
-            {conditionEvaluations.length > 0 && <div className="trace-routing-conditions">
-              {conditionEvaluations.map((evaluation) => {
-                const configuredCondition = tracedConditions.get(evaluation.node_id);
-                const comparisonValue = configuredCondition?.value;
-                return <span key={evaluation.node_id} data-matched={evaluation.matched}>
-                  <code>{evaluation.field} {conditionOperatorLabels[evaluation.operator] ?? evaluation.operator}{comparisonValue == null ? "" : ` ${String(comparisonValue)}`}</code>
-                  <b>{evaluation.matched ? "命中" : "未命中"}</b>
-                </span>;
-              })}
-            </div>}
-          </div>
+      <div className="trace-section-heading"><h3>Router 决策链路</h3><strong>{request.router_name} · v{request.router_version}</strong></div>
+      <dl className="trace-router-summary">
+        <div><dt>最终命中模型</dt><dd>{request.selected_model_name ?? request.model_name}</dd></div>
+        <div><dt>决策路径</dt><dd title={effectivePathLabel}>{effectivePathLabel}</dd></div>
+        <div><dt>判路由开销</dt><dd>{decisionOverheadLabel}</dd></div>
+        <div><dt>模型推理耗时</dt><dd>{formatLatency(routerCandidateLatency || request.latency_ms)}{routerCandidateAttempts.length > 1 ? ` (${routerCandidateAttempts.length} 次尝试)` : ""}</dd></div>
+        <div><dt>端到端耗时 / Token</dt><dd>{formatLatency(routerTotalLatency)} · {routerTotalTokens.toLocaleString(getIntlLocale())}</dd></div>
+        <div><dt>总估算费用</dt><dd>{costAvailable ? currency.format(routerTotalCost) : "未计价"}</dd></div>
+      </dl>
+      <div className="trace-router-gantt" aria-label="路由执行时序甘特图">
+        <div className="trace-router-gantt-title">
+          <b>阶段耗时甘特图 (Waterfall Timeline)</b>
         </div>
-        <div className="trace-routing-stage" data-layer="apim">
-          <div className="trace-routing-stage-label"><span>2</span><small>AZURE APIM</small></div>
-          <div className="trace-routing-stage-body">
-            <div><Network size={15} /><b>{backendPool.data ? "原生 Pool 选择物理 Runtime" : "APIM 选择物理 Runtime"}</b><strong>{backendPool.data ? "当前 Pool 映射" : "请求证据"}</strong></div>
-            <p>{request.selected_model_name ?? request.model_name} → {request.runtime}</p>
-            <dl className="trace-routing-pool-facts">
-              <div><dt>部署模式</dt><dd>{backendPool.isLoading ? "正在读取" : poolMode ?? "无生效 Pool"}</dd></div>
-              <div><dt>成员角色</dt><dd>{selectedPoolRole ?? "—"}</dd></div>
-              <div><dt>APIM 优先级</dt><dd>{selectedPoolMember ? selectedPoolMember.priority + 1 : "—"}</dd></div>
-            </dl>
-            <small>物理 Runtime 来自该请求的 Event Hub 记录；模式与优先级来自当前生效的 APIM 后端池配置。</small>
+        <div className="trace-router-gantt-board">
+          <div className="trace-router-gantt-scale" aria-hidden="true">
+            <span>0 ms</span>
+            <span>{formatLatency(Math.round(totalTimelineMs * 0.25))}</span>
+            <span>{formatLatency(Math.round(totalTimelineMs * 0.5))}</span>
+            <span>{formatLatency(Math.round(totalTimelineMs * 0.75))}</span>
+            <span>{formatLatency(totalTimelineMs)}</span>
+          </div>
+          <div className="trace-router-gantt-labels">
+            {ganttSpans.map((span) => <div className="trace-router-gantt-label" key={span.id} data-tone={span.tone} title={`${span.stageLabel} · ${span.modelLabel} (${span.detailLabel})`}>
+              <i className="trace-gantt-dot" aria-hidden="true" />
+              <span>{span.stageLabel}</span>
+              <small>{span.modelLabel.split(" · ")[0]}</small>
+            </div>)}
+          </div>
+          <div className="trace-router-gantt-canvas">
+            <div className="trace-router-gantt-grid" aria-hidden="true"><i /><i /><i /></div>
+            {ganttSpans.map((span) => <div className="trace-router-gantt-lane" key={span.id} data-tone={span.tone}>
+              <div
+                className="trace-router-gantt-bar"
+                style={{ left: `${span.leftPct}%`, width: `${span.widthPct}%` }}
+                title={`${span.stageLabel} (${span.modelLabel}): +${formatLatency(span.startMs)} → +${formatLatency(span.startMs + span.durationMs)} (${span.durationMs === 0 ? "< 1 ms" : formatLatency(span.durationMs)}, ${span.sharePct.toFixed(1)}%)`}
+              />
+            </div>)}
+          </div>
+          <div className="trace-router-gantt-metas">
+            {ganttSpans.map((span) => <div className="trace-router-gantt-meta" key={span.id} data-tone={span.tone}>
+              <strong>{span.durationMs === 0 ? "< 1 ms" : formatLatency(span.durationMs)}</strong>
+              <small>{span.durationMs === 0 ? "0.0%" : `${span.sharePct.toFixed(1)}%`}</small>
+            </div>)}
           </div>
         </div>
       </div>
-      <dl className="trace-router-summary">
-        <div><dt>最终模型</dt><dd>{request.selected_model_name ?? request.model_name}</dd></div>
-        <div><dt>选择策略</dt><dd>{routerStrategyLabels[routerStrategy ?? ""] ?? "历史优先级策略"}</dd></div>
-        <div><dt>尝试次数</dt><dd>{routerCandidateAttempts.length}</dd></div>
-        <div><dt>总决策耗时</dt><dd>{formatLatency(routerTotalLatency)}</dd></div>
-        <div><dt>总 Token</dt><dd>{routerTotalTokens.toLocaleString(getIntlLocale())}</dd></div>
-        <div><dt>总估算费用</dt><dd>{costAvailable ? currency.format(routerTotalCost) : "未计价"}</dd></div>
-      </dl>
+      {conditionEvaluations.length > 0 && <div className="trace-routing-conditions-block" aria-label="路由条件评估">
+        <div className="trace-subblock-header"><Workflow size={14} /><b>条件节点评估 (Condition)</b><span>{`共 ${conditionEvaluations.length} 项判断`}</span></div>
+        <div className="trace-routing-conditions">
+          {conditionEvaluations.map((evaluation) => {
+            const condNode = tracedConditionNodes.get(evaluation.node_id);
+            const nodeLabel = evaluation.node_label ?? condNode?.label ?? "Condition";
+            const comparisonValue = evaluation.expected !== undefined ? evaluation.expected : condNode?.condition?.value;
+            const fieldName = conditionFieldLabels[evaluation.field] ?? evaluation.field;
+            return <div className="trace-condition-eval-row" key={evaluation.node_id} data-matched={evaluation.matched}>
+              <div className="trace-condition-eval-main">
+                <b>{nodeLabel}</b>
+                <span className="trace-condition-expr">
+                  <span>{fieldName}</span>
+                  <code>({evaluation.field})</code>
+                  <span>{conditionOperatorLabels[evaluation.operator] ?? evaluation.operator}</span>
+                  {comparisonValue != null && <code>{String(comparisonValue)}</code>}
+                </span>
+              </div>
+              <div className="trace-condition-eval-right">
+                {evaluation.actual !== undefined && evaluation.actual !== null && <span className="trace-condition-actual" title={String(evaluation.actual)}><span>实测</span><code>{String(evaluation.actual).length > 36 ? `${String(evaluation.actual).slice(0, 36)}…` : String(evaluation.actual)}</code></span>}
+                <strong className="trace-condition-badge">{evaluation.matched ? "命中 Match" : "未命中 Else"}</strong>
+              </div>
+            </div>;
+          })}
+        </div>
+      </div>}
       <div className="trace-router-attempts" role="list" aria-label="模型路由器尝试链">
-        {request.router_attempts.map((attempt) => <div key={`${attempt.sequence}-${attempt.request_id ?? attempt.model_id}`} role="listitem" data-outcome={attempt.outcome}>
-          <span>{attempt.sequence}</span>
-          <div className="trace-router-attempt-identity"><b>{attempt.attempt_role === "routing_decision" ? "判路由调用" : attempt.outcome === "succeeded" ? "最终选中" : "候选调用"} · {attempt.model_name}</b><code>{attempt.request_id ?? "未发起模型请求"}</code>{attempt.decision_basis && routerDecisionLabels[attempt.decision_basis] && <small>{routerDecisionLabels[attempt.decision_basis]}</small>}{attempt.outcome !== "succeeded" && attempt.reason && <em>{attempt.reason}</em>}</div>
-          <dl className="trace-router-attempt-metrics"><div><dt>优先级</dt><dd>{attempt.priority ?? "—"}</dd></div><div><dt>权重</dt><dd>{attempt.weight ?? "—"}</dd></div><div><dt>Token</dt><dd>{attempt.total_tokens == null ? "—" : attempt.total_tokens.toLocaleString(getIntlLocale())}</dd></div><div><dt>费用</dt><dd>{attempt.estimated_cost == null ? "—" : currency.format(attempt.estimated_cost)}</dd></div><div><dt>状态</dt><dd>{attempt.status_code ? `HTTP ${attempt.status_code}` : attempt.outcome === "cost_limit_exceeded" ? "成本约束" : attempt.outcome === "unavailable" ? "不可用" : "未调用"}</dd></div><div><dt>耗时</dt><dd>{attempt.latency_ms == null ? "—" : formatLatency(attempt.latency_ms)}</dd></div></dl>
-          {attempt.attempt_role === "routing_decision" && attempt.decision_system && <details className="trace-router-decision-evidence">
-            <summary>判路由证据</summary>
-            <dl>
-              <div><dt>System SHA-256</dt><dd>{attempt.decision_system_sha256 ?? "—"}</dd></div>
-              <div><dt>输入</dt><dd>{attempt.decision_input_chars ?? 0} 字符 · {attempt.decision_input_sha256 ?? "—"}</dd></div>
-              <div><dt>输出</dt><dd>{attempt.decision_response_chars ?? 0} 字符 · {attempt.decision_response_sha256 ?? "—"}</dd></div>
-              {attempt.decision_protocol && <div><dt>决策协议</dt><dd>{attempt.decision_protocol === "system_one" ? "System One" : "LLM JSON"}</dd></div>}
-              {attempt.decision_confidence != null && <div><dt>置信度</dt><dd>{`${(attempt.decision_confidence * 100).toFixed(1)}%`}</dd></div>}
+        {request.router_attempts.map((attempt) => {
+          const isDecisionCall = attempt.attempt_role === "routing_decision";
+          const probEntries = attempt.decision_probabilities
+            ? Object.entries(attempt.decision_probabilities).sort((a, b) => b[1] - a[1])
+            : [];
+          return <div key={`${attempt.sequence}-${attempt.request_id ?? attempt.model_id}`} role="listitem" data-outcome={attempt.outcome} data-role={attempt.attempt_role ?? "candidate"}>
+            <div className="trace-router-attempt-header">
+              <span className="trace-attempt-seq">{attempt.sequence}</span>
+              <div className="trace-router-attempt-identity">
+                <div className="trace-attempt-title-row">
+                  <span className={`trace-attempt-role-tag ${isDecisionCall ? "decision" : attempt.outcome === "succeeded" ? "selected" : "candidate"}`}>
+                    {isDecisionCall ? "智能判路由" : attempt.outcome === "succeeded" ? "最终执行" : "候选跳过/失败"}
+                  </span>
+                  <b>{attempt.model_name}</b>
+                  {!isDecisionCall && attempt.decision_basis && attempt.decision_basis !== "model_based_selection" && routerDecisionLabels[attempt.decision_basis] && <small className="trace-attempt-basis-badge">{routerDecisionLabels[attempt.decision_basis]}</small>}
+                  {attempt.sticky_bound_by && stickyBoundByLabels[attempt.sticky_bound_by] && <small className="trace-attempt-protocol-badge" title={attempt.sticky_key ?? undefined}>{stickyBoundByLabels[attempt.sticky_bound_by]}</small>}
+                </div>
+                {attempt.outcome !== "succeeded" && attempt.reason && <em>{attempt.reason}</em>}
+              </div>
+              <code className="trace-attempt-reqid" title={attempt.request_id ?? undefined}>{attempt.request_id ?? "未发起模型请求"}</code>
+            </div>
+            <dl className="trace-router-attempt-metrics">
+              {isDecisionCall ? <>
+                <div><dt>步骤类型</dt><dd>路由分类器</dd></div>
+                <div><dt>判路由置信度</dt><dd>{attempt.decision_confidence != null ? `${(attempt.decision_confidence * 100).toFixed(1)}%` : "—"}</dd></div>
+                <div><dt>Token (入/出)</dt><dd>{attempt.total_tokens == null ? "—" : `${attempt.total_tokens.toLocaleString(getIntlLocale())} (${attempt.input_tokens ?? 0}/${attempt.output_tokens ?? 0})`}</dd></div>
+                <div><dt>判路由费用</dt><dd>{attempt.estimated_cost == null ? "—" : currency.format(attempt.estimated_cost)}</dd></div>
+                <div><dt>状态</dt><dd>{attempt.status_code ? `HTTP ${attempt.status_code}` : "未调用"}</dd></div>
+                <div><dt>决策耗时</dt><dd>{attempt.latency_ms == null ? "—" : formatLatency(attempt.latency_ms)}</dd></div>
+              </> : <>
+                <div><dt>候选优先级</dt><dd>{attempt.priority != null ? `P${attempt.priority}` : "—"}</dd></div>
+                <div><dt>{attempt.strategy_type === "weighted" ? "分流权重" : "路由限制"}</dt><dd>{attempt.strategy_type === "weighted" && attempt.weight != null ? `${attempt.weight}%` : attempt.max_cost_per_million != null ? `≤ $${attempt.max_cost_per_million}/M` : attempt.max_latency_ms != null ? `≤ ${attempt.max_latency_ms}ms` : "无额外上限"}</dd></div>
+                <div><dt>Token (入/出)</dt><dd>{attempt.total_tokens == null ? "—" : `${attempt.total_tokens.toLocaleString(getIntlLocale())} (${attempt.input_tokens ?? 0}/${attempt.output_tokens ?? 0})`}</dd></div>
+                <div><dt>推理费用</dt><dd>{attempt.estimated_cost == null ? "—" : currency.format(attempt.estimated_cost)}</dd></div>
+                <div><dt>状态</dt><dd>{attempt.status_code ? `HTTP ${attempt.status_code}` : attempt.outcome === "cost_limit_exceeded" ? "成本约束跳过" : attempt.outcome === "unavailable" ? "不可用" : "未调用"}</dd></div>
+                <div><dt>推理耗时</dt><dd>{attempt.latency_ms == null ? "—" : formatLatency(attempt.latency_ms)}</dd></div>
+              </>}
             </dl>
-            {attempt.decision_probabilities && Object.keys(attempt.decision_probabilities).length > 0 && <dl>
-              {Object.entries(attempt.decision_probabilities).map(([candidateId, prob]) => <div key={candidateId}><dt>{models.find((item) => item.id === candidateId)?.display_name ?? candidateId.slice(0, 8)}</dt><dd>{(prob * 100).toFixed(1)}%</dd></div>)}
-            </dl>}
-            <pre>{attempt.decision_system}</pre>
-          </details>}
-        </div>)}
+            {isDecisionCall && probEntries.length > 0 && <div className="trace-decision-prob-list" aria-label="候选模型判路由概率">
+              <div className="trace-decision-prob-header"><span>候选模型得分分布</span>{attempt.decision_confidence != null && <small>{`置信度 ${(attempt.decision_confidence * 100).toFixed(1)}%`}</small>}</div>
+              {probEntries.map(([candidateId, prob]) => {
+                const candidateName = models.find((item) => item.id === candidateId)?.display_name ?? candidateId.slice(0, 8);
+                const isWinner = candidateId === attempt.selected_candidate_model_id;
+                return <div className={`trace-decision-prob-row ${isWinner ? "winner" : ""}`} key={candidateId}>
+                  <span className="trace-decision-prob-name"><b>{candidateName}</b>{isWinner && <em>选中</em>}</span>
+                  <div className="trace-decision-prob-bar"><i style={{ width: `${Math.max(2, Math.min(100, prob * 100))}%` }} /></div>
+                  <strong className="trace-decision-prob-val">{(prob * 100).toFixed(1)}%</strong>
+                </div>;
+              })}
+            </div>}
+            {isDecisionCall && attempt.decision_system && <details className="trace-router-decision-evidence">
+              <summary>查看判路由指令与校验摘要 (SHA-256)</summary>
+              <dl>
+                <div><dt>决策协议</dt><dd>{attempt.decision_protocol === "system_one" ? "System One" : "LLM JSON"}</dd></div>
+                <div><dt>输入摘要</dt><dd title={attempt.decision_input_sha256 ?? undefined}>{`${attempt.decision_input_chars ?? 0} 字符 · ${attempt.decision_input_sha256 ? `${attempt.decision_input_sha256.slice(0, 12)}…` : "—"}`}</dd></div>
+                <div><dt>输出摘要</dt><dd title={attempt.decision_response_sha256 ?? undefined}>{`${attempt.decision_response_chars ?? 0} 字符 · ${attempt.decision_response_sha256 ? `${attempt.decision_response_sha256.slice(0, 12)}…` : "—"}`}</dd></div>
+                <div><dt>System SHA-256</dt><dd title={attempt.decision_system_sha256 ?? undefined}>{attempt.decision_system_sha256 ? `${attempt.decision_system_sha256.slice(0, 16)}…` : "—"}</dd></div>
+              </dl>
+              <pre>{attempt.decision_system}</pre>
+            </details>}
+          </div>;
+        })}
       </div>
     </section>}
     <section className="trace-detail-section">
@@ -1621,12 +1787,12 @@ export function RequestCostCalculation({ request }: { request: UsageRequestDetai
       {tier.input_range_source?.origin === "custom" && <span>管理员自定义</span>}
     </div>}
     <span className="trace-cost-unit">单价：USD / 百万 Tokens</span>
-    <div className="trace-cost-expression" role="math" aria-label={`${calculation.lowerBound ? "C ≥ " : ""}(${calculation.terms.map(term => `${labels[term.bucket]} ${number(term.tokens)} × ${rate(term.rate)}`).join(" + ")}) ÷ 1,000,000 = ${amount(calculation.calculatedCost)} USD`}>
+    <div className="trace-cost-expression" role="math" aria-label={`${calculation.lowerBound ? "C ≥ " : ""}(${calculation.terms.map(term => `${term.label ?? labels[term.bucket]} ${number(term.tokens)} × ${rate(term.rate)}`).join(" + ")}) ÷ 1,000,000 = ${amount(calculation.calculatedCost)} USD`}>
       {calculation.lowerBound && <span>C ≥</span>}
       <span className="trace-cost-fraction">
         <span className="trace-cost-numerator">{calculation.terms.map((term, index) => <span className="trace-cost-summand" key={term.bucket}>
           {index > 0 && <span aria-hidden="true">+</span>}
-          <span className="trace-cost-term"><small>{labels[term.bucket]}</small><span>{number(term.tokens)} × {rate(term.rate)}</span></span>
+          <span className="trace-cost-term"><small>{term.label ?? labels[term.bucket]}</small><span>{number(term.tokens)} × {rate(term.rate)}</span></span>
         </span>)}</span>
         <span className="trace-cost-denominator">{number(1_000_000)}</span>
       </span>

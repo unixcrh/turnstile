@@ -444,15 +444,16 @@ function ApplicationModelAccessDialog({ application, models, open, writeAvailabl
   onOpenChange: (open: boolean) => void
 }) {
   const queryClient = useQueryClient()
-  const [mode, setMode] = useState<"unrestricted" | "restricted">(application.model_policy_configured ? "restricted" : "unrestricted")
-  const [selected, setSelected] = useState(() => new Set(application.allowed_model_ids))
-  const [search, setSearch] = useState("")
   const enabledModels = models.filter((model) => model.enabled)
+  const enabledModelIds = useMemo(() => new Set(enabledModels.map((model) => model.id)), [enabledModels])
+  const [mode, setMode] = useState<"unrestricted" | "restricted">(application.model_policy_configured ? "restricted" : "unrestricted")
+  const [selected, setSelected] = useState(() => new Set(application.allowed_model_ids.filter((id) => enabledModelIds.has(id))))
+  const [search, setSearch] = useState("")
   const visibleModels = enabledModels.filter((model) => `${model.display_name} ${model.model_key}`.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase()))
   const mutation = useMutation({
     mutationFn: () => dataSource.updateGatewayApplicationModelAccess(application.id, {
       mode,
-      model_ids: mode === "restricted" ? [...selected] : [],
+      model_ids: mode === "restricted" ? [...selected].filter((id) => enabledModelIds.has(id)) : [],
     }),
     onSuccess: (value) => {
       queryClient.setQueryData(finopsKeys.gatewayApplication(application.id), value)

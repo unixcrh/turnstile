@@ -2,21 +2,29 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from abc import ABC, abstractmethod
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
+from turnstile_core.domain.enterprise import (
+    enterprise_catalog,
+    merge_application_owners,
+    merge_observed_users,
+)
 from turnstile_core.domain.model_router import (
     ModelRouter,
     ModelRouterAssignedList,
     ModelRouterAssignment,
     ModelRouterAssignmentWrite,
+    ModelRouterBulkAssignmentResult,
+    ModelRouterBulkAssignmentWrite,
     ModelRouterDecisionCandidatePreview,
     ModelRouterDecisionPreview,
     ModelRouterDecisionPreviewWrite,
@@ -25,40 +33,79 @@ from turnstile_core.domain.model_router import (
     ModelRouterDecisionTrialResult,
     ModelRouterDecisionTrialWrite,
     ModelRouterDefinition,
+    ModelRouterDepartmentAccessSummary,
     ModelRouterDuplicateWrite,
     ModelRouterListResponse,
     ModelRouterModelCatalog,
     ModelRouterModelReference,
     ModelRouterNode,
+    ModelRouterPeopleAccessResponse,
+    ModelRouterPersonAccessItem,
     ModelRouterReasoningEffort,
     ModelRouterStrategyModel,
     ModelRouterValidationIssue,
     ModelRouterValidationResult,
     ModelRouterWrite,
 )
+from turnstile_core.domain.models import ModelPrice
 from turnstile_core.domain.runtime_models import (
     ChatMessage,
     ChoiceQuestion,
     DecisionInvocationRequest,
     DecisionInvocationResponse,
+    GatewayModelCatalogItem,
+    GatewayModelCatalogResponse,
     InvocationMetadata,
     ModelInvocationRequest,
     ModelInvocationResponse,
+)
+from turnstile_core.integrations.router_table_projection import (
+    project_router_to_table_if_configured,
 )
 from turnstile_core.persistence.repository import QueryRepository
 
 from .runtime_service import ModelRuntimeService
 
 _USER_REQUEST_RE = re.compile(r"<userRequest>\s*(.*?)\s*</userRequest>", re.DOTALL)
+_CONTEXT_BLOCK_RE = re.compile(r"<context>.*?</context>", re.DOTALL | re.IGNORECASE)
+_CURRENT_DATETIME_RE = re.compile(
+    r"<current_datetime>.*?</current_datetime>\s*",
+    re.DOTALL | re.IGNORECASE,
+)
+_QUOTED_USER_MESSAGE_RE = re.compile(
+    r"(<user_message>\s*)(.*?)(\s*</user_message>)",
+    re.DOTALL | re.IGNORECASE,
+)
+_SDK_SYSTEM_PREFIX_END_MARKERS = (
+    "</system_notifications>",
+    "</custom_instructions>",
+    "</tools>",
+    "</environment_limitations>",
+    "</code_change_instructions>",
+)
+_SDK_SYSTEM_SUFFIX_START_MARKERS = (
+    "<memories>",
+    "<session_search_context>",
+    "<session_context>",
+    "<task_completion>",
+    "Your goal is to deliver complete, working solutions.",
+    "Use only tools exposed by this application.",
+    "Current page context:",
+    "Conversation history:",
+)
 _CATALOG_PLACEHOLDER = "{catalog}"
+logger = logging.getLogger(__name__)
+
 _DECISION_PROMPT_MAX_CHARS = 4_000
 _DECISION_TIMEOUT_MS = 5_000
+_DEFAULT_SESSION_STICKY_TTL_SECONDS = 1_800
+_DEFAULT_INTERACTION_STICKY_TTL_SECONDS = 300
 _DECISION_MAX_OUTPUT_TOKENS = 200
 _DECISION_REASONING_MAX_OUTPUT_TOKENS = 1_024
 _DEFAULT_DECISION_PROMPT = (
-    "You are Turnstile's model routing classifier. Select exactly one model "
-    "from the candidate catalog for the user's request. Respect capabilities, "
-    "context window, cost, and configured priority.\n\n"
+    "You are Turnstile's model routing classifier. Select the single best "
+    "model from the candidate catalog for the user's request based on each "
+    "candidate's description and unit cost.\n\n"
     "Candidate catalog:\n{catalog}\n\n"
     "Return only a JSON object with this shape: "
     '{"model_id":"<candidate UUID>","rationale":"<one short sentence>"}. '
@@ -66,7 +113,7 @@ _DEFAULT_DECISION_PROMPT = (
 )
 _DEFAULT_SYSTEM_ONE_INSTRUCTIONS = (
     "Select the single best candidate model for the user's request based on "
-    "each candidate's description, capabilities, context window, and cost/priority trade-offs."
+    "each candidate's description and unit cost."
 )
 
 
@@ -93,8 +140,25 @@ class ModelRouterNotFoundError(ValueError):
 
 
 class _ModelRouterLifecycleService(ABC):
-    def __init__(self, repository: QueryRepository) -> None:
+    def __init__(
+        self,
+        repository: QueryRepository,
+        project_model_access: Callable[[Sequence[str]], None] | None = None,
+    ) -> None:
         self._repository = repository
+        self._project_model_access = project_model_access
+
+    def _publish_assignee_model_access(self, user_ids: Sequence[str]) -> None:
+        if self._project_model_access is None or not user_ids:
+            return
+        try:
+            self._project_model_access(list(user_ids))
+        except Exception:
+            logger.warning(
+                "Router model access saved but not projected to ledger for %s people",
+                len(user_ids),
+                exc_info=True,
+            )
 
     @staticmethod
     @abstractmethod
@@ -195,14 +259,29 @@ class _ModelRouterLifecycleService(ABC):
         owner_email: str,
         role: str,
     ) -> ModelRouter:
+        existing = self._repository.get_model_router(router_id, owner_id)
         values = self._values(write, owner_email)
         self._assert_models_allowed(write.definition, owner_email, role)
         row = self._repository.update_model_router(router_id, owner_id, values)
         if row is None:
-            if self._repository.get_model_router(router_id, owner_id) is None:
+            if existing is None:
                 raise ModelRouterNotFoundError("Model router not found")
             raise ModelRouterConflictError("A model router with this name already exists")
-        return ModelRouter.model_validate(row)
+        updated = ModelRouter.model_validate(row)
+        if existing and str(existing.get("name", "")) != updated.name:
+            project_router_to_table_if_configured(
+                None,
+                self._repository,
+                deleted_id=router_id,
+                deleted_name=str(existing["name"]),
+            )
+            published_row = self._repository.get_published_model_router(router_id)
+            if published_row is not None:
+                project_router_to_table_if_configured(
+                    ModelRouter.model_validate(published_row),
+                    self._repository,
+                )
+        return updated
 
     def duplicate(
         self,
@@ -239,27 +318,47 @@ class _ModelRouterLifecycleService(ABC):
                 + "; ".join(issue.message for issue in result.issues)
             )
         router = self.get(router_id, owner_id)
-        for assignee in self._repository.list_model_router_assignees(router_id):
+        assignees = list(self._repository.list_model_router_assignees(router_id))
+        for assignee in assignees:
             self._assert_assignee_models(router.definition, assignee)
         row = self._repository.publish_model_router(router_id, owner_id, user_email)
         if row is None:
             raise ModelRouterNotFoundError("Model router not found")
-        return ModelRouter.model_validate(row)
+        published = ModelRouter.model_validate(row)
+        project_router_to_table_if_configured(published, self._repository)
+        self._publish_assignee_model_access([*assignees, user_email])
+        return published
 
     def disable(
         self, router_id: UUID, owner_id: UUID, user_email: str
     ) -> ModelRouter:
+        assignees = list(self._repository.list_model_router_assignees(router_id))
         row = self._repository.disable_model_router(router_id, owner_id, user_email)
         if row is None:
             router = self._repository.get_model_router(router_id, owner_id)
             if router is None:
                 raise ModelRouterNotFoundError("Model router not found")
             raise ModelRouterConflictError("Only a published model router can be disabled")
-        return ModelRouter.model_validate(row)
+        disabled = ModelRouter.model_validate(row)
+        project_router_to_table_if_configured(disabled, self._repository)
+        self._publish_assignee_model_access([*assignees, user_email])
+        return disabled
 
     def remove(self, router_id: UUID, owner_id: UUID) -> None:
+        existing = self._repository.get_model_router(router_id, owner_id)
+        assignees = list(self._repository.list_model_router_assignees(router_id))
         if not self._repository.delete_model_router(router_id, owner_id):
             raise ModelRouterNotFoundError("Model router not found")
+        project_router_to_table_if_configured(
+            None,
+            self._repository,
+            deleted_id=router_id,
+            deleted_name=str(existing["name"]) if existing else None,
+        )
+        creator = str(existing.get("created_by") or "") if existing else ""
+        self._publish_assignee_model_access(
+            [*assignees, *([creator] if creator else [])]
+        )
 
     def assigned(self, user_id: str) -> ModelRouterAssignedList:
         return ModelRouterAssignedList(
@@ -272,6 +371,119 @@ class _ModelRouterLifecycleService(ABC):
     def assignees(self, router_id: UUID, owner_id: UUID) -> Sequence[str]:
         self.get(router_id, owner_id)
         return list(self._repository.list_model_router_assignees(router_id))
+
+    def _directory_people(
+        self,
+        owner_email: str | None = None,
+        owner_name: str | None = None,
+    ) -> tuple[Sequence[tuple[str, str]], Sequence[tuple[str, str, str, str]]]:
+        catalog = merge_application_owners(
+            merge_observed_users(enterprise_catalog(), self._repository.observed_users()),
+            self._repository.application_owners(),
+        )
+        departments = [(dept.id, dept.name) for dept in catalog.departments]
+        dept_names = dict(departments)
+        fallback_dept_id = departments[0][0] if departments else "__unassigned__"
+        fallback_dept_name = dept_names.get(fallback_dept_id, "未分配")
+
+        raw_users = list(catalog.users)
+        if owner_email and not any(person.id == owner_email for person in raw_users):
+            raw_users.insert(
+                0,
+                type(raw_users[0])(
+                    id=owner_email,
+                    name=owner_name or owner_email,
+                    parent_id=fallback_dept_id,
+                )
+                if raw_users
+                else None,  # type: ignore[arg-type]
+            )
+            raw_users = [person for person in raw_users if person is not None]
+
+        resolved_users: list[tuple[str, str, str, str]] = []
+        for person in raw_users:
+            dept_id = (
+                person.parent_id
+                if person.parent_id and person.parent_id in dept_names
+                else fallback_dept_id
+            )
+            dept_name = dept_names.get(dept_id, fallback_dept_name)
+            resolved_users.append((person.id, person.name, dept_id, dept_name))
+        if not departments and resolved_users:
+            departments = [(fallback_dept_id, fallback_dept_name)]
+        return departments, resolved_users
+
+    def people(
+        self,
+        router_id: UUID,
+        owner_id: UUID,
+        owner_email: str,
+        owner_name: str | None = None,
+        *,
+        department_id: str | None = None,
+        query: str | None = None,
+        offset: int = 0,
+        limit: int = 50,
+    ) -> ModelRouterPeopleAccessResponse:
+        self.get(router_id, owner_id)
+        assigned_set = set(self._repository.list_model_router_assignees(router_id))
+        departments, resolved_users = self._directory_people(owner_email, owner_name)
+        normalized_query = (query or "").strip().casefold()
+        active_dept = (
+            department_id
+            if department_id and department_id != "all"
+            else None
+        )
+
+        dept_totals: Counter[str] = Counter()
+        dept_assigned: Counter[str] = Counter()
+        filtered: list[ModelRouterPersonAccessItem] = []
+
+        for user_id, user_name, dept_id, dept_name in resolved_users:
+            is_assigned = user_id in assigned_set
+            dept_totals[dept_id] += 1
+            if is_assigned:
+                dept_assigned[dept_id] += 1
+            if active_dept and dept_id != active_dept:
+                continue
+            if normalized_query and not (
+                normalized_query in user_name.casefold()
+                or normalized_query in user_id.casefold()
+                or normalized_query in dept_name.casefold()
+            ):
+                continue
+            filtered.append(
+                ModelRouterPersonAccessItem(
+                    id=user_id,
+                    name=user_name,
+                    department_id=dept_id,
+                    department_name=dept_name,
+                    assigned=is_assigned,
+                )
+            )
+
+        department_summaries = [
+            ModelRouterDepartmentAccessSummary(
+                id=dept_id,
+                name=dept_name,
+                total_users=dept_totals[dept_id],
+                assigned_users=dept_assigned[dept_id],
+            )
+            for dept_id, dept_name in departments
+            if dept_totals[dept_id] > 0
+        ]
+        matching_assigned = sum(1 for item in filtered if item.assigned)
+        return ModelRouterPeopleAccessResponse(
+            router_id=router_id,
+            total=len(filtered),
+            offset=offset,
+            limit=limit,
+            total_users=len(resolved_users),
+            assigned_count=sum(dept_assigned.values()),
+            matching_assigned_count=matching_assigned,
+            departments=department_summaries,
+            items=filtered[offset : offset + limit],
+        )
 
     def assign(
         self,
@@ -289,50 +501,125 @@ class _ModelRouterLifecycleService(ABC):
             router_id, write.user_id, write.assigned, changed_by
         ):
             raise ModelRouterNotFoundError("Published model router not found")
+        project_router_to_table_if_configured(router, self._repository)
+        self._publish_assignee_model_access([write.user_id])
         return ModelRouterAssignment(
             router_id=router_id,
             user_id=write.user_id,
             assigned=write.assigned,
         )
 
+    def assign_bulk(
+        self,
+        router_id: UUID,
+        write: ModelRouterBulkAssignmentWrite,
+        owner_id: UUID,
+        changed_by: str,
+        owner_name: str | None = None,
+    ) -> ModelRouterBulkAssignmentResult:
+        router = self.get(router_id, owner_id)
+        if router.status != "published":
+            raise ModelRouterConflictError("Only a published model router can be assigned")
+
+        effective: dict[str, bool] = {}
+        if write.all_matching_assigned is not None or write.department_assignments:
+            _, resolved_users = self._directory_people(changed_by, owner_name)
+            if write.all_matching_assigned is not None:
+                active_dept = (
+                    write.department_id
+                    if write.department_id and write.department_id != "all"
+                    else None
+                )
+                normalized_query = (write.query or "").strip().casefold()
+                for user_id, user_name, dept_id, dept_name in resolved_users:
+                    if active_dept and dept_id != active_dept:
+                        continue
+                    if normalized_query and not (
+                        normalized_query in user_name.casefold()
+                        or normalized_query in user_id.casefold()
+                        or normalized_query in dept_name.casefold()
+                    ):
+                        continue
+                    effective[user_id] = write.all_matching_assigned
+
+            for dept_write in write.department_assignments:
+                dept_query = (dept_write.query or "").strip().casefold()
+                for user_id, user_name, dept_id, dept_name in resolved_users:
+                    if dept_id != dept_write.department_id:
+                        continue
+                    if dept_query and not (
+                        dept_query in user_name.casefold()
+                        or dept_query in user_id.casefold()
+                        or dept_query in dept_name.casefold()
+                    ):
+                        continue
+                    effective[user_id] = dept_write.assigned
+
+        for change in write.changes:
+            effective[change.user_id] = change.assigned
+
+        if any(effective.values()):
+            self._assert_assignee_models(router.definition, changed_by)
+
+        if not effective:
+            return ModelRouterBulkAssignmentResult(
+                router_id=router_id,
+                updated_count=0,
+                assigned_count=len(self._repository.list_model_router_assignees(router_id)),
+            )
+
+        changed_users = self._repository.set_model_router_assignments_bulk(
+            router_id, effective, changed_by
+        )
+        if changed_users is None:
+            raise ModelRouterNotFoundError("Published model router not found")
+        project_router_to_table_if_configured(router, self._repository)
+        self._publish_assignee_model_access(changed_users)
+        return ModelRouterBulkAssignmentResult(
+            router_id=router_id,
+            updated_count=len(changed_users),
+            assigned_count=len(self._repository.list_model_router_assignees(router_id)),
+        )
+
     def _assert_assignee_models(
         self, definition: ModelRouterDefinition, user_id: str
     ) -> None:
+        del user_id
         requested = self._candidate_model_ids(definition)
-        policy = next(
-            (
-                row
-                for row in self._repository.list_user_model_policies([user_id])
-                if str(row["user_id"]) == user_id
-            ),
-            None,
-        )
-        assigned = (
-            {UUID(str(value)) for value in policy.get("model_ids", [])}
-            if policy
-            else set()
-        )
+        registry = self._repository.registry()
+        providers = {UUID(str(row["id"])): row for row in registry["providers"]}
+        runtimes = {UUID(str(row["id"])): row for row in registry["runtimes"]}
+        gateways = {UUID(str(row["id"])): row for row in registry["gateways"]}
         registry_models = {
-            UUID(str(model["id"])): model for model in self._repository.registry()["models"]
+            UUID(str(model["id"])): model for model in registry["models"]
         }
-        unavailable = {
-            model_id
-            for model_id in requested
-            if model_id not in registry_models
-            or not registry_models[model_id].get("enabled")
-            or "image_generation" in (registry_models[model_id].get("capabilities") or [])
-            or (
-                "decision" not in (registry_models[model_id].get("capabilities") or [])
-                and (
-                    (policy is not None and model_id not in assigned)
-                    or (policy is None and registry_models[model_id].get("assignment_required"))
+        for model_id in requested:
+            model = registry_models.get(model_id)
+            if model is None or not model.get("enabled"):
+                raise ModelRouterConflictError(
+                    "One or more candidate models are disabled or unavailable"
                 )
+            if "image_generation" in (model.get("capabilities") or []):
+                raise ModelRouterConflictError(
+                    "One or more candidate models are disabled or unavailable"
+                )
+            runtime = runtimes.get(UUID(str(model["runtime_id"])))
+            provider = providers.get(UUID(str(model["provider_id"])))
+            gateway = (
+                gateways.get(UUID(str(runtime["gateway_profile_id"])))
+                if runtime is not None and runtime.get("gateway_profile_id") is not None
+                else None
             )
-        }
-        if unavailable:
-            raise ModelRouterConflictError(
-                "The assignee must have access to every assignment-required candidate model"
-            )
+            if (
+                runtime is None
+                or not runtime.get("enabled")
+                or provider is None
+                or not provider.get("enabled")
+                or (gateway is not None and not gateway.get("enabled"))
+            ):
+                raise ModelRouterConflictError(
+                    "One or more candidate models are disabled or unavailable"
+                )
 
 
 class ModelRouterExecutionService:
@@ -344,11 +631,294 @@ class ModelRouterExecutionService:
         self._repository = repository
         self._runtime_service = runtime_service
 
-    def invoke(self, request: ModelInvocationRequest) -> ModelInvocationResponse:
+    def _callable_router_rows(
+        self,
+        user_id: str,
+        *,
+        include_published: bool = False,
+        allowed_model_ids: set[UUID] | None = None,
+    ) -> list[dict[str, Any]]:
+        rows_by_id: dict[UUID, dict[str, Any]] = {
+            UUID(str(row["id"])): dict(row)
+            for row in self._repository.list_assigned_model_routers(user_id)
+        }
+        if include_published and not rows_by_id:
+            for row in self._repository.list_published_model_routers():
+                rows_by_id.setdefault(UUID(str(row["id"])), dict(row))
+        if allowed_model_ids is None:
+            return list(rows_by_id.values())
+        filtered: list[dict[str, Any]] = []
+        for row in rows_by_id.values():
+            router = ModelRouter.model_validate(row)
+            cand_ids = ModelRouterService._candidate_model_ids(router.definition)
+            if cand_ids and cand_ids <= allowed_model_ids:
+                filtered.append(row)
+        return filtered
+
+    def _get_callable_router_row(
+        self,
+        router_id: UUID,
+        user_id: str,
+        *,
+        include_published: bool = False,
+        allowed_model_ids: set[UUID] | None = None,
+    ) -> dict[str, Any] | None:
+        row = self._repository.get_callable_model_router(router_id, user_id)
+        if row is None and include_published:
+            row = self._repository.get_published_model_router(router_id)
+        if row is None:
+            return None
+        if allowed_model_ids is not None:
+            router = ModelRouter.model_validate(row)
+            cand_ids = ModelRouterService._candidate_model_ids(router.definition)
+            if not cand_ids or not (cand_ids <= allowed_model_ids):
+                return None
+        return row
+
+    def list_gateway_models(
+        self,
+        user_id: str,
+        *,
+        include_published_routers: bool = False,
+        allowed_model_ids: set[UUID] | None = None,
+    ) -> GatewayModelCatalogResponse:
+        registry = self._repository.registry()
+        models_by_id = {
+            UUID(str(model["id"])): model for model in registry["models"]
+        }
+        providers_by_id = {
+            UUID(str(row["id"])): row for row in registry["providers"]
+        }
+        runtimes_by_id = {
+            UUID(str(row["id"])): row for row in registry["runtimes"]
+        }
+        callable_models = self._callable_models(registry, user_id)
+        router_rows = self._callable_router_rows(
+            user_id,
+            include_published=include_published_routers,
+            allowed_model_ids=allowed_model_ids,
+        )
+        catalog_items: list[GatewayModelCatalogItem] = []
+        for row in router_rows:
+            router = ModelRouter.model_validate(row)
+            ts = router.published_at or router.updated_at
+            created_epoch = int(ts.timestamp()) if ts is not None else 0
+            strategy_types = list(
+                dict.fromkeys(
+                    str(node.strategy_type)
+                    for node in router.definition.nodes
+                    if node.type == "strategy" and node.strategy_type
+                )
+            )
+            condition_fields = list(
+                dict.fromkeys(
+                    str(node.condition.field)
+                    for node in router.definition.nodes
+                    if node.type == "condition" and node.condition is not None
+                )
+            )
+            cand_names: list[str] = []
+            for node in router.definition.nodes:
+                if node.type == "candidate_models":
+                    for cand in node.candidates:
+                        m = models_by_id.get(cand.model_id)
+                        name = str(
+                            (m or {}).get("display_name")
+                            or (m or {}).get("model_key")
+                            or cand.model_id
+                        )
+                        if name not in cand_names:
+                            cand_names.append(name)
+            catalog_items.append(
+                GatewayModelCatalogItem(
+                    id=router.name,
+                    object="model",
+                    type="model_router",
+                    created=max(0, created_epoch),
+                    owned_by="turnstile-model-router",
+                    display_name=router.name,
+                    router_id=str(router.id),
+                    router_version=router.version,
+                    description=router.description,
+                    capabilities=[
+                        "chat",
+                        "tools",
+                        "intelligent_routing",
+                        "session_sticky",
+                    ],
+                    strategy_types=strategy_types,
+                    condition_fields=condition_fields,
+                    candidate_models=cand_names,
+                )
+            )
+        for model_id, model in sorted(
+            callable_models.items(),
+            key=lambda item: str(item[1].get("display_name") or item[1].get("model_key") or ""),
+        ):
+            capabilities = list(model.get("capabilities") or [])
+            if "decision" in capabilities:
+                continue
+            if allowed_model_ids is not None and model_id not in allowed_model_ids:
+                continue
+            provider = providers_by_id.get(UUID(str(model["provider_id"])))
+            runtime = runtimes_by_id.get(UUID(str(model["runtime_id"])))
+            created_at = model.get("created_at")
+            created_epoch = (
+                int(created_at.timestamp())
+                if created_at is not None and hasattr(created_at, "timestamp")
+                else 0
+            )
+            catalog_items.append(
+                GatewayModelCatalogItem(
+                    id=str(model.get("model_key") or model["display_name"]),
+                    object="model",
+                    type="model",
+                    created=max(0, created_epoch),
+                    owned_by=str((provider or {}).get("name") or "turnstile"),
+                    display_name=str(model["display_name"]),
+                    model_id=str(model_id),
+                    runtime=str((runtime or {}).get("name") or ""),
+                    capabilities=capabilities,
+                )
+            )
+        return GatewayModelCatalogResponse(object="list", data=catalog_items)
+
+    def resolve_invocation_target(
+        self, request: ModelInvocationRequest
+    ) -> ModelInvocationRequest:
+        if request.router_id is not None:
+            return request
+        registry = self._repository.registry()
+        models = registry["models"]
+        model_ids = {UUID(str(model["id"])) for model in models}
+        user_id = request.metadata.user_id
+        include_published = bool(
+            request.router_context.get("subscription_key_authenticated")
+        )
+        if request.model_id is not None:
+            if request.model_id in model_ids:
+                return request
+            if (
+                self._get_callable_router_row(
+                    request.model_id,
+                    user_id,
+                    include_published=include_published,
+                )
+                is not None
+                or self._repository.get_published_model_router(request.model_id)
+                is not None
+            ):
+                return request.model_copy(
+                    update={"router_id": request.model_id, "model_id": None}
+                )
+            return request
+        if request.runtime_id is not None:
+            return request
+        assigned_routers = self._callable_router_rows(
+            user_id,
+            include_published=include_published,
+        )
+        published_routers = list(self._repository.list_published_model_routers())
+        refs = [
+            value.strip()
+            for value in (request.metadata.model_id, request.metadata.model)
+            if isinstance(value, str) and value.strip()
+        ]
+        for ref in refs:
+            folded = ref.casefold()
+            matched_router = next(
+                (
+                    row
+                    for row in assigned_routers
+                    if str(row["id"]).casefold() == folded
+                    or str(row["name"]).strip().casefold() == folded
+                ),
+                None,
+            )
+            if matched_router is None:
+                matched_router = next(
+                    (
+                        row
+                        for row in published_routers
+                        if str(row["id"]).casefold() == folded
+                        or str(row["name"]).strip().casefold() == folded
+                    ),
+                    None,
+                )
+            if matched_router is not None:
+                return request.model_copy(
+                    update={
+                        "router_id": UUID(str(matched_router["id"])),
+                        "model_id": None,
+                    }
+                )
+            try:
+                ref_uuid = UUID(ref)
+            except ValueError:
+                ref_uuid = None
+            if (
+                ref_uuid is not None
+                and ref_uuid not in model_ids
+                and (
+                    self._get_callable_router_row(
+                        ref_uuid,
+                        user_id,
+                        include_published=include_published,
+                    )
+                    is not None
+                    or self._repository.get_published_model_router(ref_uuid)
+                    is not None
+                )
+            ):
+                return request.model_copy(
+                    update={"router_id": ref_uuid, "model_id": None}
+                )
+        callable_models = self._callable_models(registry, user_id)
+        for ref in refs:
+            folded = ref.casefold()
+            matched_model = next(
+                (
+                    model
+                    for model_id, model in callable_models.items()
+                    if str(model_id).casefold() == folded
+                    or str(model.get("model_key") or "").strip().casefold() == folded
+                    or str(model.get("display_name") or "").strip().casefold() == folded
+                ),
+                None,
+            )
+            if matched_model is None:
+                matched_model = next(
+                    (
+                        model
+                        for model in models
+                        if str(model["id"]).casefold() == folded
+                        or str(model.get("model_key") or "").strip().casefold() == folded
+                        or str(model.get("display_name") or "").strip().casefold()
+                        == folded
+                    ),
+                    None,
+                )
+            if matched_model is not None:
+                return request.model_copy(
+                    update={"model_id": UUID(str(matched_model["id"]))}
+                )
+        return request
+
+    def invoke(
+        self,
+        request: ModelInvocationRequest,
+        *,
+        allowed_model_ids: set[UUID] | None = None,
+    ) -> ModelInvocationResponse:
         if request.router_id is None:
             raise HTTPException(status_code=422, detail="router_id is required")
-        router_row = self._repository.get_callable_model_router(
-            request.router_id, request.metadata.user_id
+        include_published = bool(
+            request.router_context.get("subscription_key_authenticated")
+        )
+        router_row = self._get_callable_router_row(
+            request.router_id,
+            request.metadata.user_id,
+            include_published=include_published,
         )
         if router_row is None:
             raise HTTPException(
@@ -356,8 +926,17 @@ class ModelRouterExecutionService:
                 detail="Model router is not published or assigned to this user",
             )
         router = ModelRouter.model_validate(router_row)
+        if allowed_model_ids is not None:
+            cand_ids = ModelRouterService._candidate_model_ids(router.definition)
+            if not cand_ids or not (cand_ids <= allowed_model_ids):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Model is not permitted for this application subscription",
+                )
         registry = self._repository.registry()
-        models = self._callable_models(registry, request.metadata.user_id)
+        models = self._callable_models(
+            registry, request.metadata.user_id, router_authorized=True
+        )
         selection_key = ":".join(
             (
                 str(router.id),
@@ -379,24 +958,112 @@ class ModelRouterExecutionService:
         strategy_type = plan.strategy_type
         attempts: list[dict[str, Any]] = []
         preferred_basis: str | None = None
-        derived_run_id = self._derived_interaction_run_id(request)
-        bound_model_id = self._repository.get_model_router_run_binding(
-            router.id,
-            router.version,
-            request.metadata.user_id,
-            request.metadata.run_id,
+        sticky_bound_by: str | None = None
+        sticky_key: str | None = None
+        interaction_id = (
+            str(
+                request.router_context.get("interaction_id")
+                or request.router_context.get("x_interaction_id")
+                or ""
+            ).strip()[:128]
+            or None
         )
-        if (
-            bound_model_id is None
-            and derived_run_id is not None
-            and self._is_agent_continuation(request)
-        ):
-            bound_model_id = self._repository.get_model_router_run_binding(
-                router.id,
-                router.version,
-                request.metadata.user_id,
-                derived_run_id,
+        session_id = (
+            str(
+                request.router_context.get("session_id")
+                or request.router_context.get("x_session_id")
+                or ""
+            ).strip()[:128]
+            or None
+        )
+        derived_run_id = self._derived_interaction_run_id(request)
+        lookup_chain: list[tuple[str, str, str]] = []
+        if interaction_id:
+            lookup_chain.append(
+                (f"interaction:{interaction_id}", "interaction", interaction_id)
             )
+            lookup_chain.append((interaction_id, "interaction", interaction_id))
+        if session_id:
+            lookup_chain.append((f"session:{session_id}", "session", session_id))
+            lookup_chain.append((session_id, "session", session_id))
+        lookup_chain.append(
+            (request.metadata.run_id, "interaction", request.metadata.run_id)
+        )
+        if derived_run_id is not None and self._is_agent_continuation(request):
+            lookup_chain.append(
+                (derived_run_id, "derived_interaction", derived_run_id)
+            )
+        raw_ttl = request.router_context.get(
+            "session_ttl_seconds",
+            request.router_context.get("x_session_ttl_seconds"),
+        )
+        custom_ttl_seconds: int | None = None
+        if raw_ttl is not None and not isinstance(raw_ttl, bool):
+            try:
+                custom_ttl_seconds = min(86400, max(1, int(float(raw_ttl))))
+            except (TypeError, ValueError):
+                custom_ttl_seconds = None
+        session_ttl_seconds = (
+            custom_ttl_seconds
+            if custom_ttl_seconds is not None
+            else _DEFAULT_SESSION_STICKY_TTL_SECONDS
+        )
+        interaction_ttl_seconds = (
+            custom_ttl_seconds
+            if custom_ttl_seconds is not None
+            else _DEFAULT_INTERACTION_STICKY_TTL_SECONDS
+        )
+        bound_model_id: UUID | None = None
+        ordered_lookup: list[tuple[str, str, str]] = []
+        seen_lookup_keys: set[str] = set()
+        for raw_key, kind, display_key in lookup_chain:
+            if not raw_key or raw_key in seen_lookup_keys:
+                continue
+            seen_lookup_keys.add(raw_key)
+            ordered_lookup.append((raw_key, kind, display_key))
+        batch_getter = getattr(
+            self._repository, "get_model_router_run_bindings_batch", None
+        )
+        if callable(batch_getter):
+            bindings_map: dict[str, UUID] = {}
+            keys_by_ttl: dict[int, list[str]] = {}
+            for raw_key, kind, _display_key in ordered_lookup:
+                tier_ttl = (
+                    session_ttl_seconds
+                    if kind == "session"
+                    else interaction_ttl_seconds
+                )
+                keys_by_ttl.setdefault(tier_ttl, []).append(raw_key)
+            for tier_ttl, ttl_keys in keys_by_ttl.items():
+                bindings_map.update(
+                    batch_getter(
+                        router.id,
+                        router.version,
+                        request.metadata.user_id,
+                        ttl_keys,
+                        ttl_seconds=tier_ttl,
+                    )
+                )
+            for raw_key, kind, display_key in ordered_lookup:
+                found = bindings_map.get(raw_key)
+                if found is not None:
+                    bound_model_id = found
+                    sticky_bound_by = kind
+                    sticky_key = display_key
+                    break
+        else:
+            for raw_key, kind, display_key in ordered_lookup:
+                found = self._repository.get_model_router_run_binding(
+                    router.id,
+                    router.version,
+                    request.metadata.user_id,
+                    raw_key,
+                )
+                if found is not None:
+                    bound_model_id = found
+                    sticky_bound_by = kind
+                    sticky_key = display_key
+                    break
         if bound_model_id is not None and bound_model_id not in models:
             disabled = any(
                 model["id"] == bound_model_id and model["enabled"] is False
@@ -406,27 +1073,142 @@ class ModelRouterExecutionService:
                 "code": "model_disabled" if disabled else "model_unavailable",
                 "message": "The conversation's bound model is unavailable; its binding is retained",
             })
-        if bound_model_id is not None and any(
-            candidate.model_id == bound_model_id for candidate in candidates
+        all_router_configs = {
+            config.model_id: config
+            for node in router.definition.nodes
+            if node.type in {"strategy", "priority"}
+            for config in node.model_configs
+        }
+        if bound_model_id is not None and (
+            any(candidate.model_id == bound_model_id for candidate in candidates)
+            or bound_model_id in all_router_configs
         ) and bound_model_id in models:
-            candidates = [
-                *(
+            bound_candidate = next(
+                (
                     candidate
                     for candidate in candidates
                     if candidate.model_id == bound_model_id
                 ),
-                *(
-                    candidate
-                    for candidate in candidates
-                    if candidate.model_id != bound_model_id
-                ),
+                all_router_configs.get(bound_model_id)
+                or ModelRouterStrategyModel(model_id=bound_model_id),
+            )
+            eligible_for_escalation = [
+                candidate
+                for candidate in candidates
+                if candidate.model_id in models
+                and not self._is_system_one_model(models[candidate.model_id])
+                and not self._over_cost_limit(
+                    models[candidate.model_id], candidate.max_cost_per_million
+                )
             ]
-            preferred_basis = "interaction_sticky"
+            is_new_turn = self._is_new_user_turn(request)
+            bound_in_branch = any(
+                candidate.model_id == bound_model_id
+                for candidate in eligible_for_escalation
+            )
+            can_escalate_condition_branch = (
+                is_new_turn
+                and not bound_in_branch
+                and bool(eligible_for_escalation)
+                and any(
+                    self._candidate_effective_cost(models.get(target.model_id))
+                    > self._candidate_effective_cost(
+                        models.get(bound_candidate.model_id)
+                    )
+                    for target in eligible_for_escalation
+                )
+            )
+            can_escalate_bound = (
+                strategy_type == "model_based"
+                and is_new_turn
+                and bound_in_branch
+                and any(
+                    self._can_escalate_candidate(
+                        bound_candidate,
+                        target,
+                        eligible_for_escalation,
+                        models,
+                    )
+                    for target in eligible_for_escalation
+                )
+            )
+            if can_escalate_condition_branch:
+                sticky_bound_by = None
+                sticky_key = None
+                if strategy_type == "model_based":
+                    candidates, decision_attempt, selected = (
+                        self._model_based_order(
+                            request,
+                            plan,
+                            models,
+                            router_id=router.id,
+                        )
+                    )
+                    attempts.append(decision_attempt)
+                    preferred_basis = (
+                        "model_based_selection"
+                        if selected
+                        else "model_based_fallback"
+                    )
+            elif can_escalate_bound:
+                decided_candidates, decision_attempt, selected = (
+                    self._model_based_order(
+                        request,
+                        plan,
+                        models,
+                        bound_candidate=bound_candidate,
+                        router_id=router.id,
+                    )
+                )
+                attempts.append(decision_attempt)
+                if (
+                    selected
+                    and decided_candidates
+                    and self._can_escalate_candidate(
+                        bound_candidate,
+                        decided_candidates[0],
+                        eligible_for_escalation,
+                        models,
+                    )
+                ):
+                    candidates = decided_candidates
+                    preferred_basis = "model_based_selection"
+                    sticky_bound_by = None
+                    sticky_key = None
+                else:
+                    candidates = [
+                        bound_candidate,
+                        *(
+                            candidate
+                            for candidate in decided_candidates
+                            if candidate.model_id != bound_model_id
+                        ),
+                    ]
+                    preferred_basis = (
+                        "session_sticky"
+                        if sticky_bound_by == "session"
+                        else "interaction_sticky"
+                    )
+            else:
+                candidates = [
+                    bound_candidate,
+                    *(
+                        candidate
+                        for candidate in candidates
+                        if candidate.model_id != bound_model_id
+                    ),
+                ]
+                preferred_basis = (
+                    "session_sticky"
+                    if sticky_bound_by == "session"
+                    else "interaction_sticky"
+                )
         elif strategy_type == "model_based":
             candidates, decision_attempt, selected = self._model_based_order(
                 request,
                 plan,
                 models,
+                router_id=router.id,
             )
             attempts.append(decision_attempt)
             preferred_basis = (
@@ -470,6 +1252,10 @@ class ModelRouterExecutionService:
             concrete = request.model_copy(
                 update={
                     "router_id": None,
+                    "router_context": {
+                        **request.router_context,
+                        "_router_authorized_id": str(router.id),
+                    },
                     "runtime_id": UUID(str(model["runtime_id"])),
                     "model_id": candidate.model_id,
                     "metadata": request.metadata.model_copy(
@@ -533,6 +1319,10 @@ class ModelRouterExecutionService:
                 if event in fallback_events and index < len(candidates) - 1:
                     continue
                 raise
+            has_prior_candidate = any(
+                attempt.get("attempt_role") == "candidate"
+                for attempt in attempts
+            )
             attempts.append(
                 self._attempt(
                     len(attempts) + 1,
@@ -549,40 +1339,52 @@ class ModelRouterExecutionService:
                     strategy_type=strategy_type,
                     decision_basis=(
                         "fallback_success"
-                        if any(
-                            attempt.get("attempt_role") == "candidate"
-                            for attempt in attempts
-                        )
+                        if has_prior_candidate
                         else preferred_basis
                         if preferred_basis is not None
                         else "weighted_selection_success"
                         if strategy_type == "weighted"
                         else "highest_priority_success"
                     ),
-                    **self._response_usage(response),
+                    sticky_bound_by=None if has_prior_candidate else sticky_bound_by,
+                    sticky_key=None if has_prior_candidate else sticky_key,
+                    **self._response_usage(response, model),
                 )
             )
             self._attach_condition_trace(attempts, plan)
             self._save_attempt_trace(
                 response.request_id, router, candidate.model_id, model, attempts
             )
-            self._repository.save_model_router_run_binding(
-                router.id,
-                router.version,
-                request.metadata.user_id,
-                request.metadata.run_id,
-                candidate.model_id,
-                str(model["display_name"]),
+            binding_keys = [request.metadata.run_id]
+            if interaction_id:
+                binding_keys.extend((f"interaction:{interaction_id}", interaction_id))
+            if session_id:
+                binding_keys.extend((f"session:{session_id}", session_id))
+            if derived_run_id is not None:
+                binding_keys.append(derived_run_id)
+            unique_binding_keys = list(dict.fromkeys(k for k in binding_keys if k))
+            batch_saver = getattr(
+                self._repository, "save_model_router_run_bindings_batch", None
             )
-            if derived_run_id is not None and derived_run_id != request.metadata.run_id:
-                self._repository.save_model_router_run_binding(
+            if callable(batch_saver):
+                batch_saver(
                     router.id,
                     router.version,
                     request.metadata.user_id,
-                    derived_run_id,
+                    unique_binding_keys,
                     candidate.model_id,
                     str(model["display_name"]),
                 )
+            else:
+                for b_key in unique_binding_keys:
+                    self._repository.save_model_router_run_binding(
+                        router.id,
+                        router.version,
+                        request.metadata.user_id,
+                        b_key,
+                        candidate.model_id,
+                        str(model["display_name"]),
+                    )
             return response.model_copy(
                 update={
                     "router_id": router.id,
@@ -888,46 +1690,91 @@ class ModelRouterExecutionService:
         )
 
     @staticmethod
+    def _resolved_model_costs(
+        model: Mapping[str, Any] | None,
+        *,
+        input_tokens: int = 0,
+    ) -> tuple[float | None, float | None]:
+        if not model:
+            return None, None
+        raw_tiers = model.get("context_price_tiers") or []
+        if raw_tiers:
+            price = ModelPrice.from_registry(model)
+            if price is not None and price.context_tiers:
+                resolved = price.for_input_tokens(max(0, input_tokens))
+                return (
+                    float(resolved.input_price_per_million),
+                    float(resolved.output_price_per_million),
+                )
+        raw_in = model.get("input_cost_per_million")
+        raw_out = model.get("output_cost_per_million")
+        return (
+            float(raw_in) if raw_in is not None else None,
+            float(raw_out) if raw_out is not None else None,
+        )
+
+    @classmethod
     def _decision_catalog(
+        cls,
         candidates: Sequence[ModelRouterStrategyModel],
         models: Mapping[UUID, Mapping[str, Any]],
     ) -> list[dict[str, Any]]:
-        return [
-            {
-                "model_id": candidate.model_id,
-                "display_name": str(models[candidate.model_id]["display_name"]),
-                "provider_name": str(models[candidate.model_id]["provider_name"]),
-                "description": candidate.description.strip(),
-                "capabilities": list(
-                    models[candidate.model_id].get("capabilities") or []
-                ),
-                "context_window": models[candidate.model_id].get("context_window"),
-                "input_cost_per_million": models[candidate.model_id].get(
-                    "input_cost_per_million"
-                ),
-                "output_cost_per_million": models[candidate.model_id].get(
-                    "output_cost_per_million"
-                ),
-                "priority": candidate.priority,
-                "weight": candidate.weight,
-                "max_latency_ms": candidate.max_latency_ms,
-                "max_cost_per_million": candidate.max_cost_per_million,
-            }
-            for candidate in candidates
-        ]
+        items: list[dict[str, Any]] = []
+        for candidate in candidates:
+            model = models[candidate.model_id]
+            in_cost, out_cost = cls._resolved_model_costs(model)
+            items.append(
+                {
+                    "model_id": candidate.model_id,
+                    "display_name": str(model["display_name"]),
+                    "provider_name": str(model["provider_name"]),
+                    "description": candidate.description.strip(),
+                    "capabilities": list(model.get("capabilities") or []),
+                    "context_window": model.get("context_window"),
+                    "input_cost_per_million": in_cost,
+                    "output_cost_per_million": out_cost,
+                    "priority": candidate.priority,
+                    "weight": candidate.weight,
+                    "max_latency_ms": candidate.max_latency_ms,
+                    "max_cost_per_million": candidate.max_cost_per_million,
+                }
+            )
+        return items
 
     @staticmethod
     def _is_system_one_model(model: Mapping[str, Any] | None) -> bool:
         return bool(model and "decision" in (model.get("capabilities") or []))
 
     @staticmethod
+    def _prompt_catalog(
+        catalog: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "model_id": item["model_id"],
+                "display_name": item["display_name"],
+                "provider_name": item["provider_name"],
+                "description": item["description"],
+                "input_cost_per_million": item["input_cost_per_million"],
+                "output_cost_per_million": item["output_cost_per_million"],
+            }
+            for item in catalog
+        ]
+
+    @classmethod
     def _render_decision_prompt(
+        cls,
         template: str | None,
         catalog: Sequence[Mapping[str, Any]],
     ) -> tuple[str, bool, bool]:
         custom = (template or "").strip()
         effective = custom or _DEFAULT_DECISION_PROMPT
-        catalog_text = json.dumps(catalog, ensure_ascii=False, indent=2, default=str)
+        catalog_text = json.dumps(
+            cls._prompt_catalog(catalog),
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
         has_placeholder = _CATALOG_PLACEHOLDER in effective
         system = (
             effective.replace(_CATALOG_PLACEHOLDER, catalog_text)
@@ -952,16 +1799,15 @@ class ModelRouterExecutionService:
             display_name = str(item.get("display_name") or model_id)
             provider_name = str(item.get("provider_name") or "")
             description = str(item.get("description") or "").strip()
-            capabilities = ", ".join(item.get("capabilities") or ["chat"])
             cost_parts: list[str] = []
             if item.get("input_cost_per_million") is not None:
                 cost_parts.append(f"in ${item['input_cost_per_million']}/1M")
             if item.get("output_cost_per_million") is not None:
                 cost_parts.append(f"out ${item['output_cost_per_million']}/1M")
-            meta = f"{display_name} ({provider_name}, capabilities: {capabilities}"
+            meta = f"{display_name} ({provider_name}"
             if cost_parts:
                 meta += f", {', '.join(cost_parts)}"
-            meta += f", priority P{item.get('priority', 1)})"
+            meta += ")"
             criteria[model_id] = f"{meta} — {description}" if description else meta
         if len(criteria) == 1:
             criteria["__none__"] = (
@@ -1001,8 +1847,11 @@ class ModelRouterExecutionService:
         request: ModelInvocationRequest,
         plan: _RouterExecutionPlan,
         models: Mapping[UUID, Mapping[str, Any]],
+        *,
+        bound_candidate: ModelRouterStrategyModel | None = None,
+        router_id: UUID | None = None,
     ) -> tuple[list[ModelRouterStrategyModel], dict[str, Any], bool]:
-        eligible = [
+        raw_eligible = [
             candidate
             for candidate in plan.candidates
             if candidate.model_id in models
@@ -1011,10 +1860,39 @@ class ModelRouterExecutionService:
                 models[candidate.model_id], candidate.max_cost_per_million
             )
         ]
+        if bound_candidate is not None and bound_candidate.model_id in models:
+            filtered = [
+                candidate
+                for candidate in raw_eligible
+                if candidate.model_id == bound_candidate.model_id
+                or self._can_escalate_candidate(
+                    bound_candidate,
+                    candidate,
+                    raw_eligible,
+                    models,
+                )
+            ]
+            if not any(
+                candidate.model_id == bound_candidate.model_id
+                for candidate in filtered
+            ):
+                filtered.insert(0, bound_candidate)
+            eligible = filtered if len(filtered) > 1 else raw_eligible
+        else:
+            eligible = raw_eligible
         candidate_ids = [str(candidate.model_id) for candidate in eligible]
         routing_model_id = plan.routing_model_id
         routing_model = models.get(routing_model_id) if routing_model_id else None
-        prompt = self._extract_user_prompt(request.messages)
+        bound_model_name = (
+            str(models[bound_candidate.model_id]["display_name"])
+            if bound_candidate is not None and bound_candidate.model_id in models
+            else None
+        )
+        prompt = self._extract_decision_prompt(
+            request.messages,
+            bound_model_name=bound_model_name,
+            request=request,
+        )
         decision_input, prompt_truncated = self._truncate_decision_prompt(
             prompt,
             plan.max_prompt_chars,
@@ -1125,7 +2003,9 @@ class ModelRouterExecutionService:
                         "router_id": None,
                         "runtime_id": UUID(str(routing_model["runtime_id"])),
                         "model_id": routing_model_id,
-                        "router_context": {},
+                        "router_context": {
+                            "_router_authorized_id": str(router_id or routing_model_id),
+                        },
                         "messages": [
                             ChatMessage(role="system", content=system_prompt),
                             ChatMessage(role="user", content=decision_input),
@@ -1195,7 +2075,7 @@ class ModelRouterExecutionService:
                     "decision_response_sha256": hashlib.sha256(
                         response_text.encode()
                     ).hexdigest(),
-                    **self._response_usage(response),
+                    **self._response_usage(response, routing_model),
                 }
             attempt = self._attempt(
                 1,
@@ -1251,7 +2131,7 @@ class ModelRouterExecutionService:
             decision_confidence=confidence,
             decision_probabilities=probabilities or None,
             **decision_evidence,
-            **self._response_usage(response),
+            **self._response_usage(response, routing_model),
         )
         return ordered, attempt, True
 
@@ -1259,17 +2139,23 @@ class ModelRouterExecutionService:
         self,
         registry: Mapping[str, Sequence[Mapping[str, Any]]],
         user_id: str,
+        *,
+        router_authorized: bool = False,
     ) -> dict[UUID, Mapping[str, Any]]:
         providers = {UUID(str(row["id"])): row for row in registry["providers"]}
         runtimes = {UUID(str(row["id"])): row for row in registry["runtimes"]}
         gateways = {UUID(str(row["id"])): row for row in registry["gateways"]}
-        policy = next(
-            (
-                row
-                for row in self._repository.list_user_model_policies([user_id])
-                if str(row["user_id"]) == user_id
-            ),
-            None,
+        policy = (
+            None
+            if router_authorized
+            else next(
+                (
+                    row
+                    for row in self._repository.list_user_model_policies([user_id])
+                    if str(row["user_id"]) == user_id
+                ),
+                None,
+            )
         )
         assigned = (
             {UUID(str(value)) for value in policy.get("model_ids", [])}
@@ -1293,7 +2179,7 @@ class ModelRouterExecutionService:
                 continue
             if gateway is not None and not gateway.get("enabled"):
                 continue
-            if "decision" not in capabilities:
+            if not router_authorized and "decision" not in capabilities:
                 if assigned is not None and model_id not in assigned:
                     continue
                 if assigned is None and model.get("assignment_required"):
@@ -1302,23 +2188,185 @@ class ModelRouterExecutionService:
         return callable_models
 
     @staticmethod
-    def _extract_user_prompt(messages: Sequence[ChatMessage]) -> str:
+    def _clean_user_message_content(raw_content: str) -> str:
+        matches = _USER_REQUEST_RE.findall(raw_content)
+        extracted = matches[-1] if matches else raw_content
+        extracted = _CURRENT_DATETIME_RE.sub("", extracted).strip()
+
+        def _bound_quoted_block(match: re.Match[str]) -> str:
+            inner = match.group(2).strip()
+            if len(inner) <= 600:
+                return match.group(0)
+            bounded = f"{inner[:300].rstrip()} ... {inner[-150:].lstrip()}"
+            return f"{match.group(1)}{bounded}{match.group(3)}"
+
+        return _QUOTED_USER_MESSAGE_RE.sub(_bound_quoted_block, extracted).strip()
+
+    @classmethod
+    def _extract_user_prompt(cls, messages: Sequence[ChatMessage]) -> str:
         for message in reversed(messages):
             if message.role != "user":
                 continue
-            content = message.content or ""
-            matches = _USER_REQUEST_RE.findall(content)
-            return matches[-1] if matches else content
+            return cls._clean_user_message_content(message.content or "")
         return ""
 
+    @classmethod
+    def _extract_system_instruction(cls, messages: Sequence[ChatMessage]) -> str:
+        for message in messages:
+            if (
+                message.role or ""
+            ).strip().casefold() == "user" and _USER_REQUEST_RE.search(
+                message.content or ""
+            ):
+                return ""
+        parts: list[str] = []
+        for message in messages:
+            if (message.role or "").strip().casefold() not in {
+                "system",
+                "developer",
+            }:
+                continue
+            raw = message.content or ""
+            max_prefix_end = -1
+            for marker in _SDK_SYSTEM_PREFIX_END_MARKERS:
+                idx = raw.rfind(marker)
+                if idx >= 0:
+                    max_prefix_end = max(max_prefix_end, idx + len(marker))
+            if max_prefix_end >= 0:
+                raw = raw[max_prefix_end:]
+            min_suffix_start = len(raw)
+            for marker in _SDK_SYSTEM_SUFFIX_START_MARKERS:
+                idx = raw.find(marker)
+                if 0 <= idx < min_suffix_start:
+                    min_suffix_start = idx
+            raw = raw[:min_suffix_start]
+            raw = _CONTEXT_BLOCK_RE.sub(" ", raw)
+            raw = _CURRENT_DATETIME_RE.sub(" ", raw)
+            cleaned = " ".join(raw.split())
+            if cleaned:
+                parts.append(cleaned)
+        if not parts:
+            return ""
+        merged = " ".join(parts)
+        if len(merged) <= 600:
+            return merged
+        return f"{merged[:420].rstrip()} ... {merged[-140:].lstrip()}"
+
     @staticmethod
-    def _extract_first_user_prompt(messages: Sequence[ChatMessage]) -> str:
+    def _extract_request_constraints(
+        request: ModelInvocationRequest | None,
+    ) -> str:
+        if request is None:
+            return ""
+        items: list[str] = []
+        if (
+            request.max_output_tokens is not None
+            and 0 < request.max_output_tokens <= 128
+        ):
+            items.append(f"max_output_tokens={request.max_output_tokens}")
+        if request.response_format:
+            items.append(f"response_format={request.response_format}")
+        if request.tools:
+            items.append(f"tools={len(request.tools)}")
+        return ", ".join(items)
+
+    @classmethod
+    def _extract_decision_prompt(
+        cls,
+        messages: Sequence[ChatMessage],
+        *,
+        bound_model_name: str | None = None,
+        request: ModelInvocationRequest | None = None,
+    ) -> str:
+        system_instruction = cls._extract_system_instruction(messages)
+        constraints = cls._extract_request_constraints(request)
+        first_user = ""
+        prev_user = ""
+        last_user = ""
+        prev_assistant = ""
+        pending_assistant = ""
+        user_count = 0
+        for message in messages:
+            role = (message.role or "").strip().casefold()
+            if role == "assistant":
+                asst_text = (message.content or "").strip()
+                if asst_text:
+                    pending_assistant = asst_text
+            elif role == "user":
+                extracted = cls._clean_user_message_content(message.content or "")
+                if not extracted:
+                    continue
+                user_count += 1
+                if user_count == 1:
+                    first_user = extracted
+                else:
+                    prev_user = last_user
+                    prev_assistant = pending_assistant
+                last_user = extracted
+        base_prompt = last_user or cls._extract_user_prompt(messages)
+        has_multi_turn = (
+            user_count > 1 and bool(prev_user) and prev_user != last_user
+        )
+        if (
+            not system_instruction
+            and not constraints
+            and not bound_model_name
+            and not has_multi_turn
+        ):
+            return base_prompt
+        sections: list[str] = []
+        if system_instruction:
+            sections.append(f"Task / System instruction:\n{system_instruction}")
+        if constraints:
+            sections.append(f"Request constraints: {constraints}")
+        sections.append(f"Current user request:\n{base_prompt}")
+        if bound_model_name:
+            sections.append(
+                f"Active conversation model: {bound_model_name} "
+                "(keep this model to preserve conversation prompt cache unless the "
+                "current user request clearly requires a higher-capability candidate "
+                "based on the candidate descriptions and unit costs)"
+            )
+        if has_multi_turn:
+            prior_lines = [
+                "Prior turn context (for reference only if the current request is a follow-up):"
+            ]
+            if user_count > 2 and first_user and first_user != prev_user:
+                first_clean = " ".join(first_user.split())
+                first_snippet = (
+                    f"{first_clean[:200]}..."
+                    if len(first_clean) > 200
+                    else first_clean
+                )
+                prior_lines.append(f"- Initial topic: {first_snippet}")
+            prev_user_clean = " ".join(prev_user.split())
+            prev_user_snippet = (
+                f"{prev_user_clean[:240]}..."
+                if len(prev_user_clean) > 240
+                else prev_user_clean
+            )
+            prior_lines.append(f"- Previous user message: {prev_user_snippet}")
+            if prev_assistant:
+                prev_asst_clean = " ".join(prev_assistant.split())
+                prev_asst_snippet = (
+                    f"{prev_asst_clean[:240]}..."
+                    if len(prev_asst_clean) > 240
+                    else prev_asst_clean
+                )
+                prior_lines.append(
+                    f"- Previous assistant reply: {prev_asst_snippet}"
+                )
+            sections.append("\n".join(prior_lines))
+        return "\n\n".join(sections)
+
+    @classmethod
+    def _extract_first_user_prompt(cls, messages: Sequence[ChatMessage]) -> str:
         for message in messages:
             if message.role != "user":
                 continue
-            content = message.content or ""
-            matches = _USER_REQUEST_RE.findall(content)
-            return matches[0] if matches else content
+            cleaned = cls._clean_user_message_content(message.content or "")
+            if cleaned:
+                return cleaned
         return ""
 
     @classmethod
@@ -1328,8 +2376,10 @@ class ModelRouterExecutionService:
         first_prompt = cls._extract_first_user_prompt(request.messages).strip()
         if not first_prompt:
             return None
+        sys_inst = cls._extract_system_instruction(request.messages)
+        seed = f"{sys_inst}\n{first_prompt}" if sys_inst else first_prompt
         digest = hashlib.sha256(
-            f"{request.metadata.user_id}:{first_prompt}".encode()
+            f"{request.metadata.user_id}:{seed}".encode()
         ).hexdigest()[:16]
         return f"derived-{digest}"
 
@@ -1337,12 +2387,74 @@ class ModelRouterExecutionService:
     def _is_agent_continuation(request: ModelInvocationRequest) -> bool:
         if any(message.role in {"assistant", "tool"} for message in request.messages):
             return True
+        if request.metadata.turn_index > 1:
+            return True
         initiator = str(
             request.router_context.get("x_initiator")
             or request.router_context.get("initiator")
             or ""
         ).strip().casefold()
-        return initiator == "agent" and request.metadata.turn_index > 1
+        if initiator == "agent":
+            return True
+        user_count = sum(
+            1
+            for message in request.messages
+            if (message.role or "").strip().casefold() == "user"
+            and (message.content or "").strip()
+        )
+        return user_count > 1
+
+    @classmethod
+    def _is_new_user_turn(cls, request: ModelInvocationRequest) -> bool:
+        initiator = str(
+            request.router_context.get("x_initiator")
+            or request.router_context.get("initiator")
+            or ""
+        ).strip().casefold()
+        if initiator == "agent":
+            return False
+        non_system = [
+            message
+            for message in request.messages
+            if (message.role or "").strip().casefold() not in {"system", "developer"}
+        ]
+        if not non_system or (non_system[-1].role or "").strip().casefold() != "user":
+            return False
+        user_messages: list[str] = []
+        for message in non_system:
+            if (message.role or "").strip().casefold() != "user":
+                continue
+            extracted = cls._clean_user_message_content(message.content or "")
+            if extracted:
+                user_messages.append(extracted)
+        return len(user_messages) > 1 and user_messages[-1] != user_messages[-2]
+
+    @classmethod
+    def _candidate_effective_cost(cls, model: Mapping[str, Any] | None) -> float:
+        in_cost, out_cost = cls._resolved_model_costs(model)
+        return round(float(in_cost or 0.0) + float(out_cost or 0.0), 8)
+
+    @classmethod
+    def _can_escalate_candidate(
+        cls,
+        bound: ModelRouterStrategyModel,
+        target: ModelRouterStrategyModel,
+        eligible: Sequence[ModelRouterStrategyModel],
+        models: Mapping[UUID, Mapping[str, Any]],
+    ) -> bool:
+        if target.model_id == bound.model_id or not eligible:
+            return False
+        bound_cost = cls._candidate_effective_cost(models.get(bound.model_id))
+        target_cost = cls._candidate_effective_cost(models.get(target.model_id))
+        if target_cost > bound_cost:
+            return True
+        costs = [
+            cls._candidate_effective_cost(models.get(candidate.model_id))
+            for candidate in eligible
+        ]
+        return max(costs) == min(costs) and any(
+            candidate.description.strip() for candidate in eligible
+        )
 
     @classmethod
     def _routing_context(
@@ -1600,6 +2712,11 @@ class ModelRouterExecutionService:
         output_tokens: int | None = None,
         total_tokens: int | None = None,
         estimated_cost: float | None = None,
+        input_price_per_million: float | None = None,
+        cached_price_per_million: float | None = None,
+        cache_write_price_per_million: float | None = None,
+        output_price_per_million: float | None = None,
+        price_context_tier: str | None = None,
         attempt_role: str = "candidate",
         decision_protocol: str | None = None,
         decision_candidates: Sequence[str] | None = None,
@@ -1613,6 +2730,8 @@ class ModelRouterExecutionService:
         decision_response_sha256: str | None = None,
         decision_confidence: float | None = None,
         decision_probabilities: Mapping[str, float] | None = None,
+        sticky_bound_by: str | None = None,
+        sticky_key: str | None = None,
     ) -> dict[str, Any]:
         return {
             "sequence": sequence,
@@ -1631,12 +2750,19 @@ class ModelRouterExecutionService:
             "strategy_type": strategy_type,
             "fallback_trigger": fallback_trigger,
             "decision_basis": decision_basis,
+            "sticky_bound_by": sticky_bound_by,
+            "sticky_key": sticky_key,
             "input_tokens": input_tokens,
             "cached_tokens": cached_tokens,
             "cache_write_tokens": cache_write_tokens,
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,
             "estimated_cost": estimated_cost,
+            "input_price_per_million": input_price_per_million,
+            "cached_price_per_million": cached_price_per_million,
+            "cache_write_price_per_million": cache_write_price_per_million,
+            "output_price_per_million": output_price_per_million,
+            "price_context_tier": price_context_tier,
             "decision_protocol": decision_protocol,
             "decision_candidates": list(decision_candidates or []),
             "selected_candidate_model_id": (
@@ -1662,6 +2788,7 @@ class ModelRouterExecutionService:
     @staticmethod
     def _response_usage(
         response: ModelInvocationResponse | DecisionInvocationResponse,
+        model: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         usage = response.usage
         if usage is None:
@@ -1673,13 +2800,37 @@ class ModelRouterExecutionService:
                 "total_tokens": None,
                 "estimated_cost": response.estimated_cost,
             }
+        price_info: dict[str, Any] = {}
+        if model is not None:
+            price = ModelPrice.from_registry(model)
+            if price is not None and not (price.context_tiers and usage.estimated):
+                snap = price.snapshot_prices(
+                    usage.input_tokens,
+                    usage.cached_tokens,
+                    usage.output_tokens,
+                    usage.cache_write_tokens,
+                )
+                price_info = {
+                    "input_price_per_million": snap["input_price_per_million"],
+                    "cached_price_per_million": snap["cached_price_per_million"],
+                    "cache_write_price_per_million": snap["cache_write_price_per_million"],
+                    "output_price_per_million": snap["output_price_per_million"],
+                    "price_context_tier": snap["price_context_tier"],
+                }
         return {
             "input_tokens": usage.input_tokens,
             "cached_tokens": usage.cached_tokens,
             "cache_write_tokens": usage.cache_write_tokens,
             "output_tokens": usage.output_tokens,
             "total_tokens": usage.input_tokens + usage.cached_tokens + usage.output_tokens,
-            "estimated_cost": response.estimated_cost,
+            "estimated_cost": (
+                response.estimated_cost
+                if response.estimated_cost is not None
+                else snap["estimated_cost"]
+                if price_info
+                else None
+            ),
+            **price_info,
         }
 
     @classmethod
@@ -1734,12 +2885,23 @@ class ModelRouterExecutionService:
                 and len(edges) > 1
             ):
                 matched = cls._condition_matches(node.condition, context)
+                raw_actual = context.get(node.condition.field)
+                if isinstance(raw_actual, str) and len(raw_actual) > 120:
+                    actual_preview: str | float | bool | None = f"{raw_actual[:117]}..."
+                elif isinstance(raw_actual, (str, int, float, bool)) or raw_actual is None:
+                    actual_preview = raw_actual
+                else:
+                    actual_preview = str(raw_actual)[:120]
                 condition_evaluations.append(
                     {
                         "node_id": node.id,
+                        "node_label": node.label,
                         "field": node.condition.field,
                         "operator": node.condition.operator,
+                        "expected": node.condition.value,
+                        "actual": actual_preview,
                         "matched": matched,
+                        "branch": "Match" if matched else "Else",
                     }
                 )
                 edges = [
@@ -1907,16 +3069,14 @@ class ModelRouterExecutionService:
             return "timeout"
         return "error"
 
-    @staticmethod
-    def _over_cost_limit(model: Mapping[str, Any], maximum: float | None) -> bool:
+    @classmethod
+    def _over_cost_limit(cls, model: Mapping[str, Any], maximum: float | None) -> bool:
         if maximum is None:
             return False
+        in_cost, out_cost = cls._resolved_model_costs(model)
         prices = [
             float(value)
-            for value in (
-                model.get("input_cost_per_million"),
-                model.get("output_cost_per_million"),
-            )
+            for value in (in_cost, out_cost)
             if value is not None
         ]
         return bool(prices) and max(prices) > maximum

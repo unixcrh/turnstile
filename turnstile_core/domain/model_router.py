@@ -369,6 +369,57 @@ class ModelRouterAssignment(StrictModel):
     assigned: bool
 
 
+class ModelRouterDepartmentAccessSummary(StrictModel):
+    id: str = Field(min_length=1, max_length=320)
+    name: str = Field(min_length=1, max_length=320)
+    total_users: int = Field(ge=0)
+    assigned_users: int = Field(ge=0)
+
+
+class ModelRouterPersonAccessItem(StrictModel):
+    id: str = Field(min_length=1, max_length=320)
+    name: str = Field(min_length=1, max_length=320)
+    department_id: str | None = None
+    department_name: str = Field(min_length=1, max_length=320)
+    assigned: bool
+
+
+class ModelRouterPeopleAccessResponse(StrictModel):
+    router_id: UUID
+    total: int = Field(ge=0)
+    offset: int = Field(ge=0)
+    limit: int = Field(ge=1)
+    total_users: int = Field(ge=0)
+    assigned_count: int = Field(ge=0)
+    matching_assigned_count: int = Field(ge=0)
+    departments: list[ModelRouterDepartmentAccessSummary] = Field(default_factory=list)
+    items: list[ModelRouterPersonAccessItem] = Field(default_factory=list)
+
+
+class ModelRouterDepartmentAssignmentWrite(StrictModel):
+    department_id: str = Field(min_length=1, max_length=320)
+    assigned: bool
+    query: str | None = Field(default=None, max_length=200)
+
+
+class ModelRouterBulkAssignmentWrite(StrictModel):
+    changes: list[ModelRouterAssignmentWrite] = Field(
+        default_factory=list, max_length=1000
+    )
+    department_assignments: list[ModelRouterDepartmentAssignmentWrite] = Field(
+        default_factory=list, max_length=200
+    )
+    all_matching_assigned: bool | None = None
+    department_id: str | None = Field(default=None, max_length=320)
+    query: str | None = Field(default=None, max_length=200)
+
+
+class ModelRouterBulkAssignmentResult(StrictModel):
+    router_id: UUID
+    updated_count: int = Field(ge=0)
+    assigned_count: int = Field(ge=0)
+
+
 class ModelRouterAssignedList(StrictModel):
     items: list[ModelRouter]
 

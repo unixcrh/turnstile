@@ -34,6 +34,7 @@ from .service_dependencies import ApplicationAccessServiceDependency, ControlPla
 from .session import (
     CurrentSession,
     OwnerSession,
+    cache_verified_subscription_key,
     require_allowed_write_origin,
     require_authenticated_session,
 )
@@ -121,9 +122,17 @@ def reveal_gateway_application_subscription_key(
     del identity
     _disable_secret_caching(response)
     try:
-        return service.reveal_application_subscription_key(
+        secret = service.reveal_application_subscription_key(
             application_id, application_subscription_id, key_kind
         )
+        sub_meta = service._key_subscription(application_id, application_subscription_id)
+        cache_verified_subscription_key(
+            secret.value,
+            application_id=application_id,
+            apim_subscription_id=str(sub_meta["apim_subscription_id"]),
+            gateway_profile_id=str(sub_meta["gateway_profile_id"]),
+        )
+        return secret
     except ControlPlaneUnavailableError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     except ControlPlaneNotFoundError as error:

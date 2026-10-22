@@ -86,10 +86,11 @@ export function StrategyModelEditor({
   }
 
   const weightedMode = node.strategy_type === "weighted"
+  const modelBasedMode = node.strategy_type === "model_based"
   const orderedMode = !weightedMode
   return <div className={`router-strategy-model-editor ${compact ? "compact" : ""}`}>
     <div className="router-strategy-model-heading">
-      <span>{weightedMode ? "候选模型权重" : node.strategy_type === "model_based" ? "安全回退顺序" : "优先级顺序"}</span>
+      <span>{weightedMode ? "候选模型权重" : modelBasedMode ? "安全回退顺序" : "优先级顺序"}</span>
       <small>{configs.length} 个模型</small>
     </div>
     <div className="router-strategy-model-list">
@@ -121,8 +122,9 @@ export function StrategyModelEditor({
             </span>
           </div>
           {weightedMode && <label className="router-field router-strategy-weight"><span>权重</span><Input aria-label={`${model?.display_name ?? config.model_id} 权重`} type="number" min={1} max={100} value={config.weight} onChange={(event) => updateConfig(config.model_id, { weight: Math.min(100, Math.max(1, Number(event.target.value) || 1)) })} /></label>}
+          {modelBasedMode && <label className="router-field router-strategy-description"><span>路由用途说明</span><Textarea rows={2} maxLength={1000} placeholder="说明该模型适合处理的任务，供 Routing Model 判路由时参考" value={config.description} onChange={(event) => updateConfig(config.model_id, { description: event.target.value })} /></label>}
           {constraintsExpanded && <div className="router-strategy-model-constraints">
-            <label className="router-field span-2"><span>路由用途说明</span><Textarea rows={3} maxLength={1000} placeholder="说明该模型适合处理的任务，供 Routing Model 判路由时参考" value={config.description} onChange={(event) => updateConfig(config.model_id, { description: event.target.value })} /></label>
+            {!modelBasedMode && <label className="router-field span-2"><span>路由用途说明</span><Textarea rows={3} maxLength={1000} placeholder="说明该模型适合处理的任务，供 Routing Model 判路由时参考" value={config.description} onChange={(event) => updateConfig(config.model_id, { description: event.target.value })} /></label>}
             <label className="router-field"><span>候选超时 ms</span><Input type="number" min={1} placeholder="使用 Strategy 默认值" value={config.max_latency_ms ?? ""} onChange={(event) => updateConfig(config.model_id, { max_latency_ms: numberOrNull(event.target.value) })} /></label>
             <label className="router-field"><span>最高单价 / M</span><Input type="number" min={0} step="0.01" placeholder="不限" value={config.max_cost_per_million ?? ""} onChange={(event) => updateConfig(config.model_id, { max_cost_per_million: numberOrNull(event.target.value) })} /></label>
           </div>}

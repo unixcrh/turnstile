@@ -7,6 +7,7 @@ import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 from xml.etree import ElementTree as ET
 
 import pytest
@@ -16,6 +17,7 @@ from tests.backend.telemetry.test_atomic_ledger import EPOCH, NOW, completion, i
 from turnstile_core.domain.ledger import LedgerAdmissionReceipt, complete_ledger, reserve_ledger
 from turnstile_core.integrations import apim_budget_execution as compiler
 from turnstile_core.integrations import apim_model_availability as availability
+from turnstile_core.integrations import apim_storage_routes as storage_routes
 from turnstile_core.integrations.apim_control_plane_contract import PolicyCompilationError
 from turnstile_core.integrations.apim_policy_components import parse_policy
 
@@ -237,6 +239,7 @@ def compiled_expressions(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path
     expressions.update(application_tpm_expressions().values())
     expressions.update(value for name, value in vars(availability).items()
                        if name.isupper() and isinstance(value, str) and value.startswith("@"))
+    expressions.add(storage_routes.READ_FIXED_CONTENT)
     assembled = ET.Element("inbound")
     compiler._native_count(assembled)
     compiler._deny(assembled, "@(true)", "budget_request_invalid", cancel_preparing=True)
@@ -1012,6 +1015,81 @@ def test_error_owner_preserves_status_contract(
     assert result == status
 
 
+@pytest.mark.parametrize("header_count,fault,accepted", [
+    (0, None, True), (90, None, True), (91, None, False),
+    (0, "separate-runtime", True), (0, "duplicate-backend", False),
+    (0, "duplicate-backend-case", False), (0, "invalid-runtime", False),
+    (0, "pool-disabled", False),
+    (90, "configuration-sha", True), (0, "invalid-configuration-sha", False),
+])
+def test_fixed_content_csharp_accepts_deployments_not_unique_runtimes(
+    compiled_expressions: tuple[Path, str], tmp_path: Path,
+    header_count: int, fault: str | None, accepted: bool,
+) -> None:
+    from tests.backend.model_platform.test_storage_route_contracts import route_fixture
+    from turnstile_core.domain.storage_routes import canonical_document
+
+    route, _ = route_fixture()
+    document = route.model_dump(mode="json")
+    members = [
+        {"runtime_id": str(UUID(int=80)), "backend_id": "unit-member-" + str(index),
+         "dependency_sha256": "a" * 64, "priority": 0, "weight": 1}
+        for index in range(2)
+    ]
+    if fault == "separate-runtime":
+        members[1]["runtime_id"] = str(UUID(int=81))
+    elif fault == "duplicate-backend":
+        members[1]["backend_id"] = members[0]["backend_id"]
+    elif fault == "duplicate-backend-case":
+        members[1]["backend_id"] = str(members[0]["backend_id"]).upper()
+    elif fault == "invalid-runtime":
+        members[1]["runtime_id"] = "not-a-uuid"
+    document["connection"]["pool"] = {
+        "members": members,
+        "rate_limit": {
+            "max_attempts_per_request": 2, "retry_interval_seconds": 1,
+            "first_fast_retry": True, "backend_timeout_seconds": 120,
+            "circuit_breaker": {
+                "failure_count": 1, "interval_seconds": 60, "trip_duration_seconds": 60,
+                "accept_retry_after": True,
+                "status_code_ranges": [
+                    {"minimum": 429, "maximum": 429},
+                    {"minimum": 408, "maximum": 408},
+                    {"minimum": 500, "maximum": 599},
+                ],
+                "error_reasons": ["BackendConnectionFailure", "Timeout"],
+            },
+        },
+        "session_cookie_name": None, "credential_versions": {},
+        "header_values": {"unit-header-" + str(index): "value" for index in range(header_count)},
+    }
+    if fault in {"configuration-sha", "invalid-configuration-sha"}:
+        document["connection"]["pool"]["configuration_sha256"] = (
+            "a" * 64 if fault == "configuration-sha" else "invalid"
+        )
+    content = canonical_document(document)
+    result = run_cases(compiled_expressions, tmp_path, [{
+        "expression": expression_id(storage_routes.READ_FIXED_CONTENT), "body": "{}",
+        "operation": "chat-completions",
+        "variables": {
+            "routeCachedContent": content,
+            "routeScope": json.dumps(document["scope"]),
+            "routeBudgetEpoch": document["budget_epoch"],
+            "routePoolEnabled": fault != "pool-disabled",
+            "routeHead": json.dumps({"approval": {"required_profiles": [document["profile"]]}}),
+            "routeMember": json.dumps({
+                "model_id": document["model_id"], "alias": document["alias"],
+                "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+                "connection_approval": {"connection": document["connection"]},
+            }),
+        },
+    }])[0]
+    if accepted:
+        assert json.loads(result) == document
+    else:
+        assert result == ""
+
+
 def stored_response(document: dict[str, Any], etag: str = 'W/"unit"') -> dict[str, Any]:
     return {
         "__response": True,
@@ -1243,3 +1321,205 @@ def test_offline_candidate_uses_public_template_without_enabling_it() -> None:
     rendered = parse_policy(render_candidate(template))
     assert rendered.find(".//set-variable[@name='executionRequestAnalysis']") is not None
     assert rendered.find(".//set-variable[@name='budgetExecutionFence']") is None
+
+
+def test_dispatch_lease_uses_fresh_admission_timestamp_after_slow_request_upload(
+    compiled_expressions: tuple[Path, str],
+    tmp_path: Path,
+) -> None:
+    from turnstile_core.domain.ledger import LedgerDispatch
+
+    admission = compiler._admission()
+    dispatch_node = admission.find(".//set-variable[@name='executionDispatch']")
+    etag_node = admission.find(".//set-variable[@name='executionDispatchEtag']")
+    assert dispatch_node is not None and etag_node is not None
+    case = planned_case({"messages": [{"role": "user", "content": "unit"}], "max_tokens": 32})
+    case["variables"]["requestStarted"] = (
+        datetime.now(UTC) - timedelta(seconds=900)
+    ).isoformat()
+    case["variables"]["callerRequestId"] = "caller-slow-upload"
+    case["steps"].append({"expression": expression_id(compiler.PLAN), "variable": "executionPlan"})
+    case["expression"] = expression_id(dispatch_node.attrib["value"])
+    dispatch_raw = run_cases(compiled_expressions, tmp_path, [case])[0]
+    validated = LedgerDispatch.model_validate(dispatch_raw)
+    assert validated.expires_at - validated.receipts[0].identity.admitted_at == timedelta(
+        seconds=45
+    )
+    etag_case = {
+        "body": "{}",
+        "expression": expression_id(etag_node.attrib["value"]),
+        "variables": {
+            "executionDispatchInitial": dispatch_raw,
+            "executionDispatchRead": stored_response(dispatch_raw, etag='W/"fresh-dispatch"'),
+        },
+    }
+    assert run_cases(compiled_expressions, tmp_path, [etag_case])[0] == 'W/"fresh-dispatch"'
+
+
+def test_multimodal_reservation_bounds_base64_and_url_without_byte_inflation(
+    compiled_expressions: tuple[Path, str],
+    tmp_path: Path,
+) -> None:
+    uncompressed_data_url = "data:image/png;base64," + ("A" * 1_049_696)
+    compressed_data_url = "data:image/png;base64," + ("B" * 1_988)
+    remote_url = "https://cdn.example/image.png"
+
+    def make_chat_body(url: str) -> dict[str, Any]:
+        return {
+            "model": "unit-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this image."},
+                        {"type": "image_url", "image_url": {"url": url}},
+                    ],
+                }
+            ],
+        }
+
+    cases = []
+    for url in (uncompressed_data_url, compressed_data_url, remote_url):
+        case = planned_case(make_chat_body(url), operation="chat-completions", legacy=True)
+        Fence = json.loads(case["variables"]["budgetExecutionFence"])
+        Fence["model_contracts"]["unit-model"]["output_field"] = "max_tokens"
+        case["variables"]["budgetExecutionFence"] = json.dumps(Fence)
+        cases.append(case)
+
+    for url in (uncompressed_data_url, compressed_data_url, remote_url):
+        case = planned_case(make_chat_body(url), operation="chat-completions", legacy=False)
+        Fence = json.loads(case["variables"]["budgetExecutionFence"])
+        Fence["model_contracts"]["unit-model"]["multimodal_item_ceiling"] = 1700
+        case["variables"]["budgetExecutionFence"] = json.dumps(Fence)
+        cases.append(case)
+
+    results = run_cases(compiled_expressions, tmp_path, cases)
+    legacy_uncompressed, legacy_compressed, legacy_url = results[:3]
+    verified_uncompressed, verified_compressed, verified_url = results[3:]
+
+    # 1. Both uncompressed (~1.05MB) and compressed (~2KB) inline Base64 images produce
+    # identical non-media byte estimates and identical total reservations (~8,357 tokens),
+    # well within the 862,562 available balance from incident ecce1223-4255-458e-b21d-ec6d5154ec7e.
+    assert legacy_uncompressed["error"] == ""
+    assert legacy_compressed["error"] == ""
+    assert legacy_uncompressed["body_bytes_estimate"] > 1_000_000
+    assert legacy_compressed["body_bytes_estimate"] < 3_000
+    assert (
+        legacy_uncompressed["non_media_body_bytes_estimate"]
+        == legacy_compressed["non_media_body_bytes_estimate"]
+    )
+    assert legacy_uncompressed["media_reserve_tokens"] == 4096
+    assert (
+        legacy_uncompressed["receipts"][0]["reserved_tokens"]
+        == legacy_compressed["receipts"][0]["reserved_tokens"]
+    )
+    assert legacy_uncompressed["receipts"][0]["reserved_tokens"] < 10_000
+    assert legacy_uncompressed["inline_media_count"] == 1
+    assert legacy_uncompressed["remote_media_count"] == 0
+    assert legacy_uncompressed["media_sources"] == ["data_url"]
+
+    # 2. Switching to a short URL still reserves media_reserve_tokens (4,096) and cannot
+    # bypass multimodal reservation with a 29-byte URL string.
+    assert legacy_url["error"] == ""
+    assert legacy_url["inline_media_count"] == 0
+    assert legacy_url["remote_media_count"] == 1
+    assert legacy_url["media_sources"] == ["url"]
+    assert legacy_url["media_reserve_tokens"] == 4096
+    assert (
+        legacy_url["receipts"][0]["reserved_tokens"]
+        == legacy_uncompressed["receipts"][0]["reserved_tokens"]
+    )
+
+    # 3. Verified context_input_ceiling_v1 with multimodal_item_ceiling = 1700 bounds all three
+    # to non_media_body_bytes_estimate + 1700 + 4096 with verified_upper_bound assurance.
+    for verified in (verified_uncompressed, verified_compressed, verified_url):
+        assert verified["error"] == ""
+        assert verified["count_assurance"] == "verified_upper_bound"
+        assert verified["media_reserve_tokens"] == 1700
+        assert (
+            verified["receipts"][0]["reserved_tokens"]
+            == verified["non_media_body_bytes_estimate"] + 1700 + 4096
+        )
+
+
+def test_hard_budget_rejects_legacy_estimate_and_denial_includes_media_diagnostics(
+    compiled_expressions: tuple[Path, str],
+    tmp_path: Path,
+) -> None:
+    from turnstile_core.domain.ledger import LedgerAdmissionDenied
+
+    # 1. Python LedgerSummary with require_verified_bound=True rejects estimate assurance
+    hard_summary = summary().model_copy(update={"require_verified_bound": True})
+    with pytest.raises(LedgerAdmissionDenied) as exc_info:
+        reserve_ledger(hard_summary, identity(), 500, NOW, count_assurance="estimate")
+    assert exc_info.value.code == "budget_count_bound_unavailable"
+
+    # 2. C# RESERVATION with require_verified_bound=True rejects estimate assurance
+    receipt = LedgerAdmissionReceipt(identity=identity(), epoch=EPOCH, reserved_tokens=8357)
+    res_case = {
+        "body": "{}",
+        "expression": expression_id(compiler.RESERVATION),
+        "variables": {
+            "executionSummaryRead": stored_response(
+                {**hard_summary.model_dump(mode="json"), "require_verified_bound": True}
+            ),
+            "executionReceipt": receipt.model_dump(mode="json"),
+            "executionPlan": {"count_assurance": "estimate"},
+        },
+    }
+    res_result = run_cases(compiled_expressions, tmp_path, [res_case])[0]
+    assert res_result["error"] == "budget_count_bound_unavailable"
+
+    # 3. C# executionDecision on denial includes reservation breakdown without leaking base64 data
+    secret_payload = "SECRET_IMAGE_PAYLOAD_" + ("Z" * 512)
+    chat_body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64," + secret_payload},
+                    }
+                ],
+            }
+        ],
+        "max_tokens": 2048,
+    }
+    plan_case = planned_case(chat_body, operation="chat-completions", legacy=True)
+    fence = json.loads(plan_case["variables"]["budgetExecutionFence"])
+    fence["model_contracts"]["unit-model"]["output_field"] = "max_tokens"
+    plan_case["variables"]["budgetExecutionFence"] = json.dumps(fence)
+    plan_result = run_cases(compiled_expressions, tmp_path, [plan_case])[0]
+
+    decision_node = compiler._admission().find(".//set-variable[@name='executionDecision']")
+    assert decision_node is not None
+    tight_summary = summary(
+        token_limit=1_000_000, confirmed_tokens=995_000, upper_bound_tokens=0
+    )
+    decision_case = {
+        "body": json.dumps(chat_body),
+        "operation": "chat-completions",
+        "expression": expression_id(decision_node.attrib["value"]),
+        "variables": {
+            "executionError": "budget_request_bound_exceeds_balance",
+            "executionPlan": plan_result,
+            "executionReceipt": plan_result["receipts"][0],
+            "executionReservation": {"snapshot": tight_summary.model_dump(mode="json")},
+        },
+    }
+    decision = run_cases(compiled_expressions, tmp_path, [decision_case])[0]
+    assert decision["code"] == "budget_request_bound_exceeds_balance"
+    assert decision["count_assurance"] == "estimate"
+    assert decision["inline_media_count"] == 1
+    assert decision["inline_media_bytes"] == len("data:image/png;base64," + secret_payload)
+    assert decision["media_sources"] == ["data_url"]
+    assert decision["media_reserve_tokens"] == 4096
+    assert decision["output_reserve_tokens"] == 2048
+    assert (
+        decision["request_bound"]
+        == decision["input_reserve_tokens"] + decision["output_reserve_tokens"]
+    )
+    assert secret_payload not in json.dumps(decision)
+    assert secret_payload not in json.dumps(plan_result)
+

@@ -57,6 +57,7 @@ PUBLICATION_REQUIRED_ACTIONS: tuple[str, ...] = tuple(_PUBLICATION_PERMISSIONS["
 PUBLICATION_RECOVERY_ACTIONS: tuple[str, ...] = tuple(_PUBLICATION_PERMISSIONS["recovery"])
 PUBLICATION_PROBE_ACTIONS: tuple[str, ...] = tuple(_PUBLICATION_PERMISSIONS["probe"])
 PUBLICATION_OAUTH_ACTIONS: tuple[str, ...] = tuple(_PUBLICATION_PERMISSIONS["oauth"])
+PUBLICATION_OBSERVER_ACTIONS: tuple[str, ...] = tuple(_PUBLICATION_PERMISSIONS["observer"])
 GATEWAY_PROVISION_ACTIONS: tuple[str, ...] = tuple(_PUBLICATION_PERMISSIONS["gateway_provision"])
 GATEWAY_BOOTSTRAP_ACTIONS: tuple[str, ...] = tuple(_PUBLICATION_PERMISSIONS["gateway_bootstrap"])
 
@@ -491,6 +492,7 @@ class GatewayCredentialRotation(StrictModel):
 
 class GatewayBackendPoolMemberWrite(StrictModel):
     runtime_id: UUID
+    model_id: UUID | None = Field(default=None, exclude_if=lambda value: value is None)
     priority: int = Field(ge=0, le=100)
     weight: int = Field(ge=0, le=100)
 
@@ -550,9 +552,9 @@ class GatewayBackendPoolWrite(StrictModel):
 
     @model_validator(mode="after")
     def validate_members(self) -> GatewayBackendPoolWrite:
-        runtime_ids = [member.runtime_id for member in self.members]
-        if len(runtime_ids) != len(set(runtime_ids)):
-            raise ValueError("a backend pool cannot repeat a runtime")
+        deployment_ids = [(member.runtime_id, member.model_id) for member in self.members]
+        if len(deployment_ids) != len(set(deployment_ids)):
+            raise ValueError("a backend pool cannot repeat a deployment")
         priority_weights: dict[int, int] = {}
         for member in self.members:
             priority_weights[member.priority] = (
@@ -565,6 +567,12 @@ class GatewayBackendPoolWrite(StrictModel):
 
 class GatewayBackendPoolMember(StrictModel):
     runtime_id: UUID
+    model_id: UUID | None = Field(default=None, exclude_if=lambda value: value is None)
+    upstream_model_id: str | None = Field(
+        default=None, min_length=1, max_length=255,
+        exclude_if=lambda value: value is None,
+    )
+    project_endpoint: HttpUrl | None = Field(default=None, exclude_if=lambda value: value is None)
     runtime_name: str = Field(min_length=1, max_length=160)
     backend_url: HttpUrl
     auth_strategy: AuthStrategy = AuthStrategy.NONE
@@ -594,6 +602,7 @@ class GatewayBackendPoolConfig(StrictModel):
             members=[
                 GatewayBackendPoolMemberWrite(
                     runtime_id=member.runtime_id,
+                    model_id=member.model_id,
                     priority=member.priority,
                     weight=member.weight,
                 )
@@ -603,6 +612,22 @@ class GatewayBackendPoolConfig(StrictModel):
             session_affinity=self.session_affinity,
         )
         return self
+
+
+class GatewayBackendPoolCandidate(StrictModel):
+    model_id: UUID
+    runtime_id: UUID
+    runtime_name: str
+    deployment_name: str
+    project_endpoint: str | None = None
+    model_name: str
+    model_version: str | None = None
+    model_publisher: str
+
+
+class GatewayBackendPoolSummary(StrictModel):
+    model_id: UUID
+    pool: GatewayBackendPoolConfig
 
 
 class DiscoveryModel(StrictModel):
@@ -718,6 +743,38 @@ class GatewayModelBinding(StrictModel):
         return self
 
 
+def pool_member_binding(
+    binding: GatewayModelBinding, member: GatewayBackendPoolMember,
+) -> GatewayModelBinding:
+    config = {name: value for name, value in binding.runtime_config.items() if name not in {
+        "apim_backend_pool", "apim_backend_pool_session_affinity",
+    }}
+    if member.project_endpoint is not None or "project_endpoint" in config:
+        config["project_endpoint"] = str(member.project_endpoint or member.backend_url).rstrip("/")
+    return GatewayModelBinding.model_validate({
+        **binding.model_dump(mode="python"), "runtime_id": member.runtime_id,
+        "model": binding.model.model_copy(update={
+            "upstream_model_id": member.upstream_model_id or binding.model.upstream_model_id,
+        }),
+        "runtime_name": member.runtime_name, "backend_url": member.backend_url,
+        "auth_strategy": member.auth_strategy, "named_value_name": member.named_value_name,
+        "key_vault_secret_id": binding.key_vault_secret_id if (
+            member.runtime_id == binding.runtime_id
+            and member.named_value_name == binding.named_value_name
+        ) else None,
+        "managed_identity_resource": binding.managed_identity_resource
+        if member.auth_strategy is AuthStrategy.MANAGED_IDENTITY else None,
+        "runtime_config": config,
+    })
+
+
+def pool_member_bindings(binding: GatewayModelBinding) -> tuple[GatewayModelBinding, ...]:
+    pool = binding.backend_pool
+    if pool is None:
+        return ()
+    return tuple(pool_member_binding(binding, member) for member in pool.members)
+
+
 class GatewayReleaseSpec(StrictModel):
     gateway_profile_id: UUID
     discovery_models: list[DiscoveryModel]
@@ -764,11 +821,19 @@ class GatewayReleaseSpec(StrictModel):
                 raise ValueError("only managed routes can use an APIM backend pool")
             if binding.runtime_id is None:
                 raise ValueError("a backend pool requires an existing primary runtime")
+            deployment_ids = [
+                (member.runtime_id, member.upstream_model_id or binding.model.upstream_model_id)
+                for member in pool.members
+            ]
+            if len(deployment_ids) != len(set(deployment_ids)):
+                raise ValueError("a backend pool cannot repeat a deployment")
             primary = next(
                 (
                     member
                     for member in pool.members
                     if member.runtime_id == binding.runtime_id
+                    and (member.upstream_model_id or binding.model.upstream_model_id)
+                    == binding.model.upstream_model_id
                 ),
                 None,
             )
@@ -1184,6 +1249,7 @@ def publication_failure(
     if preflight:
         allowed = {
             *PUBLICATION_REQUIRED_ACTIONS, *PUBLICATION_PROBE_ACTIONS, *PUBLICATION_OAUTH_ACTIONS,
+            *PUBLICATION_OBSERVER_ACTIONS,
         }
         supplied = details.get("missing_actions", [])
         if not isinstance(supplied, list) or any(

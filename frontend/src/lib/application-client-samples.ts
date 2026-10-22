@@ -2,6 +2,11 @@ export type ClientSampleLanguage = "bash" | "python" | "javascript"
 export type GatewayApiOperation = "models" | "chat_completions" | "responses" | "responses_compact" | "anthropic_messages" | "anthropic_count_tokens" | "image_generations" | "decision"
 export type ClientSampleOperation = GatewayApiOperation
 
+export type ClientSampleRequest = {
+  payload?: Record<string, unknown>
+  headers?: Record<string, string>
+}
+
 export type GatewayApiOperationOption = {
   id: GatewayApiOperation
   label: string
@@ -78,13 +83,15 @@ export function clientSampleFor(
   endpoint: string,
   modelKey: string,
   operation: ClientSampleOperation,
+  options?: ClientSampleRequest,
 ) {
-  const request = requestFor(operation, modelKey)
+  const request = { ...requestFor(operation, modelKey), ...(options?.payload ? { payload: options.payload } : {}) }
   const url = `${endpoint.replace(/\/+$/, "")}${request.path}`
   const payload = JSON.stringify(request.payload)
   const modelList = operation === "models"
   const keyHeader = "Ocp-Apim-Subscription-Key"
   const keyVariable = "TURNSTILE_APIM_KEY"
+  const extraHeaders = Object.entries(options?.headers ?? {})
   const anthropic = operation === "anthropic_messages" || operation === "anthropic_count_tokens"
   const anthropicHeaders = anthropic
     ? ['-H "anthropic-version: 2023-06-01"']
@@ -95,6 +102,7 @@ export function clientSampleFor(
       `curl ${shellQuote(url)}`,
       `-H "${keyHeader}: \${${keyVariable}:?Set ${keyVariable} first}"`,
       ...anthropicHeaders,
+      ...extraHeaders.map(([name, value]) => `-H ${shellQuote(`${name}: ${value}`)}`),
       ...(modelList ? ['--request GET'] : [
         '-H "Content-Type: application/json"',
         `--data-raw ${shellQuote(payload!)}`,
@@ -109,7 +117,7 @@ from urllib.request import Request, urlopen
 url = ${JSON.stringify(url)}
 ${modelList ? "" : `payload = json.loads(${JSON.stringify(payload)})\n`}headers = {
   "${keyHeader}": os.environ["${keyVariable}"],
-${modelList ? "" : '  "Content-Type": "application/json",\n'}${anthropic ? '  "anthropic-version": "2023-06-01",\n' : ""}}
+${modelList ? "" : '  "Content-Type": "application/json",\n'}${anthropic ? '  "anthropic-version": "2023-06-01",\n' : ""}${extraHeaders.map(([name, value]) => `  ${JSON.stringify(name)}: ${JSON.stringify(value)},\n`).join("")}}
 request = Request(url, ${modelList ? 'method="GET", ' : "data=json.dumps(payload).encode(), "}headers=headers)
 with urlopen(request) as response:
     print(response.read().decode())`
@@ -119,7 +127,7 @@ with urlopen(request) as response:
   method: "${modelList ? "GET" : "POST"}",
   headers: {
     "${keyHeader}": process.env.${keyVariable},
-${modelList ? "" : '    "Content-Type": "application/json",\n'}${anthropic ? '    "anthropic-version": "2023-06-01",\n' : ""}  }${modelList ? "" : `,\n  body: JSON.stringify(${JSON.stringify(request.payload, null, 2)!.replaceAll("\n", "\n  ")})`}
+  ${modelList ? "" : '    "Content-Type": "application/json",\n'}${anthropic ? '    "anthropic-version": "2023-06-01",\n' : ""}${extraHeaders.map(([name, value]) => `    ${JSON.stringify(name)}: ${JSON.stringify(value)},\n`).join("")}  }${modelList ? "" : `,\n  body: JSON.stringify(${JSON.stringify(request.payload, null, 2)!.replaceAll("\n", "\n  ")})`}
 });
 
 if (!response.ok) throw new Error(await response.text());

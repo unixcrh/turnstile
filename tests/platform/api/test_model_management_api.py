@@ -61,7 +61,7 @@ def publication_api() -> Iterator[InMemoryRepository]:
     service = GatewayControlPlaneService(
         repository,
         CredentialCipher(Fernet.generate_key()),
-        apim_principal_id="39deeba0-9799-4806-96c4-2f65eb0f22d1",
+        apim_principal_id="00000000-0000-0000-0000-000000000705",
         image_generation_defaults=Settings().image_generation_defaults,
     )
     app.dependency_overrides[get_repository] = lambda: repository
@@ -331,7 +331,7 @@ def management_runtime_service(
         Settings(
             management_api_key=SecretStr("management-secret"),
             credential_encryption_key=SecretStr(Fernet.generate_key().decode()),
-            apim_principal_id="39deeba0-9799-4806-96c4-2f65eb0f22d1",
+            apim_principal_id="00000000-0000-0000-0000-000000000705",
         ),
     )
     app.dependency_overrides[runtime_service] = lambda: service
@@ -1458,6 +1458,34 @@ def activate(repository: InMemoryRepository, publication_id: str) -> None:
     activate_publication(repository, item_id, "worker")
 
 
+def test_pool_read_apis_require_session_and_candidate_owner(
+    publication_api: InMemoryRepository,
+) -> None:
+    model = next(item for item in publication_api.models if item["enabled"])
+    path = f"/api/v1/model-management/models/{model['id']}/backend-pool/candidates"
+    before = deepcopy(publication_api.models)
+    assert client.get("/api/v1/model-management/backend-pools").json() == []
+
+    def denied_session() -> None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    app.dependency_overrides[require_authenticated_session] = denied_session
+    assert client.get("/api/v1/model-management/backend-pools").status_code == 401
+    assert client.get(path).status_code == 401
+    app.dependency_overrides[require_authenticated_session] = lambda: SessionIdentity(
+        id="member", email="member@contoso.com", name="Member", role="member",
+        method="password", session_expires_at=datetime(2026, 8, 17, tzinfo=UTC),
+    )
+
+    def denied_owner() -> None:
+        raise HTTPException(status_code=403, detail="Owner access required")
+
+    app.dependency_overrides[require_publication_owner] = denied_owner
+    assert client.get(path).status_code == 403
+    assert publication_api.models == before
+    assert publication_api.gateway_publications == []
+
+
 @pytest.mark.parametrize("affinity", (False, True))
 def test_model_backend_pool_configuration_and_removal_are_publications(
     publication_api: InMemoryRepository,
@@ -1709,7 +1737,7 @@ def test_model_backend_pool_rejects_incompatible_runtime_path(
     )
     effective = GatewayControlPlaneService(
         publication_api,
-        apim_principal_id="39deeba0-9799-4806-96c4-2f65eb0f22d1",
+        apim_principal_id="00000000-0000-0000-0000-000000000705",
     ).publish(
         GatewayPublicationCreate.model_validate(
             {
@@ -1806,7 +1834,7 @@ def test_model_backend_pool_rejects_runtime_without_equivalent_deployment(
     )
     effective = GatewayControlPlaneService(
         publication_api,
-        apim_principal_id="39deeba0-9799-4806-96c4-2f65eb0f22d1",
+        apim_principal_id="00000000-0000-0000-0000-000000000705",
     ).publish(
         GatewayPublicationCreate.model_validate(
             {
@@ -1954,7 +1982,7 @@ def test_foundry_authorization_handoff_is_safe_and_resumable(
     assert waiting.json()["status"] == "awaiting_authorization"
     assert waiting.json()["authorization"] == {
         "kind": "azure_rbac",
-        "principal_id": "39deeba0-9799-4806-96c4-2f65eb0f22d1",
+        "principal_id": "00000000-0000-0000-0000-000000000705",
         "resource_endpoint": (
             "https://contoso-ai.services.ai.azure.com/"
         ),

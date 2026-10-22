@@ -82,6 +82,10 @@ static_resources:
                             body:
                               inline_string: "ok"
                         - match:
+                            path: "/_turnstile/pool-deployment-probe"
+                          direct_response:
+                            status: 503
+                        - match:
                             prefix: "/"
                             headers:
                               - name: x-adapter-key
@@ -161,6 +165,44 @@ static_resources:
                         - { header: x-request-source, on_header_present: { metadata_namespace: turnstile.request, key: request_source, type: STRING }, remove: true }
                         - { header: x-adapter-key, on_header_present: { metadata_namespace: turnstile.request, key: adapter_authorized, type: STRING }, remove: true }
                         - { header: ocp-apim-subscription-key, on_header_present: { metadata_namespace: turnstile.request, key: apim_subscription_removed, type: STRING }, remove: true }
+                  - name: envoy.filters.http.lua
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                      clear_route_cache: false
+                      default_source_code:
+                        inline_string: |
+                          function envoy_on_request(handle)
+                            local headers = handle:headers()
+                            local deployment = headers:get("x-turnstile-pool-deployment")
+                            local path = headers:get(":path")
+                            if not deployment then return end
+                            headers:remove("x-turnstile-pool-deployment")
+                            local metadata = handle:streamInfo():dynamicMetadata():get("turnstile.request")
+                            if not metadata or metadata["adapter_authorized"] ~= "__ADAPTER_SHARED_KEY__" then return end
+                            local body = handle:body()
+                            if not body then
+                              handle:respond({[":status"] = "400"}, "Pool request body is missing")
+                              return
+                            end
+                            local success, result, replacement = pcall(function()
+                              return handle:httpCall("pool_deployment_rewriter", {
+                                [":method"] = "POST", [":path"] = "/", [":authority"] = "pool-deployment",
+                                ["content-type"] = "application/json",
+                                ["x-turnstile-pool-deployment"] = deployment
+                              }, body:getBytes(0, body:length()), 1000)
+                            end)
+                            if not success or not result or result[":status"] ~= "200" or not replacement then
+                              handle:respond({[":status"] = "502"}, "Pool deployment rewrite failed")
+                              return
+                            end
+                            if path == "/_turnstile/pool-deployment-probe" then
+                              handle:respond({[":status"] = "200", ["content-type"] = "application/json",
+                                ["x-turnstile-pool-deployment-version"] = "1"}, replacement)
+                              return
+                            end
+                            handle:body():setBytes(replacement)
+                            handle:headers():replace("content-length", tostring(#replacement))
+                          end
                   - name: envoy.filters.http.dynamic_forward_proxy
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig
@@ -262,6 +304,18 @@ static_resources:
             validation_context:
               trusted_ca:
                 filename: /etc/ssl/certs/ca-certificates.crt
+    - name: pool_deployment_rewriter
+      type: STATIC
+      connect_timeout: 1s
+      load_assignment:
+        cluster_name: pool_deployment_rewriter
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 9081
 
 admin:
   access_log_path: /dev/null

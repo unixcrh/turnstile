@@ -142,7 +142,7 @@ def test_shared_apim_resources_are_environment_isolated() -> None:
     assert "displayName: '${productId} | Turnstile AI'" in APIM_INTEGRATION
     assert "param existingApimResourceGroupName string = ''" in MAIN
     assert "resource effectiveApimResourceGroup" not in MAIN
-    assert MAIN.count("scope: resourceGroup(effectiveApimResourceGroupName)") == 4
+    assert MAIN.count("scope: resourceGroup(effectiveApimResourceGroupName)") == 5
 
 
 def test_fresh_apim_creates_its_azure_monitor_logger() -> None:
@@ -669,6 +669,29 @@ def test_control_plane_role_has_no_subscription_or_resource_group_scope() -> Non
     assert "scope: apim" in CONTROL_PLANE_APIM_RBAC
     assert "assignableScopes: [" in CONTROL_PLANE_APIM_RBAC
     assert "resourceGroup().id" in CONTROL_PLANE_APIM_RBAC
+
+
+def test_publisher_observer_key_read_is_scoped_to_one_named_value() -> None:
+    source = (ROOT / "infra/modules/observer-named-value-rbac.bicep").read_text(
+        encoding="utf-8"
+    )
+    assert "param apimName string" in source
+    assert "param observerKeyNamedValue string" in source
+    assert "param publisherPrincipalId string" in source
+    assert "parent: apim" in source
+    assert "name: observerKeyNamedValue" in source
+    actions = source.split("actions: [", 1)[1].split("]", 1)[0]
+    assert actions.strip() == "'Microsoft.ApiManagement/service/namedValues/listValue/action'"
+    assert "scope: observerKey" in source
+    assert "scope: apim" not in source
+    assert "principalId: publisherPrincipalId" in source
+    assert "principalType: 'ServicePrincipal'" in source
+    assert "dataActions: []" in source
+    assert "module publisherObserverKeyAccess 'modules/observer-named-value-rbac.bicep'" in MAIN
+    assert "if (provisionControlPlane && !empty(apimUsageObserver.keyNamedValue))" in MAIN
+    assert "observerKeyNamedValue: apimUsageObserver.keyNamedValue" in MAIN
+    assert "publisherPrincipalId: controlPlane!.outputs.principalId" in MAIN
+    assert all(value not in source for value in ("xle-", "finops-", "75038ef6", "*/"))
 
 
 def test_custom_roles_use_installation_specific_names() -> None:

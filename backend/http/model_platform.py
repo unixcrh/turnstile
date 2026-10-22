@@ -3,9 +3,10 @@ from __future__ import annotations
 import logging
 import traceback
 from collections.abc import Callable, Coroutine
+from datetime import UTC, datetime
 from traceback import extract_tb
 from typing import Annotated, Any, Literal, TypeVar
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
@@ -22,7 +23,9 @@ from turnstile_core.domain.budget_delegation import (
 )
 from turnstile_core.domain.control_plane import (
     ApimOnboardingOperations,
+    GatewayBackendPoolCandidate,
     GatewayBackendPoolConfig,
+    GatewayBackendPoolSummary,
     GatewayBackendPoolWrite,
     GatewayCredentialRotation,
     GatewayPublicationCreate,
@@ -84,11 +87,15 @@ from turnstile_core.domain.model_availability import (
     ModelAvailabilityUnavailable,
 )
 from turnstile_core.domain.runtime_models import (
+    ChatCompletionsRequest,
+    ChatCompletionsResponse,
     DatabricksConnectionAdopt,
     DecisionInvocationRequest,
     DecisionInvocationResponse,
+    GatewayModelCatalogResponse,
     GatewayProfileNameWrite,
     GatewayProfileWrite,
+    InvocationMetadata,
     ManagedModelWrite,
     ModelConnectionCreate,
     ModelConnectionUpdate,
@@ -196,6 +203,13 @@ protected_router = APIRouter(
     ]
 )
 publication_router = APIRouter(route_class=ModelPlatformRoute)
+gateway_compat_router = APIRouter(
+    route_class=ModelPlatformRoute,
+    dependencies=[
+        Depends(require_authenticated_session),
+        Depends(require_allowed_write_origin),
+    ],
+)
 
 
 @protected_router.get("/api/v1/model-management", response_model=RegistryResponse)
@@ -579,6 +593,35 @@ def delete_model(
         publication=GatewayPublicationView.from_publication(publication),
         status_url=f"/api/v1/model-management/publications/{publication.id}",
     )
+
+
+@protected_router.get(
+    "/api/v1/model-management/backend-pools",
+    response_model=list[GatewayBackendPoolSummary],
+)
+def list_model_backend_pools(
+    service: ControlPlaneService, identity: CurrentSession,
+) -> list[GatewayBackendPoolSummary]:
+    del identity
+    return service.model_backend_pools()
+
+
+@protected_router.get(
+    "/api/v1/model-management/models/{item_id}/backend-pool/candidates",
+    response_model=list[GatewayBackendPoolCandidate],
+)
+def list_model_backend_pool_candidates(
+    item_id: UUID, service: ControlPlaneService, owner_email: PublicationOwner,
+) -> list[GatewayBackendPoolCandidate]:
+    del owner_email
+    try:
+        return service.model_backend_pool_candidates(item_id)
+    except ControlPlaneNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ControlPlaneConflictError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ControlPlaneUnavailableError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
 
 
 @publication_router.put(
@@ -1774,6 +1817,49 @@ def invoke_decision(
     return service.invoke_decision(request)
 
 
+@protected_router.get(
+    "/api/v1/model-gateway/models",
+    response_model=GatewayModelCatalogResponse,
+)
+@gateway_compat_router.get(
+    "/api/v1/model-gateway/v1/models",
+    response_model=GatewayModelCatalogResponse,
+    include_in_schema=False,
+)
+@gateway_compat_router.get(
+    "/v1/models",
+    response_model=GatewayModelCatalogResponse,
+    include_in_schema=False,
+)
+def list_gateway_models(
+    http_request: Request,
+    response: Response,
+    router_service: ModelRouterExecutionServiceDependency,
+    identity: CurrentSession,
+) -> GatewayModelCatalogResponse:
+    requested_user = (
+        str(http_request.headers.get("x-user-id") or "").strip()
+        if identity.role == "owner"
+        else ""
+    ) or identity.email
+    allowed_models = (
+        set(identity.allowed_model_ids)
+        if identity.allowed_model_ids is not None
+        else None
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["x-auth-method"] = identity.method
+    if identity.apim_subscription_id:
+        response.headers["x-apim-subscription-id"] = identity.apim_subscription_id
+    if identity.application_id:
+        response.headers["x-application-id"] = identity.application_id
+    return router_service.list_gateway_models(
+        requested_user,
+        include_published_routers=False,
+        allowed_model_ids=allowed_models,
+    )
+
+
 @protected_router.post("/api/v1/model-gateway/invoke", response_model=ModelInvocationResponse)
 def invoke_model(
     request: ModelInvocationRequest,
@@ -1784,9 +1870,333 @@ def invoke_model(
     settings: Config,
 ) -> ModelInvocationResponse:
     request = _bind_invocation_identity(request, identity, repository, settings)
+    allowed_models = (
+        set(identity.allowed_model_ids)
+        if identity.allowed_model_ids is not None
+        else None
+    )
+    request = router_service.resolve_invocation_target(request)
+    if (
+        allowed_models is not None
+        and request.model_id is not None
+        and request.model_id not in allowed_models
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Model is not permitted for this application subscription",
+        )
     if request.router_id is not None:
-        return router_service.invoke(request)
+        return router_service.invoke(request, allowed_model_ids=allowed_models)
     return service.invoke(request)
+
+
+@protected_router.post(
+    "/api/v1/model-gateway/chat/completions",
+    response_model=ChatCompletionsResponse,
+)
+@gateway_compat_router.post(
+    "/api/v1/model-gateway/v1/chat/completions",
+    response_model=ChatCompletionsResponse,
+    include_in_schema=False,
+)
+@gateway_compat_router.post(
+    "/v1/chat/completions",
+    response_model=ChatCompletionsResponse,
+    include_in_schema=False,
+)
+@gateway_compat_router.post(
+    "/chat/completions",
+    response_model=ChatCompletionsResponse,
+    include_in_schema=False,
+)
+def chat_completions(
+    request: ChatCompletionsRequest,
+    http_request: Request,
+    response: Response,
+    service: RuntimeService,
+    router_service: ModelRouterExecutionServiceDependency,
+    identity: CurrentSession,
+    repository: Repository,
+    settings: Config,
+) -> ChatCompletionsResponse:
+    catalog = merge_application_owners(
+        merge_observed_users(enterprise_catalog(), repository.observed_users()),
+        repository.application_owners(),
+    )
+    organization = catalog.organizations[0]
+    requested_user = (
+        str(
+            http_request.headers.get("x-user-id")
+            or request.user
+            or ""
+        ).strip()
+        if identity.role == "owner"
+        else ""
+    ) or identity.email
+    user_entry = next(
+        (u for u in catalog.users if u.id.casefold() == requested_user.casefold()),
+        None,
+    )
+    default_dept_id = (
+        user_entry.parent_id
+        if user_entry and user_entry.parent_id
+        else catalog.departments[0].id
+    )
+    dept_id = str(
+        http_request.headers.get("x-department-id")
+        or request.router_context.get("department_id")
+        or default_dept_id
+    )
+    department = next(
+        (d for d in catalog.departments if d.id == dept_id),
+        catalog.departments[0],
+    )
+    dept_projects = [
+        p for p in catalog.projects if p.parent_id == department.id
+    ] or list(catalog.projects)
+    proj_id = str(
+        http_request.headers.get("x-project-id")
+        or request.router_context.get("project_id")
+        or dept_projects[0].id
+    )
+    project = next(
+        (p for p in catalog.projects if p.id == proj_id),
+        dept_projects[0],
+    )
+    proj_agents = [
+        a for a in catalog.agents if a.parent_id == project.id
+    ] or list(catalog.agents)
+    agent_id = str(
+        http_request.headers.get("x-agent-id")
+        or request.router_context.get("agent_id")
+        or proj_agents[0].id
+    )
+    agent = next(
+        (a for a in catalog.agents if a.id == agent_id),
+        proj_agents[0],
+    )
+    interaction_id = (
+        str(
+            http_request.headers.get("x-interaction-id")
+            or http_request.headers.get("x-conversation-id")
+            or http_request.headers.get("x-copilot-interaction-id")
+            or request.router_context.get("interaction_id")
+            or ""
+        ).strip()[:128]
+        or None
+    )
+    session_id = (
+        str(
+            http_request.headers.get("x-session-id")
+            or request.router_context.get("session_id")
+            or ""
+        ).strip()[:128]
+        or None
+    )
+    run_id = str(
+        interaction_id
+        or session_id
+        or http_request.headers.get("x-run-id")
+        or request.router_context.get("run_id")
+        or uuid4()
+    )
+    raw_turn = (
+        http_request.headers.get("x-turn-index")
+        or request.router_context.get("turn_index")
+    )
+    try:
+        turn_index = max(1, int(str(raw_turn))) if raw_turn is not None else max(
+            1, sum(1 for msg in request.messages if msg.role == "user")
+        )
+    except ValueError:
+        turn_index = 1
+    router_context = dict(request.router_context)
+    if interaction_id:
+        router_context["interaction_id"] = interaction_id
+    if session_id:
+        router_context["session_id"] = session_id
+    if http_request.headers.get("x-task-type"):
+        router_context["task_type"] = str(http_request.headers["x-task-type"])
+    elif "task_type" not in router_context:
+        router_context["task_type"] = f"{project.id}-interactive"
+    if http_request.headers.get("x-initiator"):
+        router_context["x_initiator"] = str(http_request.headers["x-initiator"])
+    raw_ttl_header = (http_request.headers.get("x-session-ttl-seconds") or "").strip()
+    if raw_ttl_header.isdigit():
+        router_context["session_ttl_seconds"] = int(raw_ttl_header)
+    normalized_format: Literal["json_object"] | None = None
+    if request.response_format == "json_object" or (
+        isinstance(request.response_format, dict)
+        and request.response_format.get("type") == "json_object"
+    ):
+        normalized_format = "json_object"
+    invocation = ModelInvocationRequest(
+        metadata=InvocationMetadata(
+            organization_id=organization.id,
+            organization=organization.name,
+            department_id=department.id,
+            department=department.name,
+            project_id=project.id,
+            project=project.name,
+            agent_id=agent.id,
+            agent=agent.name,
+            user_id=user_entry.id if user_entry else requested_user,
+            user=user_entry.name if user_entry else (identity.name or requested_user),
+            workflow=str(
+                http_request.headers.get("x-workflow")
+                or router_context.get("task_type")
+                or f"{project.id}-interactive"
+            )[:255],
+            model_id=request.model.strip(),
+            model=request.model.strip(),
+            runtime="model-router",
+            request_source="agent-invocation-module",
+            run_id=run_id[:255],
+            turn_index=turn_index,
+        ),
+        router_context=router_context,
+        messages=request.messages,
+        tools=request.tools,
+        temperature=request.temperature,
+        max_output_tokens=request.max_completion_tokens or request.max_tokens or 1024,
+        reasoning_effort=request.reasoning_effort,
+        response_format=normalized_format,
+        stream=request.stream,
+    )
+    allowed_models = (
+        set(identity.allowed_model_ids)
+        if identity.allowed_model_ids is not None
+        else None
+    )
+    invocation = router_service.resolve_invocation_target(invocation)
+    if (
+        allowed_models is not None
+        and invocation.model_id is not None
+        and invocation.model_id not in allowed_models
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Model is not permitted for this application subscription",
+        )
+    if invocation.router_id is not None:
+        result = router_service.invoke(invocation, allowed_model_ids=allowed_models)
+    else:
+        if invocation.model_id is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No enabled model or router matches the requested model",
+            )
+        result = service.invoke(invocation)
+    served_model = result.selected_model_name or result.model
+    winning_attempt = next(
+        (
+            a
+            for a in result.router_attempts
+            if a.get("attempt_role") != "routing_decision"
+            and a.get("outcome") == "succeeded"
+        ),
+        None,
+    )
+    decision_attempt = next(
+        (
+            a
+            for a in result.router_attempts
+            if a.get("attempt_role") == "routing_decision"
+        ),
+        None,
+    )
+    response.headers["x-request-id"] = result.request_id
+    response.headers["x-routed-model"] = served_model
+    response.headers["x-auth-method"] = identity.method
+    if identity.apim_subscription_id:
+        response.headers["x-apim-subscription-id"] = identity.apim_subscription_id
+    if identity.application_id:
+        response.headers["x-application-id"] = identity.application_id
+    if result.router_id is not None:
+        response.headers["x-router-id"] = str(result.router_id)
+        response.headers["x-router-reason"] = str(
+            (winning_attempt or {}).get("decision_basis") or ""
+        )
+        response.headers["x-router-decision-ms"] = str(
+            (decision_attempt or {}).get("latency_ms") or 0
+        )
+        if winning_attempt and winning_attempt.get("sticky_bound_by"):
+            response.headers["x-router-sticky-bound-by"] = str(
+                winning_attempt["sticky_bound_by"]
+            )
+    if result.router_name:
+        response.headers["x-router-name"] = result.router_name
+    if interaction_id:
+        response.headers["x-router-interaction-id"] = interaction_id
+    if session_id:
+        response.headers["x-router-session-id"] = session_id
+    usage_dict = (
+        {
+            "prompt_tokens": result.usage.input_tokens + result.usage.cached_tokens,
+            "cached_tokens": result.usage.cached_tokens,
+            "cache_write_tokens": result.usage.cache_write_tokens,
+            "completion_tokens": result.usage.output_tokens,
+            "total_tokens": (
+                result.usage.input_tokens
+                + result.usage.cached_tokens
+                + result.usage.output_tokens
+            ),
+        }
+        if result.usage is not None
+        else None
+    )
+    message_payload: dict[str, Any] = {
+        "role": "assistant",
+        "content": result.content,
+    }
+    if result.tool_calls:
+        message_payload["tool_calls"] = [
+            call.model_dump(mode="json") for call in result.tool_calls
+        ]
+    return ChatCompletionsResponse(
+        id=result.request_id,
+        created=int(datetime.now(UTC).timestamp()),
+        model=served_model,
+        choices=[
+            {
+                "index": 0,
+                "message": message_payload,
+                "finish_reason": "tool_calls" if result.tool_calls else "stop",
+            }
+        ],
+        usage=usage_dict,
+        turnstile_routing={
+            "request_id": result.request_id,
+            "correlation_id": result.correlation_id,
+            "requested_model": request.model,
+            "routed": result.router_id is not None,
+            "router_id": str(result.router_id) if result.router_id else None,
+            "router_name": result.router_name,
+            "router_version": result.router_version,
+            "selected_model_id": (
+                str(result.selected_model_id) if result.selected_model_id else None
+            ),
+            "selected_model_name": served_model,
+            "decision_basis": (
+                (winning_attempt or {}).get("decision_basis")
+                if result.router_id is not None
+                else "direct_model"
+            ),
+            "sticky_bound_by": (winning_attempt or {}).get("sticky_bound_by"),
+            "sticky_key": (winning_attempt or {}).get("sticky_key"),
+            "session_id": session_id,
+            "interaction_id": interaction_id,
+            "auth_method": identity.method,
+            "apim_subscription_id": identity.apim_subscription_id,
+            "application_id": identity.application_id,
+            "provider": result.provider,
+            "runtime": result.runtime,
+            "gateway": result.gateway,
+            "latency_ms": result.latency_ms,
+            "estimated_cost": result.estimated_cost,
+            "router_attempts": result.router_attempts,
+        },
+    )
 
 
 @protected_router.post(

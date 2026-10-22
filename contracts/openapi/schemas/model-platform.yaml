@@ -453,6 +453,9 @@ schemas:
       enabled:
         type: boolean
         default: true
+      require_verified_bound:
+        type: boolean
+        default: false
       confirmed_tokens:
         type: integer
         maximum: 9.223372036854776e+18
@@ -1816,6 +1819,12 @@ schemas:
       runtime_id:
         type: string
         format: uuid
+      model_id:
+        type:
+        - string
+        - 'null'
+        format: uuid
+        description: Registered physical deployment. Distinct deployments may share a Runtime.
       priority:
         type: integer
         maximum: 100.0
@@ -1941,6 +1950,24 @@ schemas:
       runtime_id:
         type: string
         format: uuid
+      model_id:
+        type:
+        - string
+        - 'null'
+        format: uuid
+      upstream_model_id:
+        type:
+        - string
+        - 'null'
+        minLength: 1
+        maxLength: 255
+      project_endpoint:
+        type:
+        - string
+        - 'null'
+        format: uri
+        minLength: 1
+        maxLength: 2083
       runtime_name:
         type: string
         maxLength: 160
@@ -2003,6 +2030,51 @@ schemas:
     - members
     - rate_limit
     title: GatewayBackendPoolConfig
+  GatewayBackendPoolCandidate:
+    type: object
+    additionalProperties: false
+    required:
+    - model_id
+    - runtime_id
+    - runtime_name
+    - deployment_name
+    - model_name
+    - model_publisher
+    properties:
+      model_id:
+        type: string
+        format: uuid
+      runtime_id:
+        type: string
+        format: uuid
+      runtime_name:
+        type: string
+      deployment_name:
+        type: string
+      project_endpoint:
+        type:
+        - string
+        - 'null'
+      model_name:
+        type: string
+      model_version:
+        type:
+        - string
+        - 'null'
+      model_publisher:
+        type: string
+  GatewayBackendPoolSummary:
+    type: object
+    additionalProperties: false
+    required:
+    - model_id
+    - pool
+    properties:
+      model_id:
+        type: string
+        format: uuid
+      pool:
+        $ref: ../../openapi.yaml#/components/schemas/GatewayBackendPoolConfig
   GatewayProviderTarget:
     type: object
     additionalProperties: false
@@ -4513,6 +4585,17 @@ schemas:
           exclusiveMinimum: 0.0
         - type: 'null'
         title: Output Estimate
+      multimodal_item_ceiling:
+        anyOf:
+        - type: integer
+          maximum: 9.223372036854776e+18
+          exclusiveMinimum: 0.0
+        - type: 'null'
+        title: Multimodal Item Ceiling
+      require_verified_bound:
+        type: boolean
+        title: Require Verified Bound
+        default: false
       supported_features:
         items:
           type: string
@@ -4752,6 +4835,17 @@ schemas:
           exclusiveMinimum: 0.0
         - type: 'null'
         title: Output Estimate
+      multimodal_item_ceiling:
+        anyOf:
+        - type: integer
+          maximum: 9.223372036854776e+18
+          exclusiveMinimum: 0.0
+        - type: 'null'
+        title: Multimodal Item Ceiling
+      require_verified_bound:
+        type: boolean
+        title: Require Verified Bound
+        default: false
       supported_features:
         items:
           type: string

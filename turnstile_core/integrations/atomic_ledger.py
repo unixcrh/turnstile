@@ -320,7 +320,7 @@ class AtomicTableLedger(TableStorageLedger):
         )
 
     def quiesce_budget_scope(
-        self, scope: LedgerScope, epoch: UUID, revision: int,
+        self, scope: LedgerScope, epoch: UUID, revision: int, *, enabled: bool = False,
     ) -> LedgerSummary:
         for _ in range(3):
             current = self._read(scope, SUMMARY_ROW)
@@ -331,17 +331,17 @@ class AtomicTableLedger(TableStorageLedger):
                 raise LedgerProtocolConflict("Budget switch belongs to another scope or epoch")
             if summary.policy_revision >= revision:
                 return summary
-            if not summary.enabled:
+            if summary.enabled is enabled:
                 return summary
-            disabled = LedgerSummary.model_validate({
-                **summary.model_dump(), "enabled": False, "version": summary.version + 1,
+            updated = LedgerSummary.model_validate({
+                **summary.model_dump(), "enabled": enabled, "version": summary.version + 1,
                 "updated_at": datetime.now(UTC),
             })
             try:
-                self._commit(scope, [ConditionalEntity(SUMMARY_ROW, disabled, current[1])])
+                self._commit(scope, [ConditionalEntity(SUMMARY_ROW, updated, current[1])])
             except (LedgerCompareFailed, httpx.TransportError):
                 continue
-            return disabled
+            return updated
         raise LedgerUnavailable("Budget switch could not stop new reservations")
 
     def write_policy(

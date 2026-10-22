@@ -5,9 +5,11 @@ import os
 import shutil
 import subprocess
 import time
+from collections import OrderedDict
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import quote
@@ -305,6 +307,60 @@ class OpenAICompatibleGatewayAdapter:
     def __init__(self, implementation: GatewayKind, client: httpx.Client | None = None) -> None:
         self._implementation = implementation
         self._client = client or httpx.Client()
+        self._affinity_cookies: OrderedDict[tuple[str, str, str, str], dict[str, str]] = (
+            OrderedDict()
+        )
+
+    @staticmethod
+    def _affinity_scope(
+        request: ModelInvocationRequest | ImageInvocationRequest | DecisionInvocationRequest,
+        route: Mapping[str, Any],
+    ) -> tuple[str, str, str, str]:
+        session_ref = request.metadata.run_id
+        if isinstance(request, ModelInvocationRequest):
+            session_ref = str(
+                request.router_context.get("session_id")
+                or request.router_context.get("interaction_id")
+                or request.metadata.run_id
+            )
+        return (
+            str(route.get("gateway_id") or ""),
+            str(route.get("model_key") or ""),
+            request.metadata.user_id,
+            session_ref,
+        )
+
+    def _record_affinity_cookies(
+        self,
+        scope: tuple[str, str, str, str],
+        headers: httpx.Headers,
+    ) -> None:
+        raw_values = (
+            headers.get_list("set-cookie")
+            if hasattr(headers, "get_list")
+            else [headers.get("set-cookie", "")]
+        )
+        matched: dict[str, str] = {}
+        for raw in raw_values:
+            if not raw:
+                continue
+            jar = SimpleCookie()
+            try:
+                jar.load(raw)
+            except Exception:
+                continue
+            for name, morsel in jar.items():
+                if name.startswith("TurnstileAffinity-") and morsel.value:
+                    matched[name] = morsel.value
+        if matched:
+            existing = dict(self._affinity_cookies.get(scope) or {})
+            existing.update(matched)
+            self._affinity_cookies[scope] = existing
+            self._affinity_cookies.move_to_end(scope)
+            while len(self._affinity_cookies) > 2048:
+                self._affinity_cookies.popitem(last=False)
+        if hasattr(self._client, "cookies"):
+            self._client.cookies.clear()
 
     def _base_url(self, route: dict[str, Any]) -> str:
         value = route.get("gateway_base_url") or route.get("provider_endpoint_url")
@@ -370,7 +426,7 @@ class OpenAICompatibleGatewayAdapter:
             "x-project-name": metadata.project,
             "x-agent-id": metadata.agent_id,
             "x-agent-name": metadata.agent,
-            "x-model-id": str(route["model_id"]),
+            "x-model-id": str(route.get("delegated_model_id_header") or route["model_id"]),
             "x-runtime-id": str(route["runtime_id"]),
             "x-user-id": metadata.user_id,
             "x-user-name": metadata.user,
@@ -385,6 +441,18 @@ class OpenAICompatibleGatewayAdapter:
             "x-hive-turn-index": str(metadata.turn_index),
             "x-hive-model": str(route["model_key"]),
             "x-hive-runtime": str(route["runtime_name"]),
+            **(
+                {
+                    "cookie": "; ".join(
+                        f"{k}={v}"
+                        for k, v in self._affinity_cookies[
+                            self._affinity_scope(request, route)
+                        ].items()
+                    )
+                }
+                if self._affinity_scope(request, route) in self._affinity_cookies
+                else {}
+            ),
         }
 
     def invoke(self, request: ModelInvocationRequest, route: dict[str, Any]) -> GatewayResult:
@@ -431,6 +499,7 @@ class OpenAICompatibleGatewayAdapter:
             body["reasoning_effort"] = request.reasoning_effort
         if request.response_format is not None:
             body["response_format"] = {"type": request.response_format}
+        affinity_scope = self._affinity_scope(request, route)
         response_headers: dict[str, str] = {}
         with _gateway_response_errors(response_headers):
             if request.stream:
@@ -442,6 +511,7 @@ class OpenAICompatibleGatewayAdapter:
                     timeout=float(runtime_config.get("timeout_seconds", 120)),
                     follow_redirects=False,
                 ) as response:
+                    self._record_affinity_cookies(affinity_scope, response.headers)
                     response_headers.update(_response_headers(response.headers))
                     if response.is_error:
                         response.read()
@@ -485,6 +555,7 @@ class OpenAICompatibleGatewayAdapter:
                 timeout=float(runtime_config.get("timeout_seconds", 120)),
                 follow_redirects=False,
             ) as response:
+                self._record_affinity_cookies(affinity_scope, response.headers)
                 response_headers.update(_response_headers(response.headers))
                 response.read()
                 response.raise_for_status()

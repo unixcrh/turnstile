@@ -891,6 +891,7 @@ export function App() {
   const [sidebarOpen, setSidebarOpen] = useState(sidebarOpenFromCookie);
   const [sidebarOpenMobile, setSidebarOpenMobile] = useState(false);
   const [nativeRouteDrawerOpen, setNativeRouteDrawerOpen] = useState(false);
+  const [modelRouterDrawerOpen, setModelRouterDrawerOpen] = useState(false);
   const [gatewayReleaseDrawerOpen, setGatewayReleaseDrawerOpen] = useState(false);
   const [nativeRouteAddOpen, setNativeRouteAddOpen] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(sidebarWidthFromStorage);
@@ -922,6 +923,10 @@ export function App() {
   useEffect(() => {
     if (page === "gateway-releases") return;
     setGatewayReleaseDrawerOpen(false);
+  }, [page]);
+  useEffect(() => {
+    if (page === "model-router") return;
+    setModelRouterDrawerOpen(false);
   }, [page]);
   const pinnedCharts = useQuery({
     ...pinnedChartsQuery(assistantOwner),
@@ -1143,7 +1148,7 @@ export function App() {
         : page === "apim-native-routes"
         ? "APIM 后端池"
         : page === "gateway-releases"
-          ? "发布管理"
+          ? "发布历史"
         : page === "applications"
           ? "订阅管理"
         : page === "settings"
@@ -1498,6 +1503,7 @@ export function App() {
                 <PanelLeft size={16} />
               </Button>
               {selectedDataSource === "apim" && page === "apim-native-routes" && <Button type="button" variant="ghost" size="icon-sm" aria-label="打开 APIM 后端池列表" title="打开 APIM 后端池列表" onClick={() => setNativeRouteDrawerOpen(true)}><List size={16} /></Button>}
+              {selectedDataSource === "apim" && page === "model-router" && <Button type="button" variant="ghost" size="icon-sm" aria-label="模型路由器" title="模型路由器" onClick={() => setModelRouterDrawerOpen(true)}><List size={16} /></Button>}
               {selectedDataSource === "apim" && page === "gateway-releases" && <Button type="button" variant="ghost" size="icon-sm" aria-label="打开发布列表" title="打开发布列表" onClick={() => setGatewayReleaseDrawerOpen(true)}><List size={16} /></Button>}
             </div>
             <strong>{pageInfo.label}</strong>
@@ -1514,7 +1520,7 @@ export function App() {
           {selectedDataSource === "apim" && page === "apim-native-routes" && <ApimNativeRoutesPage routeDrawerOpen={nativeRouteDrawerOpen} onRouteDrawerOpenChange={setNativeRouteDrawerOpen} addOpen={nativeRouteAddOpen} onAddOpenChange={setNativeRouteAddOpen} />}
           {selectedDataSource === "apim" && page === "gateway-releases" && <GatewayReleasesPage releaseDrawerOpen={gatewayReleaseDrawerOpen} onReleaseDrawerOpenChange={setGatewayReleaseDrawerOpen} />}
           {selectedDataSource === "apim" && page === "applications" && <ApplicationsPage />}
-          {selectedDataSource === "apim" && page === "model-router" && <ModelRouterPage />}
+          {selectedDataSource === "apim" && page === "model-router" && <ModelRouterPage routerDrawerOpen={modelRouterDrawerOpen} onRouterDrawerOpenChange={setModelRouterDrawerOpen} />}
           {page === "assistant" && (
             <AssistantPage
               key={selectedDataSource}

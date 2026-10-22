@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { Check, Code2, Copy, WrapText } from "lucide-react"
 import hljs from "highlight.js/lib/core"
 import bash from "highlight.js/lib/languages/bash"
@@ -31,6 +31,58 @@ const languageOptions: Array<{ id: ClientSampleLanguage; label: string }> = [
   { id: "javascript", label: "JavaScript" },
 ]
 
+export function ClientSampleCode({
+  endpoint,
+  sampleForLanguage,
+}: {
+  endpoint: string
+  sampleForLanguage: (language: ClientSampleLanguage) => string
+}) {
+  const [language, setLanguage] = useState<ClientSampleLanguage>("bash")
+  const [copyState, setCopyState] = useState<{ sample: string; error: boolean } | null>(null)
+  const [wrapCode, setWrapCode] = useState(false)
+  const sample = sampleForLanguage(language)
+  const copied = copyState?.sample === sample && !copyState.error
+  const copyError = copyState?.sample === sample && copyState.error
+  const highlightedSample = sample ? hljs.highlight(sample, { language }).value : ""
+
+  useEffect(() => {
+    if (!copyState || copyState.error) return
+    const timer = window.setTimeout(() => setCopyState(null), 2_000)
+    return () => window.clearTimeout(timer)
+  }, [copyState])
+
+  const copySample = async () => {
+    try {
+      await navigator.clipboard.writeText(sample)
+      setCopyState({ sample, error: false })
+    } catch {
+      setCopyState({ sample, error: true })
+    }
+  }
+
+  return <>
+    <div className="application-quickstart-endpoint"><span>API Base URL</span><code title={endpoint}>{endpoint}</code></div>
+    <div className="application-quickstart-code-toolbar">
+      <div className="application-quickstart-languages" role="group" aria-label="代码语言">
+        {languageOptions.map((option) => <button type="button" key={option.id} className={language === option.id ? "active" : ""} aria-pressed={language === option.id} onClick={() => { setLanguage(option.id); setCopyState(null) }}>{option.label}</button>)}
+      </div>
+    </div>
+    {sample ? <div className="application-quickstart-code-block">
+      <pre className="application-quickstart-code" data-wrap={wrapCode}><code className={`hljs language-${language}`} dangerouslySetInnerHTML={{ __html: highlightedSample }} /></pre>
+      <div className="application-quickstart-code-actions">
+        <Button className="application-quickstart-wrap" type="button" variant="ghost" size="icon-sm" aria-label="自动换行" aria-pressed={wrapCode} title={wrapCode ? "取消自动换行" : "自动换行"} onClick={() => setWrapCode(!wrapCode)}><WrapText size={14} /></Button>
+        <Button className="application-quickstart-copy" type="button" variant="ghost" size="icon-sm" aria-label="复制代码" title={copied ? "代码已复制" : "复制代码"} onClick={() => void copySample()}>{copied ? <Check size={14} /> : <Copy size={14} />}</Button>
+      </div>
+    </div> : <div className="application-quickstart-code-empty">选择接口后显示对应调用示例</div>}
+    <footer className="application-quickstart-footer">
+      <span>使用安全的环境变量 TURNSTILE_APIM_KEY 提供订阅密钥；请勿将密钥写入示例代码。</span>
+    </footer>
+    {copied && <span className="application-quickstart-status" role="status"><Check size={13} />代码已复制</span>}
+    {copyError && <span className="application-quickstart-status error" role="alert">无法访问剪贴板，请手动复制。</span>}
+  </>
+}
+
 export function ApplicationClientQuickstart({
   application,
   registry,
@@ -57,10 +109,6 @@ export function ApplicationClientQuickstart({
   })
   const [selectedModelId, setSelectedModelId] = useState(eligibleModels[0]?.id ?? "")
   const [selectedOperation, setSelectedOperation] = useState<ClientSampleOperation>("chat_completions")
-  const [language, setLanguage] = useState<ClientSampleLanguage>("bash")
-  const [copied, setCopied] = useState(false)
-  const [copyError, setCopyError] = useState(false)
-  const [wrapCode, setWrapCode] = useState(false)
   const operations = gatewayApiOperations().filter(operation => operation.id !== "decision"
     || registry?.decision_supported === true && eligibleModels.some(model => model.capabilities.includes("decision")))
   const operation = operations.find(item => item.id === selectedOperation)?.id ?? "chat_completions"
@@ -69,9 +117,6 @@ export function ApplicationClientQuickstart({
   const selectedModel = operationModels.find(model => model.id === selectedModelId) ?? operationModels[0]
   const modelOptions = operationModels.map(model => ({ value: model.id, label: `${model.display_name} · ${model.model_key}` }))
   const baseUrl = endpoint?.replace(/\/+$/, "") ?? ""
-  const sample = selectedModel && baseUrl
-      ? clientSampleFor(language, baseUrl, selectedModel.model_key, operation)
-      : ""
   const hasActiveSubscription = application.subscriptions.some((subscription) => (
     subscription.state === "active" && subscription.scope_exists
   ))
@@ -82,54 +127,20 @@ export function ApplicationClientQuickstart({
     && publishedModelsAvailable
     && eligibleModels.length > 0
 
-  const highlightedSample = sample
-    ? hljs.highlight(sample, { language }).value
-    : ""
-
-  const copySample = async () => {
-    setCopied(false)
-    setCopyError(false)
-    try {
-      await navigator.clipboard.writeText(sample)
-      setCopied(true)
-    } catch {
-      setCopyError(true)
-    }
-  }
-
   return <section className="application-card application-quickstart-card">
     <header className="application-card-head"><div><Code2 size={14} /><h2>客户端接入</h2></div><span>示例代码</span></header>
     {ready ? <>
       <div className="application-quickstart-controls">
-        <label><span>模型</span><Select value={selectedModel?.id ?? null} items={modelOptions} onValueChange={(value) => { if (value) { setSelectedModelId(value); setCopied(false) } }}>
+        <label><span>模型</span><Select value={selectedModel?.id ?? null} items={modelOptions} onValueChange={(value) => { if (value) setSelectedModelId(value) }}>
           <SelectTrigger className="application-quickstart-model-select" aria-label="示例模型"><SelectValue /></SelectTrigger>
           <SelectContent>{modelOptions.map((model) => <SelectItem key={model.value} value={model.value}>{model.label}</SelectItem>)}</SelectContent>
         </Select></label>
-        <label><span>接口</span><Select value={operation} items={operations.map((operation) => ({ value: operation.id, label: operation.label }))} onValueChange={(value) => { if (value) { setSelectedOperation(value); setCopied(false) } }}>
+        <label><span>接口</span><Select value={operation} items={operations.map((operation) => ({ value: operation.id, label: operation.label }))} onValueChange={(value) => { if (value) setSelectedOperation(value) }}>
           <SelectTrigger className="application-quickstart-model-select" aria-label="示例接口"><SelectValue /></SelectTrigger>
           <SelectContent>{operations.map((operation) => <SelectItem key={operation.id} value={operation.id}>{operation.label} · {operation.path}</SelectItem>)}</SelectContent>
         </Select></label>
       </div>
-      <div className="application-quickstart-endpoint"><span>API Base URL</span><code title={baseUrl}>{baseUrl}</code></div>
-      <div className="application-quickstart-code-toolbar">
-        <div className="application-quickstart-languages" role="group" aria-label="代码语言">
-          {languageOptions.map((option) => <button type="button" key={option.id} className={language === option.id ? "active" : ""} aria-pressed={language === option.id} onClick={() => { setLanguage(option.id); setCopied(false) }}>{option.label}</button>)}
-        </div>
-      </div>
-      {sample
-        ? <div className="application-quickstart-code-block">
-          <pre className="application-quickstart-code" data-wrap={wrapCode}><code className={`hljs language-${language}`} dangerouslySetInnerHTML={{ __html: highlightedSample }} /></pre>
-          <div className="application-quickstart-code-actions">
-            <Button className="application-quickstart-wrap" type="button" variant="ghost" size="icon-sm" aria-label="自动换行" aria-pressed={wrapCode} title={wrapCode ? "取消自动换行" : "自动换行"} onClick={() => setWrapCode(!wrapCode)}><WrapText size={14} /></Button>
-            <Button className="application-quickstart-copy" type="button" variant="ghost" size="icon-sm" aria-label="复制代码" title={copied ? "代码已复制" : "复制代码"} onClick={() => void copySample()}>{copied ? <Check size={14} /> : <Copy size={14} />}</Button>
-          </div>
-        </div>
-        : <div className="application-quickstart-code-empty">选择接口后显示对应调用示例</div>}
-      <footer className="application-quickstart-footer">
-        <span>使用安全的环境变量 TURNSTILE_APIM_KEY 提供订阅密钥；请勿将密钥写入示例代码。</span>
-      </footer>
-      {copied && <span className="application-quickstart-status" role="status"><Check size={13} />代码已复制</span>}
-      {copyError && <span className="application-quickstart-status error" role="alert">无法访问剪贴板，请手动复制。</span>}
+      <ClientSampleCode endpoint={baseUrl} sampleForLanguage={language => selectedModel ? clientSampleFor(language, baseUrl, selectedModel.model_key, operation) : ""} />
     </> : <div className="application-card-empty"><Code2 size={17} />
       {application.status !== "active" ? "应用未启用，暂不能生成调用示例。"
         : !hasActiveSubscription ? "该应用没有可用的活动订阅。"

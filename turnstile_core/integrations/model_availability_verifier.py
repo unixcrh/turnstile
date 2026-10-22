@@ -106,6 +106,13 @@ def _excludes_api(condition: str, api_id: str) -> bool:
 def _no_bypass(root: ET.Element, api_id: str | None = None) -> None:
     if api_id is not None:
         root = deepcopy(root)
+        for parent in list(root.iter()):
+            for child in list(parent):
+                if child.get("id") == "turnstile-router-engine" or (
+                    child.tag == "set-variable"
+                    and child.get("name") == "turnstileRouterEngineVersion"
+                ):
+                    parent.remove(child)
         for choose in list(root.iter("choose")):
             for branch in list(choose):
                 if branch.tag == "when" and _excludes_api(branch.get("condition", ""), api_id):

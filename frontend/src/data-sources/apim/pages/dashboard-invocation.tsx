@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from "react"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
-import { AlertTriangle, Cpu, Image as ImageIcon, ListChecks, MessageSquare, RefreshCw, Send } from "lucide-react"
+import { AlertTriangle, ChevronRight, Code2, Cpu, Image as ImageIcon, ListChecks, MessageSquare, RefreshCw, Send } from "lucide-react"
 
 import { FoundryLogo, MicrosoftLogo } from "../../../components/brand-logos"
+import { ClientSampleCode } from "../../../components/finops/application-client-quickstart"
 import { ModelVendorLogo, modelVendorFromMetadata } from "../../../components/model-management/model-vendor-select"
 import { ButtonGroup } from "../../../components/ui/button-group"
 import { Input } from "../../../components/ui/input"
@@ -21,6 +22,7 @@ import { finopsQueries, invalidateFinOps } from "../queries"
 import { useAuth } from "../../../providers/auth-provider"
 import { gatewayInvocationChoices, resolveInvocationModel, type GatewaySelection } from "../../../lib/gateway-topology"
 import { modelInventoryFamily } from "../../../lib/model-inventory-filters"
+import { clientSampleFor, type ClientSampleOperation, type ClientSampleRequest } from "../../../lib/application-client-samples"
 import type { DecisionInvocationRequest, DecisionInvocationResponse, EnterpriseEntityCatalog, ImageGenerationOptions, ImageInvocationResponse, ManagedModel, ModelInvocationResponse, ModelRuntime } from "../types"
 import { ImageGenerationResult, ImageOptions } from "./image-generation-result"
 import {
@@ -39,6 +41,7 @@ const DEFAULT_MODEL_OPTION = "__default__"
 const MODEL_TARGET_PREFIX = "model:"
 const ROUTER_TARGET_PREFIX = "router:"
 const INVOCATION_MAX_OUTPUT_TOKENS = 1_024
+const CHAT_PROMPT_SAMPLE = "Return one short recommendation for reducing model cost."
 const DECISION_STATE_SAMPLE = "The checkout service has returned HTTP 500 errors for 15 minutes. Customers cannot complete purchases, and the issue affects all regions."
 const DECISION_STATE_JSON_SAMPLE = JSON.stringify({
   service: "checkout",
@@ -127,9 +130,7 @@ export function AgentInvocation({ entities }: { entities: EnterpriseEntityCatalo
     : null;
   const effectiveImageOptions = imageProfile ? imageOptions ?? {} : null;
   const [imageResult, setImageResult] = useState<ImageInvocationResponse | null>(null);
-  const [prompt, setPrompt] = useState(
-    "Return one short recommendation for reducing model cost.",
-  );
+  const [prompt, setPrompt] = useState(CHAT_PROMPT_SAMPLE);
   const [stateFormat, setStateFormat] = useState<"text" | "json">("text");
   const [questions, setQuestions] = useState(JSON.stringify({
     urgent: { type: "noul", instructions: "Does this incident need urgent attention?" },
@@ -293,6 +294,39 @@ export function AgentInvocation({ entities }: { entities: EnterpriseEntityCatalo
   const canInvoke = !isInvoking && gatewayReady && Boolean(invocationModel || selectedRouter) && (mode !== "chat" || validOutputLimit) && Boolean(prompt.trim() && userId && projectId && agentId)
     && (!decisionMode || (registry.data?.decision_supported === true && Boolean(questions.trim())))
     && (!imageMode || (registry.data?.image_generation_supported === true && registry.data.image_configuration_schema_version === 4 && Boolean(selectedModel) && Boolean(imageProfile && effectiveImageOptions)));
+  const sampleRuntime = registry.data?.runtimes.find(runtime => runtime.id === invocationModel?.runtime_id);
+  const sampleGateway = sampleRuntime?.gateway_profile_id
+    ? registry.data?.gateways.find(gateway => gateway.id === sampleRuntime.gateway_profile_id)
+    : registry.data?.gateways.find(gateway => gateway.is_default);
+  const sampleTarget = registry.data?.apim_target_topology?.items.find(target => target.target.gateway_profile_id === sampleGateway?.id);
+  const sampleEndpoint = (explicitGateway ? selectedGateway?.endpoint
+    : sampleGateway?.enabled && sampleGateway.implementation === "apim" ? sampleTarget?.gateway_endpoint ?? sampleGateway.base_url : null)?.replace(/\/+$/, "") ?? "";
+  const sampleModelKey = selectedRouter?.name ?? invocationModel?.model_key ?? "";
+  const sampleOperation: ClientSampleOperation = decisionMode ? "decision" : imageMode ? "image_generations" : "chat_completions";
+  let sampleRequest: ClientSampleRequest | undefined;
+  let sampleError: string | null = null;
+  if (sampleModelKey && (mode !== "chat" || validOutputLimit)) {
+    try {
+      const payload = decisionMode ? {
+        model: sampleModelKey,
+        state: stateFormat === "json" ? JSON.parse(prompt) : prompt,
+        questions: JSON.parse(questions),
+      } : imageMode ? {
+        ...effectiveImageOptions, model: sampleModelKey, prompt, n: 1, stream: false,
+      } : {
+        model: sampleModelKey, messages: [{ role: "user", content: prompt }],
+        [String(sampleRuntime?.config.max_tokens_field ?? "max_tokens")]: maxOutputTokens,
+        stream: false,
+      };
+      sampleRequest = { payload, headers: {
+        "x-org-id": entities.organizations[0]?.id ?? "",
+        "x-department-id": departmentId, "x-project-id": projectId,
+        "x-agent-id": agentId, "x-user-id": userId,
+      } };
+    } catch (error) {
+      sampleError = queryError(error);
+    }
+  }
   const selectMode = (next: typeof mode) => {
     if (next === mode || isInvoking) return;
     setMode(next);
@@ -302,7 +336,7 @@ export function AgentInvocation({ entities }: { entities: EnterpriseEntityCatalo
     setResult(null);
     setImageResult(null);
     setInvokeError(null);
-    setPrompt(next === "decision" ? (stateFormat === "json" ? DECISION_STATE_JSON_SAMPLE : DECISION_STATE_SAMPLE) : "");
+    setPrompt(next === "decision" ? (stateFormat === "json" ? DECISION_STATE_JSON_SAMPLE : DECISION_STATE_SAMPLE) : next === "chat" ? CHAT_PROMPT_SAMPLE : "");
   };
   const selectStateFormat = (next: typeof stateFormat) => {
     setStateFormat(next);
@@ -350,7 +384,7 @@ export function AgentInvocation({ entities }: { entities: EnterpriseEntityCatalo
             <Select
               value={invocationTarget}
               disabled={isInvoking}
-              onValueChange={(next) => { setInvocationTarget(next ?? DEFAULT_MODEL_OPTION); setImageOptions(null); setGatewaySelection({ targetId: null, deploymentId: null }); }}
+              onValueChange={(next) => { setInvocationTarget(next ?? DEFAULT_MODEL_OPTION); setImageOptions(null); setGatewaySelection({ targetId: null, deploymentId: null }); if (mode === "chat" && !prompt.trim()) setPrompt(CHAT_PROMPT_SAMPLE); }}
             >
               <SelectTrigger aria-label="调用目标" title={selectedModelUnavailable ? "所选模型不可用" : selectedRouter?.name ?? selectedModel?.display_name ?? "默认可用模型"}>
                 <SelectValue>
@@ -458,6 +492,14 @@ export function AgentInvocation({ entities }: { entities: EnterpriseEntityCatalo
             {isInvoking ? "调用中..." : imageMode ? "生成图片" : "发起调用"}
           </button>
         </div>
+        <details className="invoke-code-sample">
+          <summary><Code2 size={14} aria-hidden="true" /><span>示例代码</span><ChevronRight size={14} aria-hidden="true" /></summary>
+          {sampleError ? <div className="application-card-empty" role="alert">{sampleError}</div>
+            : !sampleModelKey ? <div className="application-card-empty">{decisionMode ? "选择 Decision 模型" : imageMode ? "选择图片模型" : "所选模型不可用"}</div>
+              : !sampleEndpoint ? <div className="application-card-empty">该 APIM 尚未提供可用的 API Base URL。</div>
+                : !gatewayReady ? <div className="application-card-empty">请选择可用的 Gateway API。</div>
+                  : <ClientSampleCode endpoint={sampleEndpoint} sampleForLanguage={language => sampleRequest ? clientSampleFor(language, sampleEndpoint, sampleModelKey, sampleOperation, sampleRequest) : ""} />}
+        </details>
       </section>
       <section className="finops-panel invoke-result">
         {!imageMode && <PanelTitle title="调用结果" />}

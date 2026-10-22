@@ -897,6 +897,10 @@ def test_apim_native_routes_have_one_dedicated_qualified_surface() -> None:
         FRONTEND_SOURCE
         / "components/model-management/apim-native-route-eligibility.ts"
     ).read_text(encoding="utf-8")
+    resilience_editor = (
+        FRONTEND_SOURCE
+        / "components/model-management/deployment-resilience-editor.tsx"
+    ).read_text(encoding="utf-8")
     styles = read_frontend_styles()
 
     assert '{ label: "APIM 后端池", icon: Network, page: "apim-native-routes" }' in app
@@ -927,9 +931,9 @@ def test_apim_native_routes_have_one_dedicated_qualified_surface() -> None:
     assert 'className="smh-search"' in native_page
     assert (
         ".apim-native-route-list.router-list-pane .apim-native-route-list-controls { "
-        "min-height: 54px; flex-basis: 54px; padding: 12px 16px 6px; border-bottom: 0; }"
+        "min-height: 54px; flex-basis: 54px; padding: 12px 12px 6px; border-bottom: 0; }"
     ) in styles
-    assert ".apim-native-route-list .router-list-row::before { inset-inline: 16px; }" in styles
+    assert ".apim-native-route-list .router-list-row::before { inset-inline: 8px; }" in styles
     assert ".apim-native-route-list .router-list-scroll { padding-top: 6px; }" in styles
     assert '.apim-native-routes-workspace > .smh-page-header { display: none; }' in styles
     assert (
@@ -937,7 +941,7 @@ def test_apim_native_routes_have_one_dedicated_qualified_surface() -> None:
         "inset: 48px 0 0; }"
     ) in styles
     assert '.apim-native-route-drawer-list.router-list-pane' in styles
-    assert '.apim-native-route-drawer-list .router-list-row { padding-inline: 28px; }' in styles
+    assert '.apim-native-route-drawer-list .router-list-row { padding-inline: 16px; }' in styles
     assert 'className="apim-native-route-drawer-close"' in native_page
     assert '.apim-native-route-drawer-close { width: 28px; min-width: 28px; height: 28px;' in styles
     assert (
@@ -960,13 +964,14 @@ def test_apim_native_routes_have_one_dedicated_qualified_surface() -> None:
     handle_rule = styles.split(".runtime-pane-handle {", 1)[1].split("}", 1)[0]
     assert "z-index: 2" in handle_rule
     assert "width: 1px" in handle_rule
-    assert "background: var(--border)" in handle_rule
+    assert "border-left: 1px solid var(--border)" in handle_rule
+    assert "background: transparent" in handle_rule
     assert "cursor: col-resize" in handle_rule
     assert (
         '.runtime-pane-handle::after { content: ""; position: absolute; '
         "inset: 0 -3px; }"
     ) in styles
-    assert ".runtime-pane-handle:focus-visible { background: var(--ring);" in styles
+    assert ".runtime-pane-handle:focus-visible { border-left-color: var(--ring);" in styles
     assert "localStorage.getItem(storageKey)" in resizable_pane
     assert "routeStateLoading ?" in native_page
     assert "routeStateError || !registry.data" in native_page
@@ -974,30 +979,29 @@ def test_apim_native_routes_have_one_dedicated_qualified_surface() -> None:
     assert "model-search-control" not in native_page
     assert "ModelPublicationDialog" not in native_page
     assert "ApimNativeRouteCreateDialog" in native_page
-    assert "useQueries" in native_page
-    assert "poolQuery?.data" in native_page
-    assert 'replicaOwner\n        ? "replica"' in native_page
-    assert 'poolQuery?.data\n              ? "active"\n              : "available"' in native_page
+    assert "finopsQueries.modelBackendPools()" in native_page
+    assert "poolByModelId.has(model.id)" in native_page
+    assert "useQueries" not in native_page
+    assert "replicaOwner" not in native_page
     assert 'user?.role === "owner"' in native_page
     assert "添加后端池" in native_page
     assert "DeploymentResilienceEditor" in create_dialog
     assert 'option.state === "available"' in create_dialog
-    assert 'option.state === "ineligible"' in create_dialog
-    assert 'option.state === "replica"' in create_dialog
+    assert 'selectedOption?.state === "available"' in create_dialog
     assert "onActivated={finishCreation}" in create_dialog
-    assert "missingDeploymentRuntimeNames" in create_dialog
-    assert "尚不能创建后端池" in create_dialog
-    assert "前往模型管理" in create_dialog
-    assert "前往连接管理" in create_dialog
-    assert "onManageModels" in create_dialog
-    assert "onManageRuntimes" in create_dialog
+    assert 'aria-label="模型"' in create_dialog
+    assert 'renderFrame={(editor, controls)' in create_dialog
+    assert "打开已有后端池" in create_dialog
+    assert "replicaOwnerId" not in create_dialog
+    assert "apim-native-route-create-list" not in create_dialog
+    assert "onManageModels" not in create_dialog
+    assert "onManageRuntimes" not in create_dialog
     assert "ModelPublicationDialog" not in create_dialog
     assert "Project Endpoint" not in create_dialog
     assert "提供方" not in create_dialog
-    assert "hasNativeRouteCounterpart(model, registry.data!)" in native_page
-    assert "compatibleNativeRouteRuntimes(model, registry.data)" in native_page
-    assert "nativeRouteUpstreamIdentity(model)" in native_page
-    assert "equivalentNativeRouteRuntimes(selectedModel, registry.data)" in native_page
+    assert "hasNativeRouteCounterpart" not in native_page
+    assert "equivalentNativeRouteRuntimes" not in native_page
+    assert "members.length" in native_page
     assert "<dt>数据面</dt><dd>Azure API Management</dd>" in native_page
     assert "<dt>上游 Deployment</dt>" in native_page
     assert "<dt>作用范围</dt>" in native_page
@@ -1011,14 +1015,28 @@ def test_apim_native_routes_have_one_dedicated_qualified_surface() -> None:
     assert ".runtime-detail-grid { grid-template-columns: 1fr; padding: 10px; }" in styles
     assert (
         ".runtime-detail-grid.apim-native-route-detail-grid { "
-        "grid-template-columns: minmax(0, 1fr); padding-inline: 16px; }"
+        "grid-template-columns: minmax(0, 1fr); padding-inline: 12px; }"
     ) in styles
-    assert ".apim-native-route-toolbar { min-height: 48px" in styles
+    assert (
+        ".apim-native-route-toolbar { min-height: 48px; flex: 0 0 auto; display: flex; "
+        "align-items: center; justify-content: space-between; gap: 16px; "
+        "padding: 8px 12px; border-bottom: 1px solid var(--border); }"
+    ) in styles
     assert ".apim-native-route-hero .runtime-detail-facts" in styles
     assert "runtimeIdsWithDeployment.has(runtime.id)" in eligibility
     assert "runtime.id !== model.runtime_id" in eligibility
     assert ".apim-native-routes-layout" in styles
     assert ".apim-native-route-config-card { padding: 16px" in styles
+    assert 'data-pool={hasEffectivePool}' in resilience_editor
+    assert 'className="router-resilience-member-heading"' in resilience_editor
+    assert 'className="router-resilience-member-connection"' in resilience_editor
+    assert 'className="router-resilience-member-traffic"' in resilience_editor
+    assert 'router-resilience-member-columns' not in resilience_editor
+    assert (
+        '.router-resilience-runtime-list[data-pool="true"] .router-resilience-runtime { '
+        'position: relative; grid-template-columns: minmax(0, 1fr) auto; min-height: 0; '
+        'gap: 4px 16px; padding: 12px; border: 0; border-radius: 8px; background: var(--muted); }'
+    ) in styles
     assert ".apim-native-route-content" not in styles
     assert ".apim-native-route-readiness" in styles
     assert ".apim-native-route-dialog" not in styles

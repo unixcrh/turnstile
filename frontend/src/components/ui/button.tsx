@@ -46,12 +46,17 @@ function Button({
   size = "default",
   ...props
 }: ButtonPrimitive.Props & VariantProps<typeof buttonVariants>) {
+  const requestedSlot = (props as { "data-slot"?: string })["data-slot"]
+  const slot =
+    requestedSlot === "alert-dialog-action" || requestedSlot === "alert-dialog-cancel"
+      ? requestedSlot
+      : "button"
   return (
     <ButtonPrimitive
-      data-slot="button"
+      {...props}
+      data-slot={slot}
       data-variant={variant}
       className={cn(buttonVariants({ variant, size, className }))}
-      {...props}
     />
   )
 }

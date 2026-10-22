@@ -1020,6 +1020,51 @@ export type ModelRouterAssignment = {
   assigned: boolean
 }
 
+export type ModelRouterDepartmentAccessSummary = {
+  id: string
+  name: string
+  total_users: number
+  assigned_users: number
+}
+
+export type ModelRouterPersonAccessItem = {
+  id: string
+  name: string
+  department_id: string | null
+  department_name: string
+  assigned: boolean
+}
+
+export type ModelRouterPeopleAccessResponse = {
+  router_id: string
+  total: number
+  offset: number
+  limit: number
+  total_users: number
+  assigned_count: number
+  matching_assigned_count: number
+  departments: ModelRouterDepartmentAccessSummary[]
+  items: ModelRouterPersonAccessItem[]
+}
+
+export type ModelRouterBulkAssignmentWrite = {
+  changes?: Array<{ user_id: string; assigned: boolean }>
+  department_assignments?: Array<{
+    department_id: string
+    assigned: boolean
+    query?: string | null
+  }>
+  all_matching_assigned?: boolean | null
+  department_id?: string | null
+  query?: string | null
+}
+
+export type ModelRouterBulkAssignmentResult = {
+  router_id: string
+  updated_count: number
+  assigned_count: number
+}
+
 export type ModelRouterAttempt = {
   sequence: number
   attempt_role?: "routing_decision" | "candidate"
@@ -1037,12 +1082,22 @@ export type ModelRouterAttempt = {
   strategy_type: ModelRouterStrategyType
   fallback_trigger: string | null
   decision_basis: string | null
+  sticky_bound_by?: "interaction" | "session" | "derived_interaction" | null
+  sticky_key?: string | null
   input_tokens: number | null
   cached_tokens: number | null
   cache_write_tokens: number | null
   output_tokens: number | null
   total_tokens: number | null
   estimated_cost: number | null
+  input_price_per_million?: number | null
+  cached_price_per_million?: number | null
+  cache_write_price_per_million?: number | null
+  output_price_per_million?: number | null
+  price_context_tier?: string | null
+  price_context_snapshot?: {
+    context_tiers?: Pick<StoredContextPriceTier, "key" | "min_input_tokens" | "max_input_tokens" | "input_range_source">[]
+  } | null
   decision_protocol?: ModelRouterDecisionProtocol | null
   decision_candidates?: string[]
   selected_candidate_model_id?: string | null
@@ -1057,9 +1112,13 @@ export type ModelRouterAttempt = {
   decision_probabilities?: Record<string, number> | null
   condition_evaluations?: Array<{
     node_id: string
+    node_label?: string
     field: string
     operator: ModelRouterConditionOperator
+    expected?: string | number | boolean | null
+    actual?: string | number | boolean | null
     matched: boolean
+    branch?: string
   }>
 }
 
@@ -1271,6 +1330,9 @@ export type GatewayRateLimitResilience = {
 
 export type GatewayBackendPoolMember = {
   runtime_id: string
+  model_id?: string | null
+  upstream_model_id?: string | null
+  project_endpoint?: string | null
   runtime_name: string
   backend_url: string
   auth_strategy: "none" | "managed_identity" | "named_value_bearer" | "named_value_api_key"
@@ -1287,9 +1349,25 @@ export type GatewayBackendPoolConfig = {
 }
 
 export type GatewayBackendPoolWrite = {
-  members: Array<Pick<GatewayBackendPoolMember, "runtime_id" | "priority" | "weight">>
+  members: Array<Pick<GatewayBackendPoolMember, "runtime_id" | "model_id" | "priority" | "weight">>
   rate_limit: GatewayRateLimitResilience
   session_affinity?: boolean
+}
+
+export type GatewayBackendPoolCandidate = {
+  model_id: string
+  runtime_id: string
+  runtime_name: string
+  deployment_name: string
+  project_endpoint: string | null
+  model_name: string
+  model_version: string | null
+  model_publisher: string
+}
+
+export type GatewayBackendPoolSummary = {
+  model_id: string
+  pool: GatewayBackendPoolConfig
 }
 
 export type GatewayPublicationList = {

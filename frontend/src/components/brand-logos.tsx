@@ -225,6 +225,7 @@ export function ModelBrandLogo({
   size?: number
 }) {
   const normalized = `${familyKey ?? ""} ${identity}`.toLowerCase()
+  if (normalized.includes("decision")) return <MicrosoftLogo size={size} />
   if (normalized.includes("deepseek")) return <DeepSeekLogo size={size} />
   if (normalized.includes("kimi")) return <KimiLogo size={size} />
   if (familyKey === "claude" || normalized.includes("claude")) return <ClaudeLogo size={size} />

@@ -39,6 +39,7 @@ from .apim_policy_components import (
     NATIVE_STREAM_REQUEST,
     component_digest,
     expression_token_spans,
+    expression_tokens,
     parse_policy,
     policy_document_digest,
     serialize_policy,
@@ -75,6 +76,15 @@ class FixedProgramVerifier:
         self._subscription_key = subscription_key
         self._client = client
         self._clock = clock
+        self._verified_parent: str | None = None
+
+    def require_deployment_pool_reader(self) -> None:
+        if self._verified_parent is None or not deployment_pool_reader_supported(
+            self._verified_parent,
+        ):
+            raise PolicyCompilationError(
+                "Installed API parent policy requires a deployment Pool reader upgrade"
+            )
 
     @classmethod
     def native_installation(
@@ -107,6 +117,7 @@ class FixedProgramVerifier:
         return native
 
     def verify(self) -> ProgramCapabilityProof:
+        self._verified_parent = None
         installed = self.installation
         program = installed.program
         started = self._clock()
@@ -125,6 +136,10 @@ class FixedProgramVerifier:
         parent = self._management.revision_api_policy(program.api_revision)
         if fixed_policy_digest(parent) != installed.parent_policy_sha256:
             raise PolicyCompilationError("Fixed route program parent changed")
+        origins = parse_policy(parent).findall(".//set-variable[@name='routeVaultOrigins']")
+        expected_origins = json.dumps(installed.trusted_vault_origins, separators=(",", ":"))
+        if len(origins) != 1 or origins[0].get("value") != expected_origins:
+            raise PolicyCompilationError("Fixed route trusted Vault origins binding changed")
         for capability, enabled in {
             "OAuth": installed.oauth_enabled, "Pool": installed.pool_enabled,
             "Decision": installed.decision_enabled,
@@ -183,6 +198,7 @@ class FixedProgramVerifier:
             raise PolicyCompilationError(
                 "Fixed route program verification exceeded its time window",
             )
+        self._verified_parent = parent
         return ProgramCapabilityProof(
             proof_id=str(uuid4()), identity=program,
             supported_profiles=installed.supported_profiles,
@@ -891,15 +907,17 @@ READ_FIXED_CONTENT = (
         if (connection["pool"] != null) {
             var pool = connection["pool"] as JObject;
 """
-    + _exact_fields("pool", "members rate_limit session_cookie_name credential_versions", "header_values")
+    + _exact_fields("pool", "members rate_limit session_cookie_name credential_versions", "header_values configuration_sha256")
     + r"""
             if (!context.Variables.GetValueOrDefault<bool>("routePoolEnabled", false)
                 || profile == "openai-images"
                 || !new [] {"none", "managed_identity"}.Contains((string)connection["credential"]?["mode"])
                 || !JToken.DeepEquals(pool["rate_limit"], JObject.Parse(@"{""backend_timeout_seconds"":120,""circuit_breaker"":{""accept_retry_after"":true,""error_reasons"":[""BackendConnectionFailure"",""Timeout""],""failure_count"":1,""interval_seconds"":60,""status_code_ranges"":[{""maximum"":429,""minimum"":429},{""maximum"":408,""minimum"":408},{""maximum"":599,""minimum"":500}],""trip_duration_seconds"":60},""first_fast_retry"":true,""max_attempts_per_request"":2,""retry_interval_seconds"":1}"))) { return ""; }
             var poolMembers = pool["members"] as JArray;
+            if (pool["configuration_sha256"] != null && (
+                pool["configuration_sha256"].Type != JTokenType.String
+                || !System.Text.RegularExpressions.Regex.IsMatch((string)pool["configuration_sha256"], @"\A[0-9a-f]{64}\z"))) { return ""; }
             var backendIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var runtimeIds = new HashSet<string>();
             var weights = new Dictionary<long,long>();
             if (poolMembers == null || poolMembers.Count < 2 || poolMembers.Count > 30) { return ""; }
             foreach (var value in poolMembers) {
@@ -911,7 +929,6 @@ READ_FIXED_CONTENT = (
                 if (poolMember["runtime_id"]?.Type != JTokenType.String
                     || !Guid.TryParseExact((string)poolMember["runtime_id"], "D", out runtimeId)
                     || runtimeId.ToString() != (string)poolMember["runtime_id"]
-                    || !runtimeIds.Add((string)poolMember["runtime_id"])
                     || poolMember["backend_id"]?.Type != JTokenType.String
                     || !System.Text.RegularExpressions.Regex.IsMatch((string)poolMember["backend_id"], @"\A[a-zA-Z0-9._-]{1,180}\z")
                     || !backendIds.Add((string)poolMember["backend_id"])
@@ -939,7 +956,7 @@ READ_FIXED_CONTENT = (
             if (versions == null || versions.Count > 30) { return ""; }
             if (pool["header_values"] != null) {
                 var headers = pool["header_values"] as JObject;
-                if (headers == null || headers.Count > 60) { return ""; }
+                if (headers == null || headers.Count > 90) { return ""; }
                 foreach (var header in headers.Properties()) {
                     if (!System.Text.RegularExpressions.Regex.IsMatch(header.Name, @"\A[a-zA-Z0-9._-]{1,180}\z")
                         || versions[header.Name] != null || header.Value.Type != JTokenType.String
@@ -1059,6 +1076,18 @@ READ_FIXED_CONTENT = (
     } catch { return ""; }
 }"""
 )
+
+
+def deployment_pool_reader_supported(
+    parent_policy: str,
+) -> bool:
+    readers = [
+        node.get("value", "")
+        for node in parse_policy(parent_policy).iter("set-variable")
+        if node.get("name") == "routeContent"
+    ]
+    expected = expression_tokens(READ_FIXED_CONTENT)
+    return bool(readers) and all(expression_tokens(reader) == expected for reader in readers)
 
 
 def variable(parent: ET.Element, name: str, value: str) -> ET.Element:
@@ -1275,6 +1304,9 @@ def fixed_reader(binding: FixedRouteBinding) -> ET.Element:
     })
     ET.SubElement(branch, "set-header", {
         "name": "x-turnstile-pool-member", "exists-action": "delete",
+    })
+    ET.SubElement(branch, "set-header", {
+        "name": "x-turnstile-pool-deployment", "exists-action": "delete",
     })
     branch.append(fixed_catalog(model_additions_enabled=binding.model_additions_enabled))
     branch = ET.SubElement(

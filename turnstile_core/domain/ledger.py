@@ -307,6 +307,9 @@ class LedgerSummary(StrictModel):
     )
     enforce: bool = Field(strict=True)
     enabled: bool = Field(default=True, strict=True)
+    require_verified_bound: bool = Field(
+        default=False, strict=True, exclude_if=lambda value: value is False,
+    )
     confirmed_tokens: int = Field(default=0, ge=0, le=2**63 - 1, strict=True)
     active_reserved_tokens: int = Field(default=0, ge=0, le=2**63 - 1, strict=True)
     upper_bound_tokens: int = Field(default=0, ge=0, le=2**63 - 1, strict=True)
@@ -683,11 +686,20 @@ def _advance_summary(summary: LedgerSummary, now: datetime, **updates: Any) -> L
 def reserve_ledger(
     summary: LedgerSummary, identity: LedgerAttemptIdentity, reserved_tokens: int, now: datetime,
     *, reserved_usd: Decimal | None = None, price_snapshot: BudgetPriceProjection | None = None,
+    count_assurance: Literal["estimate", "verified_upper_bound"] = "verified_upper_bound",
 ) -> tuple[LedgerSummary, LedgerAttempt]:
     if identity.scope != summary.scope:
         raise LedgerProtocolConflict("Reservation belongs to another budget scope or month")
     if not summary.enabled:
         raise LedgerAdmissionDenied("budget_consumer_disabled")
+    if count_assurance not in {"estimate", "verified_upper_bound"}:
+        raise LedgerProtocolConflict("Reservation requires a valid count assurance")
+    if (
+        summary.enforce
+        and summary.require_verified_bound
+        and count_assurance != "verified_upper_bound"
+    ):
+        raise LedgerAdmissionDenied("budget_count_bound_unavailable")
     if summary.budget_mode == "usd":
         if reserved_usd is None or price_snapshot is None:
             raise LedgerProtocolConflict("USD admission requires a current price snapshot")

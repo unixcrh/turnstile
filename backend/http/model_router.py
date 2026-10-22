@@ -18,6 +18,8 @@ from turnstile_core.domain.model_router import (
     ModelRouterAssignedList,
     ModelRouterAssignment,
     ModelRouterAssignmentWrite,
+    ModelRouterBulkAssignmentResult,
+    ModelRouterBulkAssignmentWrite,
     ModelRouterDecisionPreview,
     ModelRouterDecisionPreviewWrite,
     ModelRouterDecisionTrialResult,
@@ -25,6 +27,7 @@ from turnstile_core.domain.model_router import (
     ModelRouterDuplicateWrite,
     ModelRouterListResponse,
     ModelRouterModelCatalog,
+    ModelRouterPeopleAccessResponse,
     ModelRouterValidationResult,
     ModelRouterWrite,
 )
@@ -399,6 +402,34 @@ def delete_model_router(
         raise HTTPException(status_code=404, detail=str(error)) from error
 
 
+@router.get(
+    "/api/v1/model-routers/{router_id}/people",
+    response_model=ModelRouterPeopleAccessResponse,
+)
+def list_model_router_people(
+    router_id: UUID,
+    service: ModelRouterServiceDependency,
+    identity: OwnerSession,
+    department_id: Annotated[str | None, Query(max_length=320)] = None,
+    query: Annotated[str | None, Query(max_length=200)] = None,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> ModelRouterPeopleAccessResponse:
+    try:
+        return service.people(
+            router_id,
+            UUID(identity.id),
+            identity.email,
+            identity.name,
+            department_id=department_id,
+            query=query,
+            offset=offset,
+            limit=limit,
+        )
+    except ModelRouterNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
 @router.get("/api/v1/model-routers/{router_id}/assignees", response_model=list[str])
 def list_model_router_assignees(
     router_id: UUID,
@@ -427,6 +458,30 @@ def set_model_router_assignment(
             write,
             UUID(identity.id),
             identity.email,
+        )
+    except ModelRouterConflictError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ModelRouterNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@router.put(
+    "/api/v1/model-routers/{router_id}/assignments",
+    response_model=ModelRouterBulkAssignmentResult,
+)
+def set_model_router_assignments_bulk(
+    router_id: UUID,
+    write: ModelRouterBulkAssignmentWrite,
+    service: ModelRouterServiceDependency,
+    identity: OwnerSession,
+) -> ModelRouterBulkAssignmentResult:
+    try:
+        return service.assign_bulk(
+            router_id,
+            write,
+            UUID(identity.id),
+            identity.email,
+            identity.name,
         )
     except ModelRouterConflictError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error

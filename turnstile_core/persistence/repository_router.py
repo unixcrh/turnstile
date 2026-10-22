@@ -226,13 +226,32 @@ class PostgreSqlRouterRepositoryMixin:
             rows = connection.execute(
                 """SELECT router.*
                    FROM model_router router
-                   JOIN user_model_router_access access ON access.router_id = router.id
-                   WHERE access.user_id = %s
+                   WHERE (
+                       lower(router.created_by) = lower(%s)
+                       OR EXISTS (
+                           SELECT 1
+                           FROM user_model_router_access access
+                           WHERE access.router_id = router.id
+                             AND lower(access.user_id) = lower(%s)
+                       )
+                   )
                      AND router.status = 'published'
                      AND router.deleted_at IS NULL
                      AND router.published_config IS NOT NULL
                    ORDER BY router.name, router.id""",
-                (user_id,),
+                (user_id, user_id),
+            ).fetchall()
+        return [published_model_router_view(row) for row in rows]
+
+    def list_published_model_routers(self) -> Sequence[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT router.*
+                   FROM model_router router
+                   WHERE router.status = 'published'
+                     AND router.deleted_at IS NULL
+                     AND router.published_config IS NOT NULL
+                   ORDER BY router.name, router.id"""
             ).fetchall()
         return [published_model_router_view(row) for row in rows]
 
@@ -243,13 +262,37 @@ class PostgreSqlRouterRepositoryMixin:
             row = connection.execute(
                 """SELECT router.*
                    FROM model_router router
-                   JOIN user_model_router_access access ON access.router_id = router.id
                    WHERE router.id = %s
-                     AND access.user_id = %s
+                     AND (
+                         lower(router.created_by) = lower(%s)
+                         OR EXISTS (
+                             SELECT 1
+                             FROM user_model_router_access access
+                             WHERE access.router_id = router.id
+                               AND lower(access.user_id) = lower(%s)
+                         )
+                     )
                      AND router.status = 'published'
                      AND router.deleted_at IS NULL
                      AND router.published_config IS NOT NULL""",
-                (router_id, user_id),
+                (router_id, user_id, user_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return published_model_router_view(row)
+
+    def get_published_model_router(
+        self, router_id: UUID
+    ) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                """SELECT router.*
+                   FROM model_router router
+                   WHERE router.id = %s
+                     AND router.status = 'published'
+                     AND router.deleted_at IS NULL
+                     AND router.published_config IS NOT NULL""",
+                (router_id,),
             ).fetchone()
         if row is None:
             return None
@@ -575,6 +618,68 @@ class PostgreSqlRouterRepositoryMixin:
                 )
         return True
 
+    def set_model_router_assignments_bulk(
+        self,
+        router_id: UUID,
+        assignments: Mapping[str, bool],
+        changed_by: str,
+    ) -> list[str] | None:
+        changed_users: list[str] = []
+        with self._connection() as connection, connection.transaction():
+            router = connection.execute(
+                """SELECT id FROM model_router
+                   WHERE id = %s
+                     AND status = 'published'
+                     AND deleted_at IS NULL
+                     AND published_config IS NOT NULL
+                   FOR SHARE""",
+                (router_id,),
+            ).fetchone()
+            if router is None:
+                return None
+            for user_id, assigned in assignments.items():
+                current = connection.execute(
+                    """SELECT router_id FROM user_model_router_access
+                       WHERE user_id = %s ORDER BY router_id
+                       FOR UPDATE""",
+                    (user_id,),
+                ).fetchall()
+                previous = [row["router_id"] for row in current]
+                connection.execute(
+                    """INSERT INTO user_model_router_policy (user_id, updated_by)
+                       VALUES (%s, %s)
+                       ON CONFLICT (user_id) DO UPDATE SET
+                         updated_at = now(), updated_by = EXCLUDED.updated_by""",
+                    (user_id, changed_by),
+                )
+                if assigned:
+                    connection.execute(
+                        """INSERT INTO user_model_router_access (user_id, router_id)
+                           VALUES (%s, %s) ON CONFLICT DO NOTHING""",
+                        (user_id, router_id),
+                    )
+                else:
+                    connection.execute(
+                        """DELETE FROM user_model_router_access
+                           WHERE user_id = %s AND router_id = %s""",
+                        (user_id, router_id),
+                    )
+                rows = connection.execute(
+                    """SELECT router_id FROM user_model_router_access
+                       WHERE user_id = %s ORDER BY router_id""",
+                    (user_id,),
+                ).fetchall()
+                next_ids = [row["router_id"] for row in rows]
+                if previous != next_ids:
+                    changed_users.append(user_id)
+                    connection.execute(
+                        """INSERT INTO user_model_router_access_audit (
+                             user_id, previous_router_ids, new_router_ids, changed_by
+                           ) VALUES (%s, %s, %s, %s)""",
+                        (user_id, previous, next_ids, changed_by),
+                    )
+        return changed_users
+
     def list_model_router_assignees(self, router_id: UUID) -> Sequence[str]:
         with self._connection() as connection:
             rows = connection.execute(
@@ -584,24 +689,78 @@ class PostgreSqlRouterRepositoryMixin:
             ).fetchall()
         return [str(row["user_id"]) for row in rows]
 
+    def list_model_router_policy_users(
+        self, user_ids: Sequence[str] | None = None
+    ) -> Sequence[str]:
+        clause = "" if user_ids is None else " WHERE user_id = ANY(%s)"
+        params: tuple[Any, ...] = (
+            () if user_ids is None else (list(user_ids), list(user_ids))
+        )
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""SELECT user_id FROM user_model_router_policy{clause}
+                    UNION
+                    SELECT user_id FROM user_model_router_access{clause}
+                    ORDER BY user_id""",
+                params,
+            ).fetchall()
+        return [str(row["user_id"]) for row in rows]
+
     def get_model_router_run_binding(
         self,
         router_id: UUID,
         router_version: int,
         user_id: str,
         run_id: str,
+        *,
+        ttl_seconds: int = 1800,
     ) -> UUID | None:
         with self._connection() as connection:
             row = connection.execute(
                 """SELECT selected_model_id
                    FROM model_router_run_binding
                    WHERE router_id = %s
-                     AND router_version = %s
                      AND user_id = %s
-                     AND run_id = %s""",
-                (router_id, router_version, user_id, run_id),
+                     AND run_id = %s
+                     AND updated_at >= now() - make_interval(secs => %s)
+                   ORDER BY (router_version = %s) DESC,
+                            router_version DESC,
+                            updated_at DESC
+                   LIMIT 1""",
+                (router_id, user_id, run_id, ttl_seconds, router_version),
             ).fetchone()
         return UUID(str(row["selected_model_id"])) if row is not None else None
+
+    def get_model_router_run_bindings_batch(
+        self,
+        router_id: UUID,
+        router_version: int,
+        user_id: str,
+        run_ids: Sequence[str],
+        *,
+        ttl_seconds: int = 1800,
+    ) -> dict[str, UUID]:
+        unique_ids = list(dict.fromkeys(k for k in run_ids if k))
+        if not unique_ids:
+            return {}
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT DISTINCT ON (run_id) run_id, selected_model_id
+                   FROM model_router_run_binding
+                   WHERE router_id = %s
+                     AND user_id = %s
+                     AND run_id = ANY(%s)
+                     AND updated_at >= now() - make_interval(secs => %s)
+                   ORDER BY run_id,
+                            (router_version = %s) DESC,
+                            router_version DESC,
+                            updated_at DESC""",
+                (router_id, user_id, unique_ids, ttl_seconds, router_version),
+            ).fetchall()
+        return {
+            str(row["run_id"]): UUID(str(row["selected_model_id"]))
+            for row in rows
+        }
 
     def save_model_router_run_binding(
         self,
@@ -612,8 +771,29 @@ class PostgreSqlRouterRepositoryMixin:
         selected_model_id: UUID,
         selected_model_name: str,
     ) -> None:
-        with self._connection() as connection:
-            connection.execute(
+        self.save_model_router_run_bindings_batch(
+            router_id,
+            router_version,
+            user_id,
+            [run_id],
+            selected_model_id,
+            selected_model_name,
+        )
+
+    def save_model_router_run_bindings_batch(
+        self,
+        router_id: UUID,
+        router_version: int,
+        user_id: str,
+        run_ids: Sequence[str],
+        selected_model_id: UUID,
+        selected_model_name: str,
+    ) -> None:
+        unique_ids = list(dict.fromkeys(k for k in run_ids if k))
+        if not unique_ids:
+            return
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.executemany(
                 """INSERT INTO model_router_run_binding (
                      router_id, router_version, user_id, run_id,
                      selected_model_id, selected_model_name
@@ -623,14 +803,17 @@ class PostgreSqlRouterRepositoryMixin:
                      selected_model_id = EXCLUDED.selected_model_id,
                      selected_model_name = EXCLUDED.selected_model_name,
                      updated_at = now()""",
-                (
-                    router_id,
-                    router_version,
-                    user_id,
-                    run_id,
-                    selected_model_id,
-                    selected_model_name,
-                ),
+                [
+                    (
+                        router_id,
+                        router_version,
+                        user_id,
+                        run_id,
+                        selected_model_id,
+                        selected_model_name,
+                    )
+                    for run_id in unique_ids
+                ],
             )
 
     def save_model_router_invocation(
@@ -645,11 +828,29 @@ class PostgreSqlRouterRepositoryMixin:
     ) -> None:
         with self._connection() as connection:
             connection.execute(
+                """DELETE FROM model_router_invocation
+                   WHERE router_id = %s
+                     AND request_id <> %s
+                     AND EXISTS (
+                       SELECT 1
+                       FROM jsonb_array_elements(attempts) elem
+                       WHERE elem->>'request_id' = %s
+                     )""",
+                (router_id, request_id, request_id),
+            )
+            connection.execute(
                 """INSERT INTO model_router_invocation (
                      request_id, router_id, router_name, router_version,
                      selected_model_id, selected_model_name, attempt_count, attempts
                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                   ON CONFLICT (request_id) DO NOTHING""",
+                   ON CONFLICT (request_id) DO UPDATE SET
+                     router_id = EXCLUDED.router_id,
+                     router_name = EXCLUDED.router_name,
+                     router_version = EXCLUDED.router_version,
+                     selected_model_id = EXCLUDED.selected_model_id,
+                     selected_model_name = EXCLUDED.selected_model_name,
+                     attempt_count = EXCLUDED.attempt_count,
+                     attempts = EXCLUDED.attempts""",
                 (
                     request_id,
                     router_id,

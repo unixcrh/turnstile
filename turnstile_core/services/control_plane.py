@@ -25,9 +25,11 @@ from ..domain.control_plane import (
     AuthStrategy,
     DiscoveryModel,
     GatewayApplicationSubscriptionProvisionAccepted,
+    GatewayBackendPoolCandidate,
     GatewayBackendPoolConfig,
     GatewayBackendPoolMember,
     GatewayBackendPoolMemberWrite,
+    GatewayBackendPoolSummary,
     GatewayBackendPoolWrite,
     GatewayCredentialRotation,
     GatewayModelBinding,
@@ -2394,6 +2396,94 @@ class GatewayControlPlaneService:
         reconciled = self._reconciled_release_spec(updated, registry)
         return self._queue_route_reconcile(effective, reconciled, created_by)
 
+    def _backend_pool_release_spec(
+        self, effective: GatewayPublication,
+        registry: Mapping[str, Sequence[dict[str, Any]]],
+    ) -> GatewayReleaseSpec:
+        bindings = {binding.model.model_key.casefold(): binding
+                    for binding in effective.desired_spec.bindings}
+        discovery = {item.id.casefold(): item for item in effective.desired_spec.discovery_models}
+        for row in self._repository.active_model_route_publications(effective.gateway_profile_id):
+            source = GatewayPublication.model_validate(row)
+            for binding in source.desired_spec.bindings:
+                bindings.setdefault(binding.model.model_key.casefold(), binding)
+            for item in source.desired_spec.discovery_models:
+                discovery.setdefault(item.id.casefold(), item)
+        return self._reconciled_release_spec(effective.desired_spec.model_copy(update={
+            "bindings": list(bindings.values()), "discovery_models": list(discovery.values()),
+        }), registry)
+
+    def model_backend_pools(self) -> list[GatewayBackendPoolSummary]:
+        registry = self._repository.registry()
+        runtimes = {row["id"]: row for row in registry["runtimes"]}
+        models = {
+            (runtimes[row["runtime_id"]].get("gateway_profile_id"),
+             str(row["model_key"]).casefold()): row
+            for row in registry["models"]
+            if row.get("enabled") and row["runtime_id"] in runtimes
+        }
+        gateway_ids = {gateway_id for gateway_id, _ in models if gateway_id is not None}
+        pools = []
+        for row in self._repository.effective_gateway_publications(list(gateway_ids)):
+            publication = GatewayPublication.model_validate(row)
+            for binding in self._backend_pool_release_spec(publication, registry).bindings:
+                model = models.get((
+                    publication.gateway_profile_id, binding.model.model_key.casefold(),
+                ))
+                pool = binding.backend_pool
+                if model is not None and pool is not None:
+                    pools.append(GatewayBackendPoolSummary(model_id=model["id"], pool=pool))
+        return pools
+
+    def model_backend_pool_candidates(self, model_id: UUID) -> list[GatewayBackendPoolCandidate]:
+        registry = self._repository.registry()
+        model = self._find(registry["models"], model_id)
+        if model is None or not model["enabled"]:
+            raise ControlPlaneNotFoundError("Model not found")
+        runtime = self._find(registry["runtimes"], model["runtime_id"])
+        if runtime is None or runtime.get("gateway_profile_id") is None:
+            raise ControlPlaneConflictError("A managed APIM model route is required")
+        gateway_id = UUID(str(runtime["gateway_profile_id"]))
+        effective = self._repository.effective_gateway_publication(gateway_id)
+        if effective is None:
+            raise ControlPlaneConflictError("The gateway has no effective release")
+        spec = self._backend_pool_release_spec(
+            GatewayPublication.model_validate(effective), registry,
+        )
+        bindings = {binding.model.model_key.casefold(): binding for binding in spec.bindings}
+        target = bindings.get(str(model["model_key"]).casefold())
+        if target is None:
+            raise ControlPlaneConflictError("The model has no managed APIM route")
+        target = target.model_copy(update={
+            "runtime_id": runtime["id"], "provider_id": model["provider_id"],
+        })
+        candidates = []
+        seen: set[tuple[UUID, str]] = set()
+        for candidate in sorted(registry["models"], key=lambda item: item["id"] != model_id):
+            if not candidate.get("enabled"):
+                continue
+            try:
+                member = self._backend_pool_member(target, GatewayBackendPoolMemberWrite(
+                    runtime_id=candidate["runtime_id"], model_id=candidate["id"],
+                    priority=0, weight=1,
+                ), model, registry["runtimes"], registry["models"], gateway_id)
+            except ControlPlaneConflictError:
+                continue
+            deployment = member.upstream_model_id or target.model.upstream_model_id
+            physical = (member.runtime_id, deployment)
+            if physical in seen:
+                continue
+            seen.add(physical)
+            candidates.append(GatewayBackendPoolCandidate(
+                model_id=candidate["id"], runtime_id=member.runtime_id,
+                runtime_name=member.runtime_name, deployment_name=deployment,
+                project_endpoint=(str(member.project_endpoint).rstrip("/")
+                                  if member.project_endpoint is not None else None),
+                model_name=deployment, model_version=None,
+                model_publisher=str(candidate["provider_id"]),
+            ))
+        return candidates
+
     def configure_model_backend_pool(
         self,
         model_id: UUID,
@@ -2404,8 +2494,8 @@ class GatewayControlPlaneService:
         model = self._find(registry["models"], model_id)
         if model is None or not model["enabled"]:
             raise ControlPlaneNotFoundError("Model not found")
-        if "image_generation" in (model.get("capabilities") or []):
-            raise ControlPlaneConflictError("Image generation pools are not supported")
+        if {"image_generation", "decision"} & set(model.get("capabilities") or []):
+            raise ControlPlaneConflictError("Image generation and Decision pools are not supported")
         primary_runtime = self._find(registry["runtimes"], model["runtime_id"])
         if primary_runtime is None or primary_runtime.get("gateway_profile_id") is None:
             raise ControlPlaneConflictError(
@@ -2416,7 +2506,7 @@ class GatewayControlPlaneService:
         if effective_row is None:
             raise ControlPlaneConflictError("The gateway has no effective release")
         effective = GatewayPublication.model_validate(effective_row)
-        reconciled = self._reconciled_release_spec(effective.desired_spec, registry)
+        reconciled = self._backend_pool_release_spec(effective, registry)
         alias = str(model["model_key"]).casefold()
         target = next(
             (
@@ -2491,7 +2581,7 @@ class GatewayControlPlaneService:
         binding = next(
             (
                 item
-                for item in effective.desired_spec.bindings
+                for item in self._backend_pool_release_spec(effective, registry).bindings
                 if item.model.model_key.casefold() == alias
             ),
             None,
@@ -2520,7 +2610,7 @@ class GatewayControlPlaneService:
         if effective_row is None:
             raise ControlPlaneConflictError("The gateway has no effective release")
         effective = GatewayPublication.model_validate(effective_row)
-        reconciled = self._reconciled_release_spec(effective.desired_spec, registry)
+        reconciled = self._backend_pool_release_spec(effective, registry)
         alias = str(model["model_key"]).casefold()
         target = next(
             (
@@ -2602,19 +2692,53 @@ class GatewayControlPlaneService:
         upstream_model_id = str(
             model.get("upstream_model_id") or model["model_key"]
         ).strip().casefold()
-        has_equivalent_deployment = any(
-            candidate.get("enabled") is True
+        deployment_model = next((
+            candidate for candidate in models
+            if candidate.get("enabled") is True
             and candidate.get("provider_id") == model.get("provider_id")
             and candidate.get("runtime_id") == runtime["id"]
-            and str(
-                candidate.get("upstream_model_id") or candidate["model_key"]
-            ).strip().casefold()
-            == upstream_model_id
-            for candidate in models
-        )
-        if not has_equivalent_deployment:
+            and (
+                candidate.get("id") == member.model_id
+                if member.model_id is not None
+                else str(candidate.get("upstream_model_id") or candidate["model_key"])
+                .strip().casefold() == upstream_model_id
+            )
+        ), None)
+        if deployment_model is None:
             raise ControlPlaneConflictError(
                 "Every backend pool runtime must have an enabled equivalent model deployment"
+            )
+        primary_capabilities = set(model.get("capabilities", ["chat"]))
+        deployment_capabilities = set(deployment_model.get("capabilities", ["chat"]))
+        family = ModelFamilyKey(deployment_model.get("family_key", ModelFamilyKey.GENERIC))
+        if (
+            "chat" not in primary_capabilities or "chat" not in deployment_capabilities
+            or {"image_generation", "decision"} & (primary_capabilities | deployment_capabilities)
+            or not primary_capabilities <= deployment_capabilities
+            or family != ModelFamilyKey(model.get("family_key", ModelFamilyKey.GENERIC))
+        ):
+            raise ControlPlaneConflictError(
+                "Backend pool deployments must share chat capabilities and model family"
+            )
+        deployment = str(
+            deployment_model.get("upstream_model_id") or deployment_model["model_key"]
+        ).strip()
+        if deployment.casefold() != upstream_model_id and not any(
+            re.fullmatch(re.escape(base) + r"-[0-9]+", replica)
+            for base, replica in (
+                (upstream_model_id, deployment.casefold()),
+                (deployment.casefold(), upstream_model_id),
+            )
+        ):
+            raise ControlPlaneConflictError(
+                "Backend pool deployments must use the same model or an explicitly numbered replica"
+            )
+        if deployment.casefold() != upstream_model_id and (
+            target.provider_brand_key is not BrandKey.MICROSOFT_FOUNDRY
+            or runtime.get("brand_key") != BrandKey.MICROSOFT_FOUNDRY
+        ):
+            raise ControlPlaneConflictError(
+                "Different deployment names require a Foundry model identity check"
             )
         config = dict(runtime.get("config") or {})
         if not config.get("control_plane_managed"):
@@ -2634,6 +2758,10 @@ class GatewayControlPlaneService:
         candidate = GatewayModelBinding.model_validate(
             {
                 **target.model_dump(mode="python"),
+                "model": target.model.model_copy(update={
+                    "upstream_model_id": deployment, "family_key": family,
+                    "capabilities": list(deployment_model.get("capabilities", ["chat"])),
+                }),
                 "runtime_id": runtime["id"],
                 "runtime_name": runtime["name"],
                 "runtime_kind": runtime["runtime_kind"],
@@ -2707,6 +2835,11 @@ class GatewayControlPlaneService:
             )
         return GatewayBackendPoolMember(
             runtime_id=runtime["id"],
+            model_id=member.model_id,
+            upstream_model_id=deployment if member.model_id is not None else None,
+            project_endpoint=(
+                config.get("project_endpoint") if member.model_id is not None else None
+            ),
             runtime_name=str(runtime["name"]),
             backend_url=normalized.backend_url,
             auth_strategy=normalized.auth_strategy,
@@ -4023,11 +4156,16 @@ class GatewayControlPlaneService:
                     upgrade = FixedProgramUpgrade.model_validate_json(
                         canonical_document(upgrade_record),
                     )
-                    upgrade.require_previous(
-                        str(expected_base_release_id), FixedProgramInstallation.model_validate_json(
-                            canonical_document(installation),
-                        ),
+                    installed_program = FixedProgramInstallation.model_validate_json(
+                        canonical_document(installation),
                     )
+                    if not (
+                        upgrade.previous_publication_id != str(expected_base_release_id)
+                        and upgrade.installation == installed_program
+                    ):
+                        upgrade.require_previous(
+                            str(expected_base_release_id), installed_program,
+                        )
                 except ValueError as error:
                     raise ControlPlaneConflictError(
                         "Single-model program registration changed",

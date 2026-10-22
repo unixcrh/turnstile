@@ -1329,6 +1329,12 @@ class InMemoryRepository(
                 "output_tokens": usage.output_tokens,
                 "total_tokens": usage.input_tokens + usage.cached_tokens + usage.output_tokens,
                 "estimated_cost": usage.estimated_cost,
+                "input_price_per_million": usage.input_price_per_million,
+                "cached_price_per_million": usage.cached_price_per_million,
+                "cache_write_price_per_million": usage.cache_write_price_per_million,
+                "output_price_per_million": usage.output_price_per_million,
+                "price_context_tier": usage.price_context_tier,
+                "price_context_snapshot": deepcopy(usage.price_context_snapshot),
             }
             for request_id, usage in usage_by_request.items()
         }

@@ -1056,8 +1056,14 @@ def test_published_assigned_router_falls_back_and_persists_attempt_trace(
         assert client.post(
             f"/api/v1/model-routers/{router_id}/publish"
         ).status_code == 200
+        # Creator (owner@contoso.com) can already see and call their own published router
+        assert client.get("/api/v1/model-routers/assigned").json()["items"][0][
+            "id"
+        ] == router_id
+        # Unassigned user (member@contoso.com) gets 403, not a silent fallback to gpt-5.6-luna
         assert client.post(
-            "/api/v1/model-gateway/invoke", json=invocation_payload(router_id)
+            "/api/v1/model-gateway/invoke",
+            json=invocation_payload(router_id, "member@contoso.com"),
         ).status_code == 403
 
         assigned = client.put(
@@ -1480,12 +1486,9 @@ def test_model_based_router_narrows_catalog_and_falls_back_from_invalid_choice(
             f"/api/v1/model-routers/{router_id}/assignment",
             json={"user_id": "owner@contoso.com", "assigned": True},
         ).status_code == 200
-        repository.user_model_policies["owner@contoso.com"] = {
-            "user_id": "owner@contoso.com",
-            "model_ids": [routing_model, first_model],
-            "updated_at": datetime.now(UTC),
-            "updated_by": "owner@contoso.com",
-        }
+        for row in repository.models:
+            if row["id"] == excluded_model:
+                row["enabled"] = False
         invoked = client.post(
             "/api/v1/model-gateway/invoke",
             json=invocation_payload(router_id),
@@ -1589,7 +1592,7 @@ def test_model_based_prompt_truncation_keeps_both_ends() -> None:
     assert "[middle omitted]" in truncated
 
 
-def test_republish_rejects_candidates_unavailable_to_existing_assignees(
+def test_republish_allows_candidates_not_directly_assigned_to_existing_assignees(
     router_repository: tuple[InMemoryRepository, dict[str, SessionIdentity]],
 ) -> None:
     repository, _ = router_repository
@@ -1616,14 +1619,14 @@ def test_republish_rejects_candidates_unavailable_to_existing_assignees(
         f"/api/v1/model-routers/{router_id}",
         json={"name": "Stable assignment", "definition": valid_definition(second_model)},
     ).status_code == 200
-    rejected = client.post(f"/api/v1/model-routers/{router_id}/publish")
+    republished = client.post(f"/api/v1/model-routers/{router_id}/publish")
     assigned = client.get(
         "/api/v1/model-routers/assigned", params={"user_id": user_id}
     ).json()["items"]
 
-    assert rejected.status_code == 409
-    assert assigned[0]["version"] == 1
-    assert assigned[0]["definition"]["default_model_id"] == str(first_model)
+    assert republished.status_code == 200
+    assert assigned[0]["version"] == 2
+    assert assigned[0]["definition"]["default_model_id"] == str(second_model)
 
 
 def test_system_one_decision_model_routes_via_native_choice_with_probabilities(
@@ -1902,3 +1905,1693 @@ def test_matches_any_condition_and_reasoning_effort_and_implicit_agent_stickines
     ]
     assert second_res.json()["selected_model_id"] == str(second_model)
     assert second_res.json()["router_attempts"][0]["decision_basis"] == "interaction_sticky"
+
+
+def test_chat_completions_and_invoke_treat_router_like_a_model(
+    router_repository: tuple[InMemoryRepository, dict[str, SessionIdentity]],
+) -> None:
+    repository, _ = router_repository
+    first_model, second_model = enabled_model_ids(repository)[:2]
+    definition = {
+        "schema_version": 2,
+        "nodes": [
+            {
+                "id": "start",
+                "type": "start",
+                "label": "Start",
+                "position": {"x": 40, "y": 160},
+            },
+            {
+                "id": "cond-task",
+                "type": "condition",
+                "label": "Task Type Check",
+                "position": {"x": 220, "y": 160},
+                "condition": {
+                    "field": "task_type",
+                    "operator": "equals",
+                    "value": "code",
+                },
+            },
+            {
+                "id": "pool-code",
+                "type": "candidate_models",
+                "label": "Code Models",
+                "position": {"x": 420, "y": 80},
+                "candidates": [{"model_id": str(first_model)}],
+            },
+            {
+                "id": "strat-code",
+                "type": "strategy",
+                "label": "Code Strategy",
+                "position": {"x": 620, "y": 80},
+                "strategy_type": "priority",
+                "model_configs": [{"model_id": str(first_model), "priority": 1, "weight": 100}],
+            },
+            {
+                "id": "pool-general",
+                "type": "candidate_models",
+                "label": "General Models",
+                "position": {"x": 420, "y": 240},
+                "candidates": [{"model_id": str(second_model)}],
+            },
+            {
+                "id": "strat-general",
+                "type": "strategy",
+                "label": "General Strategy",
+                "position": {"x": 620, "y": 240},
+                "strategy_type": "priority",
+                "model_configs": [{"model_id": str(second_model), "priority": 1, "weight": 100}],
+            },
+            {
+                "id": "output",
+                "type": "output",
+                "label": "Output",
+                "position": {"x": 840, "y": 160},
+            },
+        ],
+        "edges": [
+            {"id": "e1", "source": "start", "target": "cond-task"},
+            {"id": "e2", "source": "cond-task", "target": "pool-code", "label": "Match"},
+            {"id": "e3", "source": "cond-task", "target": "pool-general", "label": "Else"},
+            {"id": "e4", "source": "pool-code", "target": "strat-code"},
+            {"id": "e5", "source": "pool-general", "target": "strat-general"},
+            {"id": "e6", "source": "strat-code", "target": "output"},
+            {"id": "e7", "source": "strat-general", "target": "output"},
+        ],
+    }
+
+    class EchoRuntimeService:
+        def invoke(
+            self,
+            request: ModelInvocationRequest,
+            *,
+            request_id: str | None = None,
+            timeout_ms: int | None = None,
+        ) -> ModelInvocationResponse:
+            del timeout_ms
+            model = next(
+                item for item in repository.models if item["id"] == request.model_id
+            )
+            return ModelInvocationResponse(
+                request_id=request_id or "req-direct",
+                correlation_id="corr-unified",
+                content=f"SERVED_BY:{model['display_name']}",
+                provider="Azure OpenAI",
+                runtime=str(model["runtime_name"]),
+                model=str(model["display_name"]),
+                gateway="APIM",
+                latency_ms=42,
+                usage=InvocationUsage(
+                    input_tokens=20,
+                    cached_tokens=0,
+                    cache_write_tokens=0,
+                    output_tokens=10,
+                    estimated=False,
+                ),
+                estimated_cost=0.0002,
+            )
+
+    app.dependency_overrides[runtime_service] = EchoRuntimeService
+    try:
+        created = client.post(
+            "/api/v1/model-routers",
+            json={"name": "Unified Condition Router", "definition": definition},
+        )
+        router_id = created.json()["id"]
+        assert client.post(
+            f"/api/v1/model-routers/{router_id}/publish"
+        ).status_code == 200
+        assert client.put(
+            f"/api/v1/model-routers/{router_id}/assignment",
+            json={"user_id": "owner@contoso.com", "assigned": True},
+        ).status_code == 200
+
+        by_name = client.post(
+            "/api/v1/model-gateway/chat/completions",
+            json={
+                "model": "Unified Condition Router",
+                "messages": [{"role": "user", "content": "Hello via router name"}],
+                "router_context": {"task_type": "code"},
+            },
+        )
+        first_model_row = next(
+            item for item in repository.models if item["id"] == first_model
+        )
+        direct_model = client.post(
+            "/api/v1/model-gateway/chat/completions",
+            json={
+                "model": str(first_model_row["model_key"]),
+                "messages": [{"role": "user", "content": "Hello via model key"}],
+            },
+        )
+        invoke_as_model_id = invocation_payload(router_id)
+        invoke_as_model_id["model_id"] = invoke_as_model_id.pop("router_id")
+        invoke_as_model_id["router_context"] = {"task_type": "general"}
+        by_model_id = client.post(
+            "/api/v1/model-gateway/invoke",
+            json=invoke_as_model_id,
+        )
+    finally:
+        app.dependency_overrides.pop(runtime_service, None)
+
+    assert by_name.status_code == 200
+    chat_body = by_name.json()
+    assert chat_body["object"] == "chat.completion"
+    assert chat_body["choices"][0]["message"]["content"].startswith("SERVED_BY:")
+    assert chat_body["turnstile_routing"]["routed"] is True
+    assert chat_body["turnstile_routing"]["router_name"] == "Unified Condition Router"
+    assert chat_body["turnstile_routing"]["selected_model_id"] == str(first_model)
+    cond_eval = chat_body["turnstile_routing"]["router_attempts"][0][
+        "condition_evaluations"
+    ][0]
+    assert cond_eval["field"] == "task_type"
+    assert cond_eval["expected"] == "code"
+    assert cond_eval["actual"] == "code"
+    assert cond_eval["matched"] is True
+    assert cond_eval["branch"] == "Match"
+
+    assert direct_model.status_code == 200
+    assert direct_model.json()["turnstile_routing"]["routed"] is False
+    assert direct_model.json()["model"] == str(first_model_row["display_name"])
+
+    assert by_model_id.status_code == 200
+    assert by_model_id.json()["router_id"] == router_id
+    assert by_model_id.json()["selected_model_id"] == str(second_model)
+
+    app.dependency_overrides[runtime_service] = EchoRuntimeService
+    try:
+        sticky_within_ttl = client.post(
+            "/api/v1/model-gateway/chat/completions",
+            headers={"x-session-id": "sess-ttl-check"},
+            json={
+                "model": "Unified Condition Router",
+                "messages": [{"role": "user", "content": "Turn 1 on code branch"}],
+                "router_context": {"task_type": "code"},
+            },
+        )
+        assert (
+            sticky_within_ttl.json()["turnstile_routing"]["selected_model_id"]
+            == str(first_model)
+        )
+        reused = client.post(
+            "/api/v1/model-gateway/chat/completions",
+            headers={"x-session-id": "sess-ttl-check"},
+            json={
+                "model": "Unified Condition Router",
+                "messages": [{"role": "user", "content": "Turn 2 within 30m"}],
+                "router_context": {"task_type": "general"},
+            },
+        )
+        assert (
+            reused.json()["turnstile_routing"]["selected_model_id"]
+            == str(first_model)
+        )
+        assert (
+            reused.json()["turnstile_routing"]["decision_basis"]
+            == "session_sticky"
+        )
+        # 2. Once idle for > 30 minutes, the binding expires and re-routes to second_model
+        for row in repository.model_router_run_bindings.values():
+            row["updated_at"] = datetime.now(UTC) - timedelta(minutes=31)
+        expired_reroute = client.post(
+            "/api/v1/model-gateway/chat/completions",
+            headers={"x-session-id": "sess-ttl-check"},
+            json={
+                "model": "Unified Condition Router",
+                "messages": [{"role": "user", "content": "Turn 3 after 31m idle"}],
+                "router_context": {"task_type": "general"},
+            },
+        )
+        assert (
+            expired_reroute.json()["turnstile_routing"]["selected_model_id"]
+            == str(second_model)
+        )
+        assert (
+            expired_reroute.json()["turnstile_routing"]["decision_basis"]
+            == "highest_priority_success"
+        )
+    finally:
+        app.dependency_overrides.pop(runtime_service, None)
+
+
+def test_subscription_key_exposes_routers_in_models_and_invokes_chat_completions() -> None:
+    from backend.http.session import get_auth_store
+    from tests.platform.api.api_support import StubAuthStore
+
+    repository = InMemoryRepository()
+    first_model, second_model = enabled_model_ids(repository)[:2]
+    gateway_id = UUID(str(repository.gateways[0]["id"]))
+    app_id = UUID("00000000-0000-4000-8000-000000000701")
+    sub_id = UUID("00000000-0000-4000-8000-000000000702")
+    now = datetime.now(UTC)
+    repository.gateway_applications.append(
+        {
+            "id": app_id,
+            "gateway_profile_id": gateway_id,
+            "slug": "enterprise-assistant",
+            "display_name": "Enterprise Assistant",
+            "description": None,
+            "owner_id": None,
+            "department_id": None,
+            "application_type": "agent",
+            "status": "active",
+            "system_managed": False,
+            "created_by": "owner@contoso.com",
+            "created_at": now,
+            "updated_by": "owner@contoso.com",
+            "updated_at": now,
+        }
+    )
+    test_sub_key = "sub-key-live-test-0123456789abcdef"
+    repository.gateway_application_subscriptions.append(
+        {
+            "id": sub_id,
+            "application_id": app_id,
+            "gateway_profile_id": gateway_id,
+            "apim_subscription_id": "enterprise-assistant",
+            "display_name": "Enterprise Assistant",
+            "scope_type": "api",
+            "scope_id": "/apis/turnstile-llm",
+            "state": "active",
+            "scope_exists": True,
+            "source": "discovered",
+            "discovered_at": now,
+            "last_synced_at": now,
+            "primary_key": test_sub_key,
+        }
+    )
+    definition = valid_definition(first_model)
+
+    class EchoRuntimeService:
+        def invoke(
+            self,
+            request: ModelInvocationRequest,
+            *,
+            request_id: str | None = None,
+            timeout_ms: int | None = None,
+        ) -> ModelInvocationResponse:
+            del timeout_ms
+            model = next(
+                item for item in repository.models if item["id"] == request.model_id
+            )
+            return ModelInvocationResponse(
+                request_id=request_id or "req-sub-key",
+                correlation_id="corr-sub-key",
+                content=f"SUB_KEY_SERVED:{model['display_name']}",
+                provider="Microsoft Foundry",
+                runtime=str(model["runtime_name"]),
+                model=str(model["display_name"]),
+                gateway="Azure API Management",
+                latency_ms=19,
+                usage=InvocationUsage(
+                    input_tokens=12,
+                    cached_tokens=0,
+                    cache_write_tokens=0,
+                    output_tokens=8,
+                    estimated=False,
+                ),
+                estimated_cost=0.0001,
+            )
+
+    app.dependency_overrides[get_repository] = lambda: repository
+    app.dependency_overrides[get_auth_store] = StubAuthStore
+    app.dependency_overrides[runtime_service] = EchoRuntimeService
+    try:
+        # Create and publish router using owner session
+        owner_override = identity(OWNER_ID, "owner@contoso.com")
+        app.dependency_overrides[require_authenticated_session] = lambda: owner_override
+        created = client.post(
+            "/api/v1/model-routers",
+            json={
+                "name": "Exposed Subscription Router",
+                "description": "Router exposed via /v1/models",
+                "definition": definition,
+            },
+        )
+        assert created.status_code == 201
+        router_id = created.json()["id"]
+        assert (
+            client.post(f"/api/v1/model-routers/{router_id}/publish").status_code
+            == 200
+        )
+        # Remove session override so require_authenticated_session uses Ocp-Apim-Subscription-Key
+        app.dependency_overrides.pop(require_authenticated_session, None)
+        client.cookies.clear()
+
+        # 1. Invalid subscription key is rejected with 401
+        bad_models = client.get(
+            "/v1/models",
+            headers={"Ocp-Apim-Subscription-Key": "invalid-key-000"},
+        )
+        assert bad_models.status_code == 401
+
+        # 2. Valid Ocp-Apim-Subscription-Key on /v1/models lists both router and models
+        for path in (
+            "/v1/models",
+            "/api/v1/model-gateway/models",
+            "/api/v1/model-gateway/v1/models",
+        ):
+            models_resp = client.get(
+                path,
+                headers={"Ocp-Apim-Subscription-Key": test_sub_key},
+            )
+            assert models_resp.status_code == 200, path
+            assert models_resp.headers["x-auth-method"] == "subscription_key"
+            assert models_resp.headers["x-apim-subscription-id"] == "enterprise-assistant"
+            payload = models_resp.json()
+            assert payload["object"] == "list"
+            router_items = [
+                item for item in payload["data"] if item["type"] == "model_router"
+            ]
+            direct_items = [
+                item for item in payload["data"] if item["type"] == "model"
+            ]
+            assert len(router_items) == 1
+            assert router_items[0]["id"] == "Exposed Subscription Router"
+            assert router_items[0]["router_id"] == router_id
+            assert router_items[0]["object"] == "model"
+            assert len(direct_items) >= 1
+
+        # 3. Call /v1/chat/completions and /api/v1/model-gateway/chat/completions with key
+        for path in ("/v1/chat/completions", "/api/v1/model-gateway/chat/completions"):
+            chat_resp = client.post(
+                path,
+                headers={"Ocp-Apim-Subscription-Key": test_sub_key},
+                json={
+                    "model": "Exposed Subscription Router",
+                    "messages": [{"role": "user", "content": "Hello with sub key"}],
+                },
+            )
+            assert chat_resp.status_code == 200, path
+            assert chat_resp.headers["x-auth-method"] == "subscription_key"
+            assert chat_resp.headers["x-apim-subscription-id"] == "enterprise-assistant"
+            chat_json = chat_resp.json()
+            assert chat_json["turnstile_routing"]["routed"] is True
+            assert chat_json["turnstile_routing"]["auth_method"] == "subscription_key"
+            assert (
+                chat_json["turnstile_routing"]["apim_subscription_id"]
+                == "enterprise-assistant"
+            )
+            assert chat_json["choices"][0]["message"]["content"].startswith(
+                "SUB_KEY_SERVED:"
+            )
+
+        # 4. Also works when subscription key is passed as Authorization: Bearer <sub_key>
+        bearer_resp = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {test_sub_key}"},
+            json={
+                "model": "Exposed Subscription Router",
+                "messages": [{"role": "user", "content": "Hello via OpenAI SDK Bearer"}],
+            },
+        )
+        assert bearer_resp.status_code == 200
+        assert bearer_resp.json()["turnstile_routing"]["auth_method"] == "subscription_key"
+    finally:
+        app.dependency_overrides.pop(get_repository, None)
+        app.dependency_overrides.pop(get_auth_store, None)
+        app.dependency_overrides.pop(runtime_service, None)
+        app.dependency_overrides.pop(require_authenticated_session, None)
+
+
+def test_router_table_projection_and_apim_global_policy_are_decoupled_and_parameterized(
+    router_repository: tuple[InMemoryRepository, dict[str, SessionIdentity]],
+) -> None:
+    import json as json_mod
+
+    import httpx
+
+    from turnstile_core.domain.model_router import ModelRouter
+    from turnstile_core.integrations.apim_router_global_policy import (
+        build_router_global_service_policy,
+    )
+    from turnstile_core.integrations.router_table_projection import (
+        ROUTER_CATALOG_PARTITION,
+        ROUTER_TRACE_PARTITION,
+        RouterTableProjector,
+        build_router_table_document,
+        router_row_key,
+    )
+
+    repository, _ = router_repository
+    first_model, second_model = enabled_model_ids(repository)[:2]
+    definition = fallback_definition(first_model, second_model)
+    created = client.post(
+        "/api/v1/model-routers",
+        json={"name": "Table Projected Router", "definition": definition},
+    )
+    assert created.status_code == 201
+    router_id = created.json()["id"]
+    published_resp = client.post(f"/api/v1/model-routers/{router_id}/publish")
+    assert published_resp.status_code == 200
+    router_obj = ModelRouter.model_validate(published_resp.json())
+
+    doc = build_router_table_document(router_obj, repository.registry())
+    assert doc is not None
+    assert doc["router_id"] == router_id
+    assert doc["router_name"] == "Table Projected Router"
+    assert str(first_model) in doc["candidates_by_id"]
+    assert str(second_model) in doc["candidates_by_id"]
+
+    # Verify model_based projection distinguishes chat_json vs system_one routing models
+    mb_def = model_based_definition(first_model, first_model, second_model)
+    mb_created = client.post(
+        "/api/v1/model-routers",
+        json={"name": "Chat JSON Routing Model Router", "definition": mb_def},
+    )
+    assert mb_created.status_code == 201
+    mb_pub = client.post(f"/api/v1/model-routers/{mb_created.json()['id']}/publish")
+    assert mb_pub.status_code == 200
+    mb_router = ModelRouter.model_validate(mb_pub.json())
+    mb_doc = build_router_table_document(mb_router, repository.registry())
+    assert mb_doc is not None
+    rm_entry = mb_doc["routing_models_by_id"][str(first_model)]
+    assert rm_entry["decision_protocol"] == "chat_json"
+    assert isinstance(rm_entry["capabilities"], list)
+    assert rm_entry["max_tokens_field"] in {"max_completion_tokens", "max_tokens"}
+    assert rm_entry["backend_path"].endswith("/chat/completions")
+    assert "cached_cost_per_million" in rm_entry
+    assert "cache_write_cost_per_million" in rm_entry
+
+    reg_with_decision = dict(repository.registry())
+    reg_with_decision["models"] = [
+        {**row, "capabilities": ["decision"]}
+        if str(row["id"]) == str(first_model)
+        else row
+        for row in reg_with_decision["models"]
+    ]
+    sys1_doc = build_router_table_document(mb_router, reg_with_decision)
+    assert sys1_doc is not None
+    assert (
+        sys1_doc["routing_models_by_id"][str(first_model)]["decision_protocol"]
+        == "system_one"
+    )
+    assert (
+        sys1_doc["routing_models_by_id"][str(first_model)]["backend_path"]
+        == "/providers/microsoft/v1/systemone"
+    )
+
+    # Verify APIM global policy builder is 100% parameterized and idempotent
+    base_xml = (
+        "<policies><inbound></inbound><backend><forward-request /></backend>"
+        "<outbound></outbound><on-error></on-error></policies>"
+    )
+    compiled_once = build_router_global_service_policy(
+        base_xml,
+        ledger_table_endpoint="https://example-storage.table.core.windows.net",
+        ledger_table_name="ExampleLedgerTable",
+        api_id="example-llm-api",
+    )
+    compiled_twice = build_router_global_service_policy(
+        compiled_once,
+        ledger_table_endpoint="https://example-storage.table.core.windows.net",
+        ledger_table_name="ExampleLedgerTable",
+        api_id="example-llm-api",
+    )
+    assert compiled_once == compiled_twice
+    assert "https://example-storage.table.core.windows.net/ExampleLedgerTable" in compiled_once
+    assert "example-llm-api" in compiled_once
+    assert "cache-lookup-value" in compiled_once
+    assert "cache-store-value" in compiled_once
+    assert (
+        "interactionTtlSeconds = customTtlSeconds &gt; 0 ? customTtlSeconds : 300;"
+        in compiled_once
+    )
+    assert (
+        "sessionTtlSeconds = customTtlSeconds &gt; 0 ? customTtlSeconds : 1800;"
+        in compiled_once
+    )
+    assert "__LEDGER_TABLE_ENDPOINT__" not in compiled_once
+    assert "__LEDGER_TABLE_NAME__" not in compiled_once
+    assert "__API_ID__" not in compiled_once
+    assert "/openai/v1/chat/completions" in compiled_once
+    assert "/providers/microsoft/v1/systemone" in compiled_once
+    assert "proto == &quot;chat_json&quot;" in compiled_once
+
+    from backend.services.model_router_service import ModelRouterExecutionService
+    from turnstile_core.domain.runtime_models import ChatMessage
+
+    single_msg = [
+        ChatMessage(role="system", content="Huge system prompt that must be ignored"),
+        ChatMessage(
+            role="user",
+            content="<context>noise</context><userRequest>Solve this integral</userRequest>",
+        ),
+    ]
+    assert (
+        ModelRouterExecutionService._extract_decision_prompt(single_msg)
+        == "Solve this integral"
+    )
+
+    multi_msg = [
+        ChatMessage(role="system", content="You are a distributed systems architect."),
+        ChatMessage(
+            role="user",
+            content="Design a Raft consensus state machine with leader lease",
+        ),
+        ChatMessage(
+            role="assistant",
+            content=(
+                "Here are two designs: Option 1 uses heartbeats; "
+                "Option 2 uses monotonic quorum leases."
+            ),
+        ),
+        ChatMessage(
+            role="tool",
+            tool_call_id="call_1",
+            content="raw tool dump that must be ignored",
+        ),
+        ChatMessage(role="user", content="Implement Option 2 in Rust"),
+    ]
+    extracted_multi = ModelRouterExecutionService._extract_decision_prompt(multi_msg)
+    assert extracted_multi.startswith(
+        "Task / System instruction:\nYou are a distributed systems architect.\n\n"
+        "Current user request:\nImplement Option 2 in Rust"
+    )
+    assert "Design a Raft consensus state machine" in extracted_multi
+    assert "Option 2 uses monotonic quorum leases" in extracted_multi
+    assert "raw tool dump" not in extracted_multi
+
+    # Verify streaming and non-streaming trace sync normalizes legacy and new attempt shapes
+    trace_payload = {
+        "request_id": "req-stream-101",
+        "correlation_id": "corr-stream-202",
+        "router_id": router_id,
+        "router_name": "Table Projected Router",
+        "router_version": 1,
+        "selected_model_id": str(second_model),
+        "selected_model_name": doc["candidates_by_id"][str(second_model)]["display_name"],
+        "attempts": [
+            {
+                "attempt_number": 1,
+                "model_id": str(first_model),
+                "model_name": doc["candidates_by_id"][str(first_model)]["display_name"],
+                "outcome": "skipped",
+                "decision_basis": "policy_filtered",
+                "attempt_role": "candidate_invocation",
+                "reason": "Candidate exceeds static cost ceiling ($25.00/M > $4.00/M)",
+            },
+            {
+                "attempt_number": 2,
+                "model_id": str(second_model),
+                "model_name": doc["candidates_by_id"][str(second_model)]["display_name"],
+                "request_id": "req-stream-101",
+                "outcome": "succeeded",
+                "status_code": 200,
+                "latency_ms": 420,
+                "attempt_role": "candidate_invocation",
+                "decision_basis": "fallback_success",
+            },
+        ],
+        "usage_records": [],
+    }
+
+    class FakeTokenProvider:
+        def token(self, scope: str = "https://storage.azure.com/") -> str:
+            del scope
+            return "fake-token"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and "model-router-trace" in str(request.url):
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        {
+                            "PartitionKey": ROUTER_TRACE_PARTITION,
+                            "RowKey": "req-stream-101",
+                            "Document": json_mod.dumps(trace_payload),
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(200, json={"value": []})
+
+    projector = RouterTableProjector(
+        "https://example-storage.table.core.windows.net",
+        "ExampleLedgerTable",
+        token_provider=FakeTokenProvider(),  # type: ignore[arg-type]
+    )
+    orig_client = httpx.Client
+
+    def mock_client(*args: object, **kwargs: object) -> httpx.Client:
+        del args, kwargs
+        return orig_client(transport=httpx.MockTransport(handler))
+
+    httpx.Client = mock_client  # type: ignore[misc,assignment]
+    try:
+        synced = projector.sync_traces_to_repository(repository)
+    finally:
+        httpx.Client = orig_client  # type: ignore[misc,assignment]
+
+    assert synced == 1
+    assert "req-stream-101" in repository.model_router_invocations
+    assert "corr-stream-202" not in repository.model_router_invocations
+    synced_trace = repository.model_router_invocations["req-stream-101"]
+    assert synced_trace["router_attempts"][0]["sequence"] == 1
+    assert synced_trace["router_attempts"][0]["outcome"] == "cost_limit_exceeded"
+    assert synced_trace["router_attempts"][0]["attempt_role"] == "candidate"
+    assert synced_trace["router_attempts"][1]["sequence"] == 2
+    assert synced_trace["router_attempts"][1]["outcome"] == "succeeded"
+    assert synced_trace["router_attempts"][1]["attempt_role"] == "candidate"
+    assert router_row_key("Table Projected Router").startswith("router:")
+    assert ROUTER_CATALOG_PARTITION == "model-router|v1"
+
+
+def test_model_router_paginated_people_and_bulk_assignments(
+    router_repository: tuple[InMemoryRepository, dict[str, SessionIdentity]],
+) -> None:
+    repository, _ = router_repository
+    first_model = enabled_model_ids(repository)[0]
+    created = client.post(
+        "/api/v1/model-routers",
+        json={"name": "Scalable Access Router", "definition": valid_definition(first_model)},
+    )
+    assert created.status_code == 201
+    router_id = created.json()["id"]
+    assert client.post(f"/api/v1/model-routers/{router_id}/publish").status_code == 200
+
+    # 1. Paginated people endpoint includes signed-in owner and department summaries
+    first_page = client.get(
+        f"/api/v1/model-routers/{router_id}/people",
+        params={"offset": 0, "limit": 5},
+    )
+    assert first_page.status_code == 200
+    body = first_page.json()
+    assert body["router_id"] == router_id
+    assert body["limit"] == 5
+    assert len(body["items"]) <= 5
+    assert body["total"] >= len(body["items"])
+    assert len(body["departments"]) >= 1
+    assert any(item["id"] == "owner@contoso.com" for item in body["items"])
+
+    # 2. Bulk assign an entire department + explicit user override in 1 request
+    target_dept = body["departments"][0]["id"]
+    bulk_res = client.put(
+        f"/api/v1/model-routers/{router_id}/assignments",
+        json={
+            "department_assignments": [
+                {"department_id": target_dept, "assigned": True},
+            ],
+            "changes": [
+                {"user_id": "owner@contoso.com", "assigned": False},
+            ],
+        },
+    )
+    assert bulk_res.status_code == 200
+    bulk_body = bulk_res.json()
+    assert bulk_body["updated_count"] >= 1
+    assert bulk_body["assigned_count"] >= 1
+
+    assignees = client.get(f"/api/v1/model-routers/{router_id}/assignees").json()
+    assert "owner@contoso.com" not in assignees
+
+    # 3. Search filter + all_matching_assigned clear
+    filtered = client.get(
+        f"/api/v1/model-routers/{router_id}/people",
+        params={"department_id": target_dept, "offset": 0, "limit": 50},
+    ).json()
+    assert filtered["matching_assigned_count"] == filtered["total"] - 1
+
+    clear_res = client.put(
+        f"/api/v1/model-routers/{router_id}/assignments",
+        json={
+            "all_matching_assigned": False,
+            "department_id": "all",
+        },
+    )
+    assert clear_res.status_code == 200
+    assert clear_res.json()["assigned_count"] == 0
+
+
+def test_multi_turn_escalation_from_light_to_strong_and_cache_ratchet(
+    router_repository: tuple[InMemoryRepository, dict[str, SessionIdentity]],
+) -> None:
+    repository, _ = router_repository
+    # index 0: gpt-5.6-luna ($7/M, light), index 1: gpt-5.3-chat ($35/M, strong), index 2: gpt-5.4
+    light_model, strong_model, routing_model = enabled_model_ids(repository)[:3]
+    definition = model_based_definition(routing_model, strong_model, light_model)
+    seen_calls: list[UUID] = []
+    decision_inputs: list[str] = []
+
+    class EscalationRuntimeService:
+        def invoke(
+            self,
+            request: ModelInvocationRequest,
+            *,
+            request_id: str | None = None,
+            timeout_ms: int | None = None,
+        ) -> ModelInvocationResponse:
+            del timeout_ms
+            assert request.model_id is not None
+            seen_calls.append(request.model_id)
+            if request.model_id == routing_model:
+                raw_input = request.messages[-1].content or ""
+                decision_inputs.append(raw_input)
+                user_text = raw_input.lower()
+                first_line = (
+                    user_text.splitlines()[1]
+                    if user_text.startswith("current user request:")
+                    else user_text
+                )
+                target = (
+                    strong_model
+                    if "refactor" in first_line or "distributed" in first_line
+                    else light_model
+                )
+                content = json.dumps({"model_id": str(target), "rationale": "Complexity check"})
+            else:
+                content = f"SERVED_BY:{request.model_id}"
+            return ModelInvocationResponse(
+                request_id=request_id or "req-esc",
+                correlation_id=request_id or "req-esc",
+                content=content,
+                provider="Microsoft Foundry",
+                runtime=request.metadata.runtime,
+                model=request.metadata.model,
+                gateway="Azure API Management",
+                latency_ms=20,
+                usage=None,
+            )
+
+    app.dependency_overrides[runtime_service] = EscalationRuntimeService
+    try:
+        created = client.post(
+            "/api/v1/model-routers",
+            json={"name": "Ratchet Escalation Router", "definition": definition},
+        )
+        assert created.status_code == 201
+        router_id = created.json()["id"]
+        assert client.post(f"/api/v1/model-routers/{router_id}/publish").status_code == 200
+        assert client.put(
+            f"/api/v1/model-routers/{router_id}/assignment",
+            json={"user_id": "owner@contoso.com", "assigned": True},
+        ).status_code == 200
+
+        # 1. Turn 1: "Tell me a joke" -> routes to light_model
+        t1 = client.post(
+            "/api/v1/model-gateway/chat/completions",
+            json={
+                "model": "Ratchet Escalation Router",
+                "messages": [{"role": "user", "content": "Tell me a joke"}],
+            },
+        )
+        assert t1.status_code == 200
+        assert t1.json()["turnstile_routing"]["selected_model_id"] == str(light_model)
+        assert seen_calls == [routing_model, light_model]
+
+        # 2. Turn 1b: Tool-call loop on light_model stays interaction_sticky
+        t1_tool = client.post(
+            "/api/v1/model-gateway/chat/completions",
+            json={
+                "model": "Ratchet Escalation Router",
+                "messages": [
+                    {"role": "user", "content": "Tell me a joke"},
+                    {
+                        "role": "assistant",
+                        "content": "Checking joke database",
+                        "tool_calls": [
+                            {
+                                "id": "c1",
+                                "type": "function",
+                                "function": {"name": "get_joke", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "c1", "content": "Joke #42"},
+                ],
+            },
+        )
+        assert t1_tool.status_code == 200
+        assert t1_tool.json()["turnstile_routing"]["selected_model_id"] == str(light_model)
+        assert t1_tool.json()["turnstile_routing"]["decision_basis"] == "interaction_sticky"
+        assert seen_calls == [routing_model, light_model, light_model]
+
+        # 3. Turn 2: Complex coding follow-up in the same conversation escalates to strong_model
+        t2 = client.post(
+            "/api/v1/model-gateway/chat/completions",
+            json={
+                "model": "Ratchet Escalation Router",
+                "messages": [
+                    {"role": "user", "content": "Tell me a joke"},
+                    {"role": "assistant", "content": "Why did the developer go broke?"},
+                    {
+                        "role": "user",
+                        "content": "Now refactor this distributed consensus engine in Rust",
+                    },
+                ],
+            },
+        )
+        assert t2.status_code == 200
+        assert t2.json()["turnstile_routing"]["selected_model_id"] == str(strong_model)
+        assert t2.json()["turnstile_routing"]["decision_basis"] == "model_based_selection"
+        assert decision_inputs[0] == "Tell me a joke"
+        assert decision_inputs[1].startswith(
+            "Current user request:\nNow refactor this distributed consensus engine in Rust"
+        )
+        assert "Active conversation model:" in decision_inputs[1]
+        assert "- Previous user message: Tell me a joke" in decision_inputs[1]
+        assert "- Previous assistant reply: Why did the developer go broke?" in decision_inputs[1]
+        assert seen_calls == [
+            routing_model,
+            light_model,
+            light_model,
+            routing_model,
+            strong_model,
+        ]
+
+        # 4. Turn 3: Short follow-up within 5m stays locked on strong_model (preserves cache)
+        t3 = client.post(
+            "/api/v1/model-gateway/chat/completions",
+            json={
+                "model": "Ratchet Escalation Router",
+                "messages": [
+                    {"role": "user", "content": "Tell me a joke"},
+                    {"role": "assistant", "content": "Why did the developer go broke?"},
+                    {
+                        "role": "user",
+                        "content": "Now refactor this distributed consensus engine in Rust",
+                    },
+                    {"role": "assistant", "content": "Here is the refactored Rust code..."},
+                    {"role": "user", "content": "Rename the timeout variable"},
+                ],
+            },
+        )
+        assert t3.status_code == 200
+        assert t3.json()["turnstile_routing"]["selected_model_id"] == str(strong_model)
+        assert t3.json()["turnstile_routing"]["decision_basis"] == "interaction_sticky"
+        assert seen_calls == [
+            routing_model,
+            light_model,
+            light_model,
+            routing_model,
+            strong_model,
+            strong_model,
+        ]
+
+        # 5. Turn 4: After > 5m inactivity, a simple joke question routes back to light_model
+        for row in repository.model_router_run_bindings.values():
+            row["updated_at"] = datetime.now(UTC) - timedelta(minutes=6)
+        t4 = client.post(
+            "/api/v1/model-gateway/chat/completions",
+            json={
+                "model": "Ratchet Escalation Router",
+                "messages": [
+                    {"role": "user", "content": "Tell me a joke"},
+                    {"role": "assistant", "content": "Why did the developer go broke?"},
+                    {
+                        "role": "user",
+                        "content": "Now refactor this distributed consensus engine in Rust",
+                    },
+                    {"role": "assistant", "content": "Here is the refactored Rust code..."},
+                    {"role": "user", "content": "Tell me another short joke"},
+                ],
+            },
+        )
+        assert t4.status_code == 200
+        assert t4.json()["turnstile_routing"]["selected_model_id"] == str(light_model)
+        assert t4.json()["turnstile_routing"]["decision_basis"] == "model_based_selection"
+    finally:
+        app.dependency_overrides.pop(runtime_service, None)
+
+
+def test_model_router_extracts_system_task_instruction_and_request_constraints(
+    router_repository: tuple[InMemoryRepository, dict[str, SessionIdentity]],
+) -> None:
+    repository, _ = router_repository
+    routing_model, strong_model, light_model = enabled_model_ids(repository)[:3]
+    for model in repository.models:
+        if model["id"] == strong_model:
+            model["input_cost_per_million"] = 5.0
+            model["output_cost_per_million"] = 25.0
+        elif model["id"] == light_model:
+            model["input_cost_per_million"] = 0.0
+            model["output_cost_per_million"] = 0.0
+
+    definition = model_based_definition(routing_model, strong_model, light_model)
+    captured_decision_inputs: list[str] = []
+
+    class TaskAwareRuntimeService:
+        def invoke(
+            self,
+            request: ModelInvocationRequest,
+            *,
+            request_id: str | None = None,
+            timeout_ms: int | None = None,
+        ) -> ModelInvocationResponse:
+            del timeout_ms
+            assert request.model_id is not None
+            if request.model_id == routing_model:
+                raw_input = request.messages[-1].content or ""
+                captured_decision_inputs.append(raw_input)
+                task_section = raw_input.split("Current user request:\n", 1)[0].lower()
+                target = (
+                    light_model
+                    if "concise 3-5 word title" in task_section
+                    or "max_output_tokens=64" in task_section
+                    else strong_model
+                )
+                content = json.dumps({"model_id": str(target), "rationale": "Task instruction"})
+            else:
+                content = f"SERVED_BY:{request.model_id}"
+            return ModelInvocationResponse(
+                request_id=request_id or "req-task",
+                correlation_id=request_id or "req-task",
+                content=content,
+                provider="Microsoft Foundry",
+                runtime=request.metadata.runtime,
+                model=request.metadata.model,
+                gateway="Azure API Management",
+                latency_ms=15,
+                usage=None,
+            )
+
+    app.dependency_overrides[runtime_service] = TaskAwareRuntimeService
+    try:
+        created = client.post(
+            "/api/v1/model-routers",
+            json={"name": "Task Instruction Router", "definition": definition},
+        )
+        assert created.status_code == 201
+        router_id = created.json()["id"]
+        assert client.post(f"/api/v1/model-routers/{router_id}/publish").status_code == 200
+        assert client.put(
+            f"/api/v1/model-routers/{router_id}/assignment",
+            json={"user_id": "owner@contoso.com", "assigned": True},
+        ).status_code == 200
+
+        # 1. Body generation: system prompt specifies deep report writing, user has raw notes
+        body_res = client.post(
+            "/api/v1/model-gateway/chat/completions",
+            json={
+                "model": "Task Instruction Router",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "<context>noisy ide block</context>"
+                            "You are a technical weekly report writer. Transform raw meeting "
+                            "notes into a structured English engineering report and "
+                            "architecture analysis."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": "Meeting notes: 今天同步了语音网关改造和自动评测进展。",
+                    },
+                ],
+            },
+        )
+        assert body_res.status_code == 200
+        assert body_res.json()["turnstile_routing"]["selected_model_id"] == str(strong_model)
+
+        # 2. Title generation: system prompt specifies short title + max_completion_tokens=64,
+        # while user message contains long technical architecture prose
+        title_res = client.post(
+            "/api/v1/model-gateway/chat/completions",
+            json={
+                "model": "Task Instruction Router",
+                "max_completion_tokens": 64,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Generate a concise 3-5 word title for the following technical notes."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            "# Foundry Voice Agent 2.0 Architecture & MCP Integration\n"
+                            "We redesigned the distributed streaming architecture and end-to-end "
+                            "OpenTelemetry trace pipeline across Azure API Management."
+                        ),
+                    },
+                ],
+            },
+        )
+        assert title_res.status_code == 200
+        assert title_res.json()["turnstile_routing"]["selected_model_id"] == str(light_model)
+
+        assert len(captured_decision_inputs) == 2
+        assert captured_decision_inputs[0].startswith(
+            "Task / System instruction:\nYou are a technical weekly report writer."
+        )
+        assert "noisy ide block" not in captured_decision_inputs[0]
+        assert captured_decision_inputs[1].startswith(
+            "Task / System instruction:\n"
+            "Generate a concise 3-5 word title for the following technical notes."
+        )
+        assert "Request constraints: max_output_tokens=64" in captured_decision_inputs[1]
+
+        # 3. Verify @github/copilot-sdk customize-mode envelope and <user_message> wrapper
+        sdk_wrapped_title_res = client.post(
+            "/api/v1/model-gateway/chat/completions",
+            json={
+                "model": "Task Instruction Router",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are the GitHub Copilot CLI, a terminal assistant built by "
+                            "GitHub. You help with software engineering tasks.\n"
+                            "<environment_limitations>sandbox</environment_limitations>\n"
+                            "<tools><code_search_tools>search</code_search_tools></tools>\n"
+                            "<system_notifications>notify</system_notifications>\n\n"
+                            "Generate a concise 3-5 word title from one user message.\n\n"
+                            "<session_context>Session folder: /tmp</session_context>\n"
+                            "Your goal is to deliver complete, working solutions.\n"
+                            "<task_completion>verify</task_completion>"
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            "<current_datetime>2026-10-22T05:13:12Z</current_datetime>\n\n"
+                            "Create a title for this single user message:\n"
+                            "<user_message>\n"
+                            + ("Distributed consensus & MCP integration architecture. " * 25)
+                            + "\n</user_message>"
+                        ),
+                    },
+                ],
+            },
+        )
+        assert sdk_wrapped_title_res.status_code == 200
+        assert (
+            sdk_wrapped_title_res.json()["turnstile_routing"]["selected_model_id"]
+            == str(light_model)
+        )
+        assert captured_decision_inputs[2].startswith(
+            "Task / System instruction:\n"
+            "Generate a concise 3-5 word title from one user message."
+        )
+        assert "GitHub Copilot CLI" not in captured_decision_inputs[2]
+        assert "<current_datetime>" not in captured_decision_inputs[2]
+    finally:
+        app.dependency_overrides.pop(runtime_service, None)
+
+
+def test_model_router_context_price_tiers_and_attempt_price_enrichment(
+    router_repository: tuple[InMemoryRepository, dict[str, SessionIdentity]],
+) -> None:
+    from backend.services.model_router_service import ModelRouterExecutionService
+    from turnstile_core.domain.model_router import ModelRouter, ModelRouterStrategyModel
+    from turnstile_core.integrations.router_table_projection import (
+        build_router_table_document,
+    )
+    from turnstile_core.persistence.repository_support import enrich_router_attempts
+
+    repository, _ = router_repository
+    routing_model, tiered_model, unpriced_model = enabled_model_ids(repository)[:3]
+    for model in repository.models:
+        if model["id"] == tiered_model:
+            model["input_cost_per_million"] = None
+            model["output_cost_per_million"] = None
+            model["cached_cost_per_million"] = None
+            model["cache_write_cost_per_million"] = None
+            model["context_price_tiers"] = [
+                {
+                    "key": "short",
+                    "min_input_tokens": 0,
+                    "max_input_tokens": 272000,
+                    "input_price_per_million": 0.2,
+                    "cached_price_per_million": 0.02,
+                    "cache_write_price_per_million": 0.25,
+                    "output_price_per_million": 1.2,
+                },
+                {
+                    "key": "long",
+                    "min_input_tokens": 272001,
+                    "max_input_tokens": None,
+                    "input_price_per_million": 0.4,
+                    "cached_price_per_million": 0.04,
+                    "cache_write_price_per_million": 0.5,
+                    "output_price_per_million": 1.8,
+                },
+            ]
+        elif model["id"] == unpriced_model:
+            model["input_cost_per_million"] = None
+            model["output_cost_per_million"] = None
+            model["cached_cost_per_million"] = None
+            model["cache_write_cost_per_million"] = None
+            model["context_price_tiers"] = []
+
+    definition = model_based_definition(routing_model, tiered_model, unpriced_model)
+    created = client.post(
+        "/api/v1/model-routers",
+        json={"name": "Context Tiered Router", "definition": definition},
+    )
+    assert created.status_code == 201
+    router_id = created.json()["id"]
+    published = client.post(f"/api/v1/model-routers/{router_id}/publish")
+    assert published.status_code == 200
+    router_obj = ModelRouter.model_validate(published.json())
+
+    doc = build_router_table_document(router_obj, repository.registry())
+    assert doc is not None
+    tiered_entry = doc["candidates_by_id"][str(tiered_model)]
+    assert tiered_entry["input_cost_per_million"] == 0.2
+    assert tiered_entry["cached_cost_per_million"] == 0.02
+    assert tiered_entry["cache_write_cost_per_million"] == 0.25
+    assert tiered_entry["output_cost_per_million"] == 1.2
+    assert tiered_entry["effective_cost_per_million"] == 1.2
+    assert len(tiered_entry["context_price_tiers"]) == 2
+
+    unpriced_entry = doc["candidates_by_id"][str(unpriced_model)]
+    assert unpriced_entry["input_cost_per_million"] is None
+    assert unpriced_entry["output_cost_per_million"] is None
+    assert unpriced_entry["effective_cost_per_million"] is None
+    assert unpriced_entry["context_price_tiers"] == []
+
+    models_map = {UUID(str(m["id"])): m for m in repository.models}
+    assert ModelRouterExecutionService._candidate_effective_cost(models_map[tiered_model]) == 1.4
+    assert ModelRouterExecutionService._over_cost_limit(models_map[tiered_model], 0.5) is True
+    assert ModelRouterExecutionService._over_cost_limit(models_map[tiered_model], 1.5) is False
+    assert ModelRouterExecutionService._over_cost_limit(models_map[unpriced_model], 0.5) is False
+
+    catalog = ModelRouterExecutionService._decision_catalog(
+        [
+            ModelRouterStrategyModel(model_id=tiered_model),
+            ModelRouterStrategyModel(model_id=unpriced_model),
+        ],
+        models_map,
+    )
+    assert catalog[0]["input_cost_per_million"] == 0.2
+    assert catalog[0]["output_cost_per_million"] == 1.2
+    assert catalog[1]["input_cost_per_million"] is None
+    assert catalog[1]["output_cost_per_million"] is None
+
+    # Verify enrich_router_attempts replaces bogus 0.0 rates with historical tiered snapshot,
+    # preserves legitimate 0.0 rates, and clears bogus 0.0 rates when historical usage is unpriced.
+    enriched = enrich_router_attempts(
+        [
+            {
+                "sequence": 1,
+                "attempt_role": "routing_decision",
+                "model_id": str(routing_model),
+                "model_name": "Decision-1",
+                "request_id": "req-dec-1",
+                "outcome": "succeeded",
+                "input_tokens": 444,
+                "cached_tokens": 0,
+                "cache_write_tokens": 0,
+                "output_tokens": 1,
+                "total_tokens": 445,
+                "estimated_cost": 0.00001678,
+                "input_price_per_million": 0.0378,
+                "cached_price_per_million": 0.0378,
+                "cache_write_price_per_million": 0.0,
+                "output_price_per_million": 0.0,
+            },
+            {
+                "sequence": 2,
+                "attempt_role": "candidate",
+                "model_id": str(tiered_model),
+                "model_name": "gpt-5.6-luna",
+                "request_id": "verify-73898f55-a18d-4752-a16f-874397429822",
+                "outcome": "succeeded",
+                "input_tokens": 112,
+                "cached_tokens": 0,
+                "cache_write_tokens": 0,
+                "output_tokens": 32,
+                "total_tokens": 144,
+                "estimated_cost": 0.0,
+                "input_price_per_million": 0.0,
+                "cached_price_per_million": 0.0,
+                "cache_write_price_per_million": 0.0,
+                "output_price_per_million": 0.0,
+            },
+            {
+                "sequence": 3,
+                "attempt_role": "candidate",
+                "model_id": str(unpriced_model),
+                "model_name": "unpriced-model",
+                "request_id": "req-unpriced",
+                "outcome": "succeeded",
+                "input_tokens": 50,
+                "output_tokens": 10,
+                "total_tokens": 60,
+                "estimated_cost": 0.0,
+                "input_price_per_million": 0.0,
+                "cached_price_per_million": 0.0,
+                "cache_write_price_per_million": 0.0,
+                "output_price_per_million": 0.0,
+            },
+            {
+                "sequence": 4,
+                "attempt_role": "candidate",
+                "model_id": str(routing_model),
+                "model_name": "free-model",
+                "request_id": "req-free",
+                "outcome": "succeeded",
+                "input_tokens": 50,
+                "output_tokens": 10,
+                "total_tokens": 60,
+                "estimated_cost": 0.0,
+                "input_price_per_million": 0.0,
+                "cached_price_per_million": 0.0,
+                "cache_write_price_per_million": 0.0,
+                "output_price_per_million": 0.0,
+            },
+        ],
+        {
+            "verify-73898f55-a18d-4752-a16f-874397429822": {
+                "input_tokens": 112,
+                "cached_tokens": 0,
+                "cache_write_tokens": 0,
+                "output_tokens": 32,
+                "total_tokens": 144,
+                "estimated_cost": 0.0000608,
+                "input_price_per_million": 0.2,
+                "cached_price_per_million": 0.02,
+                "cache_write_price_per_million": 0.25,
+                "output_price_per_million": 1.2,
+                "price_context_tier": "short",
+            },
+            "req-unpriced": {
+                "input_tokens": 50,
+                "output_tokens": 10,
+                "total_tokens": 60,
+                "estimated_cost": 0.0,
+                "input_price_per_million": None,
+                "cached_price_per_million": None,
+                "cache_write_price_per_million": None,
+                "output_price_per_million": None,
+            },
+            "req-free": {
+                "input_tokens": 50,
+                "output_tokens": 10,
+                "total_tokens": 60,
+                "estimated_cost": 0.0,
+                "input_price_per_million": 0.0,
+                "cached_price_per_million": 0.0,
+                "cache_write_price_per_million": 0.0,
+                "output_price_per_million": 0.0,
+            },
+        },
+    )
+    assert enriched[1]["estimated_cost"] == 0.0000608
+    assert enriched[1]["input_price_per_million"] == 0.2
+    assert enriched[1]["cached_price_per_million"] == 0.02
+    assert enriched[1]["cache_write_price_per_million"] == 0.25
+    assert enriched[1]["output_price_per_million"] == 1.2
+    assert enriched[1]["price_context_tier"] == "short"
+
+    assert enriched[2]["input_price_per_million"] is None
+    assert enriched[2]["output_price_per_million"] is None
+
+    assert enriched[3]["input_price_per_million"] == 0.0
+    assert enriched[3]["output_price_per_million"] == 0.0
+
+
+def test_audit_fixes_start_node_partial_candidates_sub_key_bounds_and_trace_pagination(
+    router_repository: tuple[InMemoryRepository, dict[str, SessionIdentity]],
+) -> None:
+    import json as json_mod
+
+    import httpx
+
+    from backend.http.session import get_auth_store
+    from tests.platform.api.api_support import StubAuthStore
+    from turnstile_core.domain.model_router import ModelRouter
+    from turnstile_core.integrations.apim_router_global_policy import (
+        build_router_global_service_policy,
+    )
+    from turnstile_core.integrations.ledger import LedgerSyncService
+    from turnstile_core.integrations.router_table_projection import (
+        ROUTER_TRACE_PARTITION,
+        RouterTableProjector,
+        build_router_table_document,
+    )
+
+    repository, _ = router_repository
+    first_model, second_model, third_model = enabled_model_ids(repository)[:3]
+
+    # 1. UI-created start node ID ("node-<uuid>") + partial candidate availability projection
+    ui_definition = {
+        "schema_version": 2,
+        "default_model_id": str(first_model),
+        "nodes": [
+            {
+                "id": "node-2dd2ed60-1111-4000-8000-000000000001",
+                "type": "start",
+                "label": "Start",
+                "position": {"x": 40, "y": 160},
+            },
+            {
+                "id": "node-pool-1",
+                "type": "candidate_models",
+                "label": "Candidate Models",
+                "position": {"x": 240, "y": 160},
+                "candidates": [
+                    {"model_id": str(first_model)},
+                    {"model_id": str(second_model)},
+                ],
+            },
+            {
+                "id": "node-strat-1",
+                "type": "strategy",
+                "label": "Strategy",
+                "position": {"x": 460, "y": 160},
+                "strategy_type": "priority",
+                "model_configs": [
+                    {"model_id": str(first_model), "priority": 1, "weight": 100},
+                    {"model_id": str(second_model), "priority": 2, "weight": 100},
+                ],
+            },
+            {
+                "id": "node-out-1",
+                "type": "output",
+                "label": "Output",
+                "position": {"x": 680, "y": 160},
+            },
+        ],
+        "edges": [
+            {
+                "id": "e1",
+                "source": "node-2dd2ed60-1111-4000-8000-000000000001",
+                "target": "node-pool-1",
+            },
+            {"id": "e2", "source": "node-pool-1", "target": "node-strat-1"},
+            {"id": "e3", "source": "node-strat-1", "target": "node-out-1"},
+        ],
+    }
+    created = client.post(
+        "/api/v1/model-routers",
+        json={"name": "UI Start Node Router", "definition": ui_definition},
+    )
+    assert created.status_code == 201
+    router_id = created.json()["id"]
+    published = client.post(f"/api/v1/model-routers/{router_id}/publish")
+    assert published.status_code == 200
+    assert (
+        client.put(
+            f"/api/v1/model-routers/{router_id}/assignment",
+            json={"user_id": "member@contoso.com", "assigned": True},
+        ).status_code
+        == 200
+    )
+    assert (
+        client.put(
+            f"/api/v1/model-routers/{router_id}/assignment",
+            json={"user_id": "owner@contoso.com", "assigned": True},
+        ).status_code
+        == 200
+    )
+
+    # Disable second_model; router projection must still succeed with first_model
+    for row in repository.models:
+        if row["id"] == second_model:
+            row["enabled"] = False
+    try:
+        router_obj = ModelRouter.model_validate(published.json())
+        doc = build_router_table_document(
+            router_obj,
+            repository.registry(),
+            assigned_user_ids=["member@contoso.com"],
+        )
+        assert doc is not None
+        assert str(first_model) in doc["candidates_by_id"]
+        assert str(second_model) not in doc["candidates_by_id"]
+        assert doc["owner_email"] == "owner@contoso.com"
+        assert doc["assigned_user_ids"] == ["member@contoso.com", "owner@contoso.com"]
+        assert doc["candidate_model_ids"] == [str(first_model)]
+    finally:
+        for row in repository.models:
+            if row["id"] == second_model:
+                row["enabled"] = True
+
+    # 2. Direct model access ("M" row) does NOT include router candidate models,
+    #    but DOES include router:<router_id> for assigned users and creators.
+    repository.user_model_policies["member@contoso.com"] = {
+        "user_id": "member@contoso.com",
+        "model_ids": [third_model],
+        "updated_at": datetime.now(UTC),
+        "updated_by": "owner@contoso.com",
+    }
+    direct_access = LedgerSyncService(
+        repository, None  # type: ignore[arg-type]
+    ).model_access()
+    member_access = next(
+        row for row in direct_access if row.user_id == "member@contoso.com"
+    )
+    assert str(third_model) in member_access.identifiers
+    assert f"router:{str(router_id).lower()}" in member_access.identifiers
+    assert str(first_model) not in member_access.identifiers
+
+    # 3. APIM Global Policy locates start node dynamically by type == "start",
+    #    enforces strict person/subscription router authorization without empty callerEmail bypass,
+    #    and supports multi-step & anthropic-messages fallback.
+    base_xml = (
+        "<policies><inbound></inbound><backend><forward-request /></backend>"
+        "<outbound></outbound><on-error></on-error></policies>"
+    )
+    policy_xml = build_router_global_service_policy(
+        base_xml,
+        ledger_table_endpoint="https://example-storage.table.core.windows.net",
+        ledger_table_name="ExampleLedgerTable",
+        api_id="example-llm-api",
+    )
+    assert (
+        "FirstOrDefault(n =&gt; string.Equals((string)n[&quot;type&quot;], &quot;start&quot;"
+        in policy_xml
+    )
+    assert "router_not_assigned" in policy_xml
+    assert "needs_outbound_fallback" in policy_xml
+    assert "allowed_subscription_ids" in policy_xml
+    assert "hasPersonAuth" in policy_xml
+    assert "rawTok.AsJwt() != null" in policy_xml
+    assert "retry_anthropic" in policy_xml
+    assert "count=\"3\"" in policy_xml
+
+    # 3b. Unassigned user calling /api/v1/model-gateway/chat/completions with a published router
+    #     gets 403 (never silently falls back to gpt-5.6-luna), and unknown model gets 404.
+    unassigned_user = "outsider@contoso.com"
+    app.dependency_overrides[require_authenticated_session] = lambda: identity(
+        MEMBER_ID, unassigned_user, role="member"
+    )
+    try:
+        unassigned_chat = client.post(
+            "/api/v1/model-gateway/chat/completions",
+            json={
+                "model": "UI Start Node Router",
+                "messages": [{"role": "user", "content": "Should be 403"}],
+            },
+        )
+        assert unassigned_chat.status_code == 403
+
+        unknown_chat = client.post(
+            "/api/v1/model-gateway/chat/completions",
+            json={
+                "model": "non-existent-model-or-router-xyz",
+                "messages": [{"role": "user", "content": "Should be 404"}],
+            },
+        )
+        assert unknown_chat.status_code == 404
+    finally:
+        app.dependency_overrides[require_authenticated_session] = lambda: identity(
+            OWNER_ID, "owner@contoso.com"
+        )
+
+    # 4. Restricted application subscription key cannot bypass allowed_model_ids via router
+    gateway_id = UUID(str(repository.gateways[0]["id"]))
+    app_id = UUID("00000000-0000-4000-8000-000000000791")
+    sub_id = UUID("00000000-0000-4000-8000-000000000792")
+    now = datetime.now(UTC)
+    repository.gateway_applications.append(
+        {
+            "id": app_id,
+            "gateway_profile_id": gateway_id,
+            "slug": "restricted-app",
+            "display_name": "Restricted App",
+            "description": None,
+            "owner_id": None,
+            "department_id": None,
+            "application_type": "agent",
+            "status": "active",
+            "system_managed": False,
+            "created_by": "owner@contoso.com",
+            "created_at": now,
+            "updated_by": "owner@contoso.com",
+            "updated_at": now,
+        }
+    )
+    repository.gateway_application_model_policies[app_id] = {
+        "application_id": app_id,
+        "updated_at": now,
+        "updated_by": "owner@contoso.com",
+    }
+    repository.gateway_application_model_access[app_id] = {third_model}
+    restricted_key = "sub-key-restricted-app-999"
+    repository.gateway_application_subscriptions.append(
+        {
+            "id": sub_id,
+            "application_id": app_id,
+            "gateway_profile_id": gateway_id,
+            "apim_subscription_id": "restricted-app",
+            "display_name": "Restricted App",
+            "scope_type": "api",
+            "scope_id": "/apis/turnstile-llm",
+            "state": "active",
+            "scope_exists": True,
+            "source": "discovered",
+            "discovered_at": now,
+            "last_synced_at": now,
+            "primary_key": restricted_key,
+        }
+    )
+    app.dependency_overrides[get_repository] = lambda: repository
+    app.dependency_overrides[get_auth_store] = StubAuthStore
+    app.dependency_overrides.pop(require_authenticated_session, None)
+    client.cookies.clear()
+    try:
+        # /v1/models hides routers whose candidates are outside allowed_model_ids
+        models_resp = client.get(
+            "/v1/models",
+            headers={"Ocp-Apim-Subscription-Key": restricted_key},
+        )
+        assert models_resp.status_code == 200
+        router_ids = [
+            item["router_id"]
+            for item in models_resp.json()["data"]
+            if item["type"] == "model_router"
+        ]
+        assert router_id not in router_ids
+
+        # Calling the router with the restricted subscription key returns 403 model_not_allowed
+        denied_chat = client.post(
+            "/v1/chat/completions",
+            headers={"Ocp-Apim-Subscription-Key": restricted_key},
+            json={
+                "model": "UI Start Node Router",
+                "messages": [{"role": "user", "content": "Attempt restricted router"}],
+            },
+        )
+        assert denied_chat.status_code == 403
+        assert (
+            denied_chat.json()["detail"]
+            == "Model is not permitted for this application subscription"
+        )
+
+        # Subscription key has role="member" and cannot call owner-only management endpoints
+        owner_only = client.post(
+            "/api/v1/model-routers",
+            headers={"Ocp-Apim-Subscription-Key": restricted_key},
+            json={"name": "SubKey Created", "definition": ui_definition},
+        )
+        assert owner_only.status_code in {401, 403}
+    finally:
+        app.dependency_overrides[require_authenticated_session] = lambda: identity(
+            OWNER_ID, "owner@contoso.com"
+        )
+
+    # 5. Trace sync paginates NextPartitionKey/NextRowKey, forwards price_context_tier,
+    # and deletes synced rows
+    deleted_row_keys: list[str] = []
+    get_calls: list[str] = []
+
+    class FakeTokenProvider:
+        def token(self, scope: str = "https://storage.azure.com/") -> str:
+            del scope
+            return "fake-token"
+
+    def page_handler(request: httpx.Request) -> httpx.Response:
+        url_str = str(request.url)
+        if request.method == "GET" and "model-router-trace" in url_str:
+            get_calls.append(url_str)
+            if "NextRowKey=req-page-2" in url_str:
+                return httpx.Response(
+                    200,
+                    json={
+                        "value": [
+                            {
+                                "PartitionKey": ROUTER_TRACE_PARTITION,
+                                "RowKey": "req-page-2",
+                                "Document": json_mod.dumps(
+                                    {
+                                        "request_id": "req-page-2",
+                                        "router_id": router_id,
+                                        "router_name": "UI Start Node Router",
+                                        "router_version": 1,
+                                        "selected_model_id": str(first_model),
+                                        "selected_model_name": "gpt-5.6-luna",
+                                        "attempts": [],
+                                        "usage_records": [
+                                            {
+                                                "request_id": "dec-page-2",
+                                                "user_id": "owner@contoso.com",
+                                                "model": "gpt-5.6-luna",
+                                                "model_id": str(first_model),
+                                                "input_tokens": 100,
+                                                "output_tokens": 10,
+                                                "estimated_cost": 0.000032,
+                                                "input_price_per_million": 0.2,
+                                                "output_price_per_million": 1.2,
+                                                "price_context_tier": "short",
+                                            }
+                                        ],
+                                    }
+                                ),
+                            }
+                        ]
+                    },
+                )
+            return httpx.Response(
+                200,
+                headers={
+                    "x-ms-continuation-NextPartitionKey": ROUTER_TRACE_PARTITION,
+                    "x-ms-continuation-NextRowKey": "req-page-2",
+                },
+                json={
+                    "value": [
+                        {
+                            "PartitionKey": ROUTER_TRACE_PARTITION,
+                            "RowKey": "req-page-1",
+                            "Document": json_mod.dumps(
+                                {
+                                    "request_id": "req-page-1",
+                                    "router_id": router_id,
+                                    "router_name": "UI Start Node Router",
+                                    "router_version": 1,
+                                    "selected_model_id": str(first_model),
+                                    "selected_model_name": "gpt-5.6-luna",
+                                    "attempts": [],
+                                    "usage_records": [],
+                                }
+                            ),
+                        }
+                    ]
+                },
+            )
+        if request.method == "DELETE" and "model-router-trace" in url_str:
+            deleted_row_keys.append(url_str)
+            return httpx.Response(204)
+        return httpx.Response(200, json={"value": []})
+
+    projector = RouterTableProjector(
+        "https://example-storage.table.core.windows.net",
+        "ExampleLedgerTable",
+        token_provider=FakeTokenProvider(),  # type: ignore[arg-type]
+    )
+    orig_client = httpx.Client
+
+    def mock_client(*args: object, **kwargs: object) -> httpx.Client:
+        del args, kwargs
+        return orig_client(transport=httpx.MockTransport(page_handler))
+
+    httpx.Client = mock_client  # type: ignore[misc,assignment]
+    try:
+        synced_count = projector.sync_traces_to_repository(repository)
+    finally:
+        httpx.Client = orig_client  # type: ignore[misc,assignment]
+
+    assert synced_count == 2
+    assert len(get_calls) == 2
+    assert len(deleted_row_keys) == 2
+    assert "req-page-1" in repository.model_router_invocations
+    assert "req-page-2" in repository.model_router_invocations
+    dec_usage = repository.get_usage_request("dec-page-2")
+    assert dec_usage is not None
+    assert dec_usage["price_context_tier"] == "short"
+

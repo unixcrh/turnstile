@@ -2576,6 +2576,232 @@ schemas:
     - latency_ms
     - usage
     title: ModelInvocationResponse
+  ChatCompletionsRequest:
+    properties:
+      model:
+        type: string
+        maxLength: 255
+        minLength: 1
+        title: Model
+      messages:
+        items:
+          $ref: ../../openapi.yaml#/components/schemas/ChatMessage
+        type: array
+        maxItems: 100
+        minItems: 1
+        title: Messages
+      tools:
+        anyOf:
+        - items:
+            $ref: ../../openapi.yaml#/components/schemas/ToolDefinition
+          maxItems: 32
+          type: array
+        - type: 'null'
+        title: Tools
+      temperature:
+        anyOf:
+        - maximum: 2.0
+          minimum: 0.0
+          type: number
+        - type: 'null'
+        title: Temperature
+      max_tokens:
+        anyOf:
+        - maximum: 1000000.0
+          minimum: 1.0
+          type: integer
+        - type: 'null'
+        title: Max Tokens
+      max_completion_tokens:
+        anyOf:
+        - maximum: 1000000.0
+          minimum: 1.0
+          type: integer
+        - type: 'null'
+        title: Max Completion Tokens
+      reasoning_effort:
+        anyOf:
+        - enum:
+          - none
+          - low
+          - medium
+          - high
+          type: string
+        - type: 'null'
+        title: Reasoning Effort
+      response_format:
+        anyOf:
+        - const: json_object
+          type: string
+        - additionalProperties: true
+          type: object
+        - type: 'null'
+        title: Response Format
+      stream:
+        default: false
+        title: Stream
+        type: boolean
+      user:
+        anyOf:
+        - maxLength: 255
+          type: string
+        - type: 'null'
+        title: User
+      router_context:
+        additionalProperties:
+          anyOf:
+          - type: string
+          - type: number
+          - type: boolean
+        maxProperties: 50
+        title: Router Context
+        type: object
+    additionalProperties: false
+    required:
+    - model
+    - messages
+    title: ChatCompletionsRequest
+    type: object
+  ChatCompletionsResponse:
+    properties:
+      id:
+        title: Id
+        type: string
+      object:
+        const: chat.completion
+        default: chat.completion
+        title: Object
+        type: string
+      created:
+        minimum: 0.0
+        title: Created
+        type: integer
+      model:
+        title: Model
+        type: string
+      choices:
+        items:
+          additionalProperties: true
+          type: object
+        title: Choices
+        type: array
+      usage:
+        anyOf:
+        - additionalProperties:
+            type: integer
+          type: object
+        - type: 'null'
+        title: Usage
+      turnstile_routing:
+        additionalProperties: true
+        title: Turnstile Routing
+        type: object
+    additionalProperties: false
+    required:
+    - id
+    - created
+    - model
+    - choices
+    - turnstile_routing
+    title: ChatCompletionsResponse
+    type: object
+  GatewayModelCatalogItem:
+    properties:
+      id:
+        title: Id
+        type: string
+      object:
+        const: model
+        default: model
+        title: Object
+        type: string
+      type:
+        default: model
+        enum:
+        - model
+        - model_router
+        title: Type
+        type: string
+      created:
+        minimum: 0.0
+        title: Created
+        type: integer
+      owned_by:
+        title: Owned By
+        type: string
+      display_name:
+        title: Display Name
+        type: string
+      model_id:
+        anyOf:
+        - type: string
+        - type: 'null'
+        title: Model Id
+      router_id:
+        anyOf:
+        - type: string
+        - type: 'null'
+        title: Router Id
+      router_version:
+        anyOf:
+        - type: integer
+        - type: 'null'
+        title: Router Version
+      runtime:
+        anyOf:
+        - type: string
+        - type: 'null'
+        title: Runtime
+      description:
+        anyOf:
+        - type: string
+        - type: 'null'
+        title: Description
+      capabilities:
+        items:
+          type: string
+        title: Capabilities
+        type: array
+      strategy_types:
+        items:
+          type: string
+        title: Strategy Types
+        type: array
+      condition_fields:
+        items:
+          type: string
+        title: Condition Fields
+        type: array
+      candidate_models:
+        items:
+          type: string
+        title: Candidate Models
+        type: array
+    additionalProperties: false
+    required:
+    - id
+    - created
+    - owned_by
+    - display_name
+    title: GatewayModelCatalogItem
+    type: object
+  GatewayModelCatalogResponse:
+    properties:
+      object:
+        const: list
+        default: list
+        title: Object
+        type: string
+      data:
+        items:
+          $ref: ../../openapi.yaml#/components/schemas/GatewayModelCatalogItem
+        title: Data
+        type: array
+    additionalProperties: false
+    required:
+    - data
+    title: GatewayModelCatalogResponse
+    type: object
   ModelPrice:
     properties:
       input_price_per_million:

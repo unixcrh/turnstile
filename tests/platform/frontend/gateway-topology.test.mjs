@@ -105,7 +105,7 @@ test("shared form styles cover standalone inputs and variant-aware dialog button
   const stylesheet = frontendRequire("postcss").parse(readFileSync(new URL("../../../frontend/src/styles/finops.css", import.meta.url), "utf8"))
   const rules = new Map()
   stylesheet.walkRules(rule => { for (const selector of rule.selectors) rules.set(selector, Object.fromEntries(rule.nodes.filter(node => node.type === "decl").map(node => [node.prop, node.value]))) })
-  assert.equal(rules.get('[data-slot="input"]').height, "32px")
+  assert.equal(rules.get('[data-slot="input"]').height, "28px")
   assert.equal(rules.get('[data-slot="input"][aria-invalid="true"]')["border-color"], "var(--destructive)")
   assert.equal(rules.get('.registry-editor-footer > [data-slot="button"][data-variant="outline"]').background, "var(--background)")
   assert.equal(rules.get('.registry-editor-footer > [data-slot="button"][data-variant="default"]').background, "var(--primary)")

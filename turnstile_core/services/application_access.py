@@ -458,13 +458,55 @@ class ApplicationAccessService:
         request: GatewayApplicationBudgetUpdate,
         actor: str,
     ) -> GatewayApplicationDetail:
-        period_start, _ = _period_bounds()
-        if request.budget_mode == "usd":
+        period_start, period_end = _period_bounds()
+        existing_budgets = {
+            UUID(str(item["application_id"])): item
+            for item in self._repository.list_gateway_application_budgets(
+                period_start, [application_id]
+            )
+        }
+        existing_budget = existing_budgets.get(application_id)
+        switching_mode = (
+            existing_budget is not None
+            and existing_budget.get("budget_mode", "tokens") != request.budget_mode
+        )
+        effective_mode = (
+            str(existing_budget.get("budget_mode", "tokens"))
+            if existing_budget is not None
+            else request.budget_mode
+        )
+        if request.budget_mode == "usd" or switching_mode:
             execution = (self._read_execution_budget(application_id, period_start)
                          if self._read_execution_budget is not None else None)
-            if execution is None or execution.get("ledger_status") != "current":
+            if request.budget_mode == "usd" and (
+                execution is None or execution.get("ledger_status") != "current"
+            ):
                 raise ControlPlaneUnavailableError(
                     "USD budgets require a current verified atomic execution scope"
+                )
+            if execution is not None and execution.get("budget_mode") in {"tokens", "usd"}:
+                effective_mode = str(execution["budget_mode"])
+            needs_ledger_switch = (
+                existing_budget is not None and effective_mode != request.budget_mode
+            )
+            if needs_ledger_switch and execution is not None and (
+                execution.get("finalized_upper_bound_tokens")
+                or execution.get("finalized_upper_bound_usd")
+                or execution.get("pending_reserved_tokens")
+                or execution.get("pending_reserved_usd")
+            ):
+                raise ControlPlaneConflictError(
+                    "Cannot switch budget unit while unresolved upper-bound reservations exist"
+                )
+        else:
+            needs_ledger_switch = False
+        if needs_ledger_switch and request.budget_mode == "usd":
+            usage_rows = self._repository.gateway_application_usage(
+                period_start, period_end, [application_id]
+            )
+            if any(int(row.get("unpriced_usage_count") or 0) > 0 for row in usage_rows):
+                raise ControlPlaneConflictError(
+                    "Cannot switch to USD budget while the period has unpriced usage"
                 )
         row = self._repository.update_gateway_application_budget(
             application_id,

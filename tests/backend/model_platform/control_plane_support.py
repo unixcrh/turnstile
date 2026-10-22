@@ -458,9 +458,9 @@ def foundry_publication(
 def external_tenant_foundry_publication(
     repository: InMemoryRepository,
     *,
-    account: str = "admin-8382-resource",
-    project: str = "admin-8382",
-    deployment: str = "gpt-5.6-sol",
+    account: str = "unit-foundry-account",
+    project: str = "unit-foundry-project",
+    deployment: str = "gpt-5-unit-deployment",
 ) -> GatewayPublicationCreate:
     provider = next(
         item

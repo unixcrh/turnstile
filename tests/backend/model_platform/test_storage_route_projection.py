@@ -1994,6 +1994,92 @@ def test_configuration_task_binds_publication_baseline_and_changed_routes(
     assert task.context_sha256 == document_digest(task)
 
 
+@pytest.mark.parametrize("registered", ["legacy", "predecessor", "unapproved"])
+@pytest.mark.parametrize("fault", [None, "missing", "wrong"])
+def test_configuration_task_binds_previous_program_after_approved_upgrade(
+    fault: str | None, registered: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import nullcontext
+
+    from turnstile_core.domain.storage_routes import RouteConfigurationPlan, RoutePublicationTask
+    from turnstile_core.integrations.apim_control_plane_contract import PolicyCompilationError
+    from turnstile_core.services.storage_route_publisher import FixedRoutePublisherFactory
+
+    previous, original, proof = snapshot_fixture()
+    program = original.model_copy(update={"program_sha256": "f" * 64})
+    proof = proof.model_copy(update={"identity": program})
+    connections = {
+        member.connection_approval.connection.revision_id: member.connection_approval
+        for member in previous.members
+    }
+    version = str(UUID(int=30))
+    _, manifest, dependencies = configuration_manifests(
+        program.scope, version, previous.routes, connections, 1100,
+    )
+    approval = previous.approval.model_copy(update={
+        "approval_id": str(UUID(int=31)), "route_version": version, "generation": 2,
+        "manifest_sha256": manifest, "dependency_manifest_sha256": dependencies,
+        "required_program_sha256": program.program_sha256,
+    })
+    snapshot = RouteSnapshot.prepare(approval, previous.routes, connections, 1100)
+    plan = RouteConfigurationPlan.prepare(
+        previous.routes, snapshot, program, proof, approval.budget_epoch, 1100,
+    )
+    values: dict[str, Any] = {
+        "publication_id": str(UUID(int=32)), "base_publication_id": str(UUID(int=33)),
+        "desired_spec_sha256": "a" * 64, "target_identity_sha256": "b" * 64,
+        "storage_endpoint": "https://unitstore.table.core.windows.net", "storage_table": "Routes",
+        "plan": plan.model_dump(mode="json"),
+        "previous_head": ActiveRouteHead(
+            approval=previous.approval, activated_epoch=1100,
+        ).model_dump(mode="json"),
+        "previous_routes": [route.model_dump(mode="json") for route in previous.routes],
+        "previous_members": [member.model_dump(mode="json") for member in previous.members],
+    }
+    if fault != "missing":
+        values["previous_program_sha256"] = (
+            "e" * 64 if fault == "wrong" else original.program_sha256
+        )
+    if fault is not None:
+        with pytest.raises(ValueError):
+            RoutePublicationTask.model_validate_json(json.dumps(values))
+        return
+    task = RoutePublicationTask.model_validate_json(json.dumps(values))
+    assert task.previous_program_sha256 == original.program_sha256
+    assert task.previous_head is not None
+    assert task.previous_head.approval == previous.approval
+    assert task.plan.program == program
+    assert task.plan.policy_write_count == 0
+    repository = Mock()
+    repository.get_gateway_publication.return_value = {
+        "resource_manifest": {"route_configuration": task.model_dump(mode="json")},
+    }
+    factory = FixedRoutePublisherFactory(
+        repository, Mock(), active_fence=Mock(), availability_projector=Mock(),
+    )
+    installation = Mock(
+        program=program,
+        legacy_program_sha256=original.program_sha256 if registered == "legacy" else "e" * 64,
+        predecessor_program_sha256=(original.program_sha256,)
+        if registered == "predecessor" else (),
+    )
+    monkeypatch.setattr(factory, "installed", Mock(return_value=(installation, Mock())))
+    port = Mock()
+    opened = Mock(return_value=nullcontext((port, Mock())))
+    monkeypatch.setattr(factory, "_open", opened)
+    if registered == "unapproved":
+        with (
+            pytest.raises(PolicyCompilationError, match="approval changed"),
+            factory.resolve(task),
+        ):
+            pytest.fail("Unapproved previous program opened the publication port")
+        opened.assert_not_called()
+    else:
+        with factory.resolve(task) as resolved:
+            assert resolved is port
+        opened.assert_called_once()
+
+
 def test_activation_cannot_bypass_an_existing_storage_writer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2611,14 +2697,23 @@ def test_program_proof_renewal_is_conditional_with_immutable_receipt(
     "pool-unexpected-marker", "pool-duplicate-marker", "arm-indentation",
     "staged-revision", "staged-current-changed", "count-path", "retired-denied", "retired-forward",
     "native-enabled", "native-missing-marker", "native-false-marker", "native-duplicate-marker",
+    "vault-enabled", "vault-empty-marker", "vault-foreign-marker", "vault-missing-marker",
+    "vault-duplicate-marker",
 ])
 @pytest.mark.parametrize("models_path", ["/models", "/v1/models"])
 @pytest.mark.parametrize("messages_path", ["/messages", "/v1/messages"])
 def test_live_program_verifier_requires_exact_policies_and_authenticated_identity(
     fault: str | None, models_path: str, messages_path: str,
 ) -> None:
+    from xml.etree import ElementTree as ET
+
     from pydantic import SecretStr
 
+    from turnstile_core.integrations.apim_policy_components import (
+        parse_policy,
+        policy_document_digest,
+        serialize_policy,
+    )
     from turnstile_core.services.storage_route_publisher import (
         FixedProgramInstallation,
         FixedProgramVerifier,
@@ -2629,6 +2724,24 @@ def test_live_program_verifier_requires_exact_policies_and_authenticated_identit
     parent = '<policies><inbound><set-variable name="routeProgram" value="' + "d" * 64 + (
         '" /></inbound><backend /><outbound /><on-error /></policies>'
     )
+    vault_origins = ("https://unit-key-vault.vault.azure.net",) if (
+        fault is not None and fault.startswith("vault-")
+    ) else ()
+    policy = parse_policy(parent)
+    inbound = policy.find("inbound")
+    assert inbound is not None
+    if fault != "vault-missing-marker":
+        actual_origins = (
+            () if fault == "vault-empty-marker"
+            else ("https://foreign-key-vault.vault.azure.net",)
+            if fault == "vault-foreign-marker" else vault_origins
+        )
+        for _ in range(2 if fault == "vault-duplicate-marker" else 1):
+            ET.SubElement(inbound, "set-variable", {
+                "name": "routeVaultOrigins",
+                "value": json.dumps(actual_origins, separators=(",", ":")),
+            })
+    parent = serialize_policy(policy)
     if fault in {"native-enabled", "native-false-marker", "native-duplicate-marker"}:
         enabled = "false" if fault == "native-false-marker" else "true"
         marker = f'<set-variable name="routeNativeGatewayScopeEnabled" value="@({enabled})" />'
@@ -2656,7 +2769,6 @@ def test_live_program_verifier_requires_exact_policies_and_authenticated_identit
     operation = (
         "<policies><inbound><base /></inbound><backend /><outbound /><on-error /></policies>"
     )
-    from turnstile_core.integrations.apim_policy_components import policy_document_digest
     from turnstile_core.integrations.apim_storage_routes import (
         AUXILIARY_OPERATIONS,
         FIXED_OPERATIONS,
@@ -2701,6 +2813,7 @@ def test_live_program_verifier_requires_exact_policies_and_authenticated_identit
         operation_contracts=contracts,
         retired_operations={"retained-operation": ("POST", "/retired/converse")} if retired else {},
         supported_profiles=("openai-v1",),
+        trusted_vault_origins=vault_origins,
         oauth_enabled=fault in {"oauth-missing-marker", "oauth-false-marker", "oauth-enabled"},
         pool_enabled=fault in {
             "pool-missing-marker", "pool-false-marker", "pool-enabled", "pool-duplicate-marker",
@@ -2765,9 +2878,12 @@ def test_live_program_verifier_requires_exact_policies_and_authenticated_identit
             } else None,
         )
         accepted = {None, "oauth-enabled", "adapter-enabled", "pool-enabled", "arm-indentation",
-            "staged-revision", "retired-denied", "native-enabled"}
+            "staged-revision", "retired-denied", "native-enabled", "vault-enabled"}
         if fault not in accepted:
-            with pytest.raises(ValueError):
+            with pytest.raises(ValueError, match=(
+                "trusted Vault origins binding changed"
+                if fault is not None and fault.startswith("vault-") else None
+            )):
                 verifier.verify()
         else:
             verified = verifier.verify()
@@ -2781,6 +2897,8 @@ def test_live_program_verifier_requires_exact_policies_and_authenticated_identit
             "pool-duplicate-marker",
             "staged-current-changed", "retired-forward", "count-path",
             "native-missing-marker", "native-false-marker", "native-duplicate-marker",
+            "vault-empty-marker", "vault-foreign-marker", "vault-missing-marker",
+            "vault-duplicate-marker",
         } else 1)
         allowed = {"current_revision", "revision_api_policy", "route_program_operations"}
         assert all(call[0] in allowed for call in management.method_calls)
@@ -3223,74 +3341,103 @@ def test_fixed_image_probe_recovery_requires_image_validation(validated: bool) -
 )
 @pytest.mark.parametrize("service_origin", [False, True])
 @pytest.mark.parametrize("managed_identity", [False, True])
+@pytest.mark.parametrize("version_bound", [False, True])
 def test_foundry_deployment_validation_reads_metadata_without_inference(
-    fault: str | None, service_origin: bool, managed_identity: bool,
+    fault: str | None, service_origin: bool, managed_identity: bool, version_bound: bool,
 ) -> None:
-    from pydantic import SecretStr
-
     from turnstile_core.domain.control_plane import AuthStrategy
     from turnstile_core.integrations.apim_control_plane_contract import PolicyCompilationError
     from turnstile_core.services.storage_route_publisher import FixedRoutePublisherFactory
 
     repository = Mock()
     repository.gateway_publication_credential.return_value = None
-    factory = FixedRoutePublisherFactory(repository, Mock(), active_fence=Mock(),
-                                        availability_projector=Mock())
+    factory = FixedRoutePublisherFactory(
+        repository, Mock(), active_fence=Mock(), availability_projector=Mock(),
+    )
     tokens = Mock()
     tokens.token.return_value = "unit-only-managed-identity-token"
     factory._tokens = tokens
-    publication = Mock(desired_spec=Mock(bindings=[Mock(
+    factory._cipher = Mock()
+    secret_id = "https://unit-vault.vault.azure.net/secrets/unit-key/" + "a" * 32
+    installation = Mock(
+        credential_vault_origin="https://unit-vault.vault.azure.net",
+        trusted_vault_origins=("https://unit-vault.vault.azure.net",),
+    )
+    binding = Mock(
         runtime_config={"project_endpoint": "https://unit.services.ai.azure.com/api/projects/unit"},
         backend_url="https://foreign.openai.azure.com" if fault == "target"
         else "https://unit.services.ai.azure.com" if service_origin
-        else "https://unit.openai.azure.com", model=Mock(upstream_model_id="unit-deployment"),
+        else "https://unit.openai.azure.com",
+        model=Mock(upstream_model_id="unit-deployment"),
         auth_strategy=AuthStrategy.MANAGED_IDENTITY if managed_identity
-        else AuthStrategy.NAMED_VALUE_API_KEY, named_value_name="unit-key",
-        key_vault_secret_id=None,
-    )]))
+        else AuthStrategy.NAMED_VALUE_API_KEY,
+        named_value_name="unit-key",
+        key_vault_secret_id=secret_id if version_bound and not managed_identity else None,
+    )
+    publication = Mock(desired_spec=Mock(bindings=[binding]))
+    publication.resource_manifest = {
+        "route_credentials": {"version": 1, "bindings": {"b" * 64: secret_id}},
+    }
     management = Mock()
-    management.route_credential_value.return_value = SecretStr("unit-only-key")
+    management.route_credential_value.side_effect = AssertionError("Business Named Value read")
     requests: list[httpx.Request] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         assert request.method == "GET"
+        if request.url.host == "unit-vault.vault.azure.net":
+            assert not managed_identity
+            assert request.url.path == "/secrets/unit-key/" + "a" * 32
+            return httpx.Response(200, json={
+                "id": secret_id, "value": "unit-only-key", "attributes": {"enabled": True},
+            })
         assert request.url.path == "/api/projects/unit/deployments"
         if managed_identity:
             assert request.headers["Authorization"] == "Bearer unit-only-managed-identity-token"
             assert "api-key" not in request.headers
-        else:
+        if not managed_identity:
             assert request.headers["api-key"] == "unit-only-key"
             assert "Authorization" not in request.headers
         if fault in {"auth", "auth401"}:
-            return httpx.Response(401 if fault == "auth401" else 403,
-                                  json={"error": "private-upstream-error"})
-        payload: dict[str, Any] = {"value": [{"name": "different" if fault == "missing"
-                                                     else "unit-deployment"}]}
+            return httpx.Response(
+                401 if fault == "auth401" else 403, json={"error": "private-upstream-error"},
+            )
+        payload: dict[str, Any] = {
+            "value": [{"name": "different" if fault == "missing" else "unit-deployment"}],
+        }
         if fault == "paging":
             payload["nextLink"] = "https://foreign.example/private"
-        elif fault == "invalid":
+        if fault == "invalid":
             payload = {"value": "private-invalid-data"}
         return httpx.Response(200, json=payload)
 
-    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
-        if fault:
-            with pytest.raises(PolicyCompilationError) as failed:
-                factory._validate_deployment(publication, management, client, Mock())
-            assert "private" not in str(failed.value)
-            if fault == "missing":
-                assert "deployment_not_found" in str(failed.value)
-                assert "unit-deployment" in str(failed.value)
-            elif fault in {"auth", "auth401"}:
-                assert "deployment_metadata_unavailable" in str(failed.value)
-        else:
-            factory._validate_deployment(publication, management, client, Mock())
-    assert len(requests) == (0 if fault == "target" else 1)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            "turnstile_core.services.route_publication.route_credential_source",
+            lambda _binding: "b" * 64,
+        )
+        with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+            if fault is None:
+                factory._validate_deployment(publication, management, client, installation)
+            if fault is not None:
+                with pytest.raises(PolicyCompilationError) as failed:
+                    factory._validate_deployment(publication, management, client, installation)
+                assert "private" not in str(failed.value)
+                if fault == "missing":
+                    assert "deployment_not_found" in str(failed.value)
+                    assert "unit-deployment" in str(failed.value)
+                if fault in {"auth", "auth401"}:
+                    assert "deployment_metadata_unavailable" in str(failed.value)
+
+    expected_requests = 0 if fault == "target" else 1 if managed_identity else 2
+    assert len(requests) == expected_requests
+    management.route_credential_value.assert_not_called()
     if managed_identity and fault != "target":
         tokens.token.assert_called_once_with("https://ai.azure.com")
-        management.route_credential_value.assert_not_called()
         repository.gateway_publication_credential.assert_not_called()
-    else:
+    if not managed_identity and fault != "target":
+        tokens.token.assert_called_once_with("https://vault.azure.net")
+    if fault == "target":
         tokens.token.assert_not_called()
 
 

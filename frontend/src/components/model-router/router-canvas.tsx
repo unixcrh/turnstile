@@ -13,7 +13,6 @@ import {
   Controls,
   Handle,
   MarkerType,
-  MiniMap,
   Panel,
   Position,
   ReactFlow,
@@ -22,7 +21,6 @@ import {
   applyNodeChanges,
   useReactFlow,
   useUpdateNodeInternals,
-  useNodesInitialized,
   type Connection,
   type Edge,
   type EdgeChange,
@@ -41,19 +39,29 @@ import {
   Grid3X3,
   ListOrdered,
   Lock,
-  Map as MapIcon,
   Maximize2,
   Play,
   Redo2,
   RotateCcw,
   Search,
+  Settings2,
   Trash2,
   Undo2,
   Unlock,
+  X,
 } from "lucide-react"
+import { useIsMobile } from "../../hooks/use-mobile"
 import { ModelBrandLogo } from "../brand-logos"
 import { Button } from "../ui/button"
 import { Checkbox } from "../ui/checkbox"
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "../ui/dialog"
 import { Input } from "../ui/input"
 import { Textarea } from "../ui/textarea"
 import {
@@ -95,14 +103,12 @@ const PROPERTIES_WIDTH_KEY = "turnstile_model_router_properties_width"
 const PROPERTIES_WIDTH_DEFAULT = 312
 const PROPERTIES_WIDTH_MIN = 260
 const PROPERTIES_WIDTH_MAX = 420
-const ROUTER_CANVAS_MIN_ZOOM = 0.35
+const ROUTER_CANVAS_MIN_ZOOM = 0.1
 const ROUTER_CANVAS_FIT_OPTIONS = {
   padding: 0.12,
   minZoom: ROUTER_CANVAS_MIN_ZOOM,
   maxZoom: 1.1,
 } as const
-const ROUTER_MINIMAP_WIDTH = 113.33333333333333
-const ROUTER_MINIMAP_HEIGHT = 80
 function clampPropertiesWidth(value: number) {
   return Math.max(PROPERTIES_WIDTH_MIN, Math.min(PROPERTIES_WIDTH_MAX, value))
 }
@@ -115,6 +121,7 @@ function propertiesWidthFromStorage() {
 }
 const PALETTE_TYPES: ModelRouterNodeType[] = [
   "start",
+  "condition",
   "candidate_models",
   "strategy",
   "fallback",
@@ -206,7 +213,7 @@ function nodeSummary(node: ModelRouterNode, modelsById: Map<string, ModelRouterM
   if (node.type === "fallback") {
     return node.fallback_on.length ? node.fallback_on.join(" · ") : "尚未配置回退条件"
   }
-  return "返回最终模型"
+  return "调用选中模型并返回响应"
 }
 
 function RouterNodeCard({ data, selected }: NodeProps<RouteFlowNode>) {
@@ -267,14 +274,12 @@ function flowNodes(
         ? outgoing
         : [{ target: "" }]
     const summary = nodeSummary(node, modelsById)
-    const { width, height } = routerNodeDimensions(node)
+    const { width } = routerNodeDimensions(node)
     return {
       id: node.id,
       type: "routerNode",
       position: node.position,
       width,
-      height,
-      measured: { width, height },
       sourcePosition: layoutDirection === "vertical" ? Position.Bottom : Position.Right,
       targetPosition: layoutDirection === "vertical" ? Position.Top : Position.Left,
       selected: node.id === selectedNodeId,
@@ -343,6 +348,7 @@ function RouterCanvasSurface({
   canRedo,
   onUndo,
   onRedo,
+  onOpenProperties,
 }: {
   definition: ModelRouterDefinition
   models: ModelRouterModelReference[]
@@ -353,11 +359,12 @@ function RouterCanvasSurface({
   canRedo: boolean
   onUndo: () => void
   onRedo: () => void
+  onOpenProperties?: () => void
 }) {
   const { fitView, screenToFlowPosition } = useReactFlow<RouterFlowNode, RouterFlowEdge>()
   const updateNodeInternals = useUpdateNodeInternals()
-  const nodesInitialized = useNodesInitialized()
   const fittedSignature = useRef("")
+  const pendingFitSignature = useRef("")
   const modelsById = useMemo(() => new Map(models.map((model) => [model.id, model])), [models])
   const layoutDirection = inferLayoutDirection(definition)
   const projectedNodes = useMemo(
@@ -368,7 +375,6 @@ function RouterCanvasSurface({
   const [isDragging, setIsDragging] = useState(false)
   const [isLocked, setIsLocked] = useState(false)
   const [showGrid, setShowGrid] = useState(true)
-  const [showMinimap, setShowMinimap] = useState(true)
   const canvasNodesRef = useRef<RouterFlowNode[]>(projectedNodes)
   const draggingRef = useRef(false)
   const dragFrameRef = useRef<number | null>(null)
@@ -392,13 +398,25 @@ function RouterCanvasSurface({
   }, [])
 
   useEffect(() => {
-    if (!nodesInitialized || fittedSignature.current === nodeSignature) return
-    fittedSignature.current = nodeSignature
+    if (fittedSignature.current === nodeSignature || pendingFitSignature.current === nodeSignature) return
+    pendingFitSignature.current = nodeSignature
     requestAnimationFrame(() => {
       updateNodeInternals(canvasNodesRef.current.map((node) => node.id))
-      requestAnimationFrame(() => void fitView(ROUTER_CANVAS_FIT_OPTIONS))
+      const fitWhenReady = (attempt: number) => {
+        void fitView(ROUTER_CANVAS_FIT_OPTIONS).then((didFit) => {
+          if (didFit) {
+            fittedSignature.current = nodeSignature
+            pendingFitSignature.current = ""
+          } else if (attempt < 12) {
+            requestAnimationFrame(() => fitWhenReady(attempt + 1))
+          } else {
+            pendingFitSignature.current = ""
+          }
+        })
+      }
+      requestAnimationFrame(() => fitWhenReady(0))
     })
-  }, [fitView, nodeSignature, nodesInitialized, updateNodeInternals])
+  }, [canvasNodes, fitView, nodeSignature, updateNodeInternals])
 
   const addNode = (type: ModelRouterNodeType, position?: { x: number; y: number }) => {
     const next = createRouterNode(type, position ?? { x: 120 + definition.nodes.length * 24, y: 120 })
@@ -478,7 +496,14 @@ function RouterCanvasSurface({
   const handleConnect = (connection: Connection) => {
     if (!connection.source || !connection.target || connection.source === connection.target) return
     if (definition.edges.some((edge) => edge.source === connection.source && edge.target === connection.target)) return
-    const edge = createRouterEdge(connection.source, connection.target)
+    const sourceNode = definition.nodes.find((node) => node.id === connection.source)
+    const existingOutgoing = definition.edges.filter((edge) => edge.source === connection.source)
+    let defaultLabel = ""
+    if (sourceNode?.type === "condition") {
+      const hasMatch = existingOutgoing.some((edge) => ["match", "matched", "true", "yes", "匹配"].includes(edge.label.trim().toLocaleLowerCase()))
+      defaultLabel = hasMatch ? "Else" : "Match"
+    }
+    const edge = createRouterEdge(connection.source, connection.target, defaultLabel)
     edge.source_handle = connection.sourceHandle
     onChange({ ...cloneDefinition(definition), edges: [...definition.edges, edge] })
   }
@@ -508,19 +533,19 @@ function RouterCanvasSurface({
           onClick={() => addNode(type)}
         ><Icon size={14} /><span>{ROUTER_NODE_LABELS[type]}</span></button>
       })}
+      {onOpenProperties && <Button className="router-settings-trigger" type="button" variant="ghost" size="icon-sm" aria-label="路由设置" title="路由设置" onClick={onOpenProperties}><Settings2 size={14} /></Button>}
     </div>
     <ReactFlow<RouterFlowNode, RouterFlowEdge>
       nodes={canvasNodes}
       edges={edges}
       nodeTypes={nodeTypes}
       edgeTypes={edgeTypes}
-      fitView
       fitViewOptions={ROUTER_CANVAS_FIT_OPTIONS}
       minZoom={ROUTER_CANVAS_MIN_ZOOM}
       maxZoom={1.8}
       snapToGrid
       snapGrid={[16, 16]}
-      onlyRenderVisibleElements
+      onlyRenderVisibleElements={false}
       nodesDraggable={!isLocked}
       nodesConnectable={!isLocked}
       elementsSelectable={!isLocked && !isDragging}
@@ -567,25 +592,10 @@ function RouterCanvasSurface({
         <span className="router-toolbar-group">
           <button type="button" onClick={() => void fitView({ ...ROUTER_CANVAS_FIT_OPTIONS, duration: 220 })} aria-label="适应画布" title="适应画布"><Maximize2 size={14} /></button>
           <button type="button" className={showGrid ? "active" : ""} aria-label="显示画布网格" aria-pressed={showGrid} onClick={() => setShowGrid((current) => !current)} title="显示画布网格"><Grid3X3 size={14} /></button>
-          <button type="button" className={showMinimap ? "active" : ""} aria-label="显示小地图" aria-pressed={showMinimap} onClick={() => setShowMinimap((current) => !current)} title="显示小地图"><MapIcon size={14} /></button>
           <button type="button" className={isLocked ? "warning" : ""} aria-label={isLocked ? "解锁画布" : "锁定画布"} aria-pressed={isLocked} onClick={() => setIsLocked((current) => !current)} title={isLocked ? "解锁画布" : "锁定画布"}>{isLocked ? <Lock size={14} /> : <Unlock size={14} />}</button>
         </span>
       </Panel>
       <Controls showInteractive={false} fitViewOptions={ROUTER_CANVAS_FIT_OPTIONS} />
-      {showMinimap && !isDragging && <MiniMap
-        pannable
-        zoomable
-        style={{ width: ROUTER_MINIMAP_WIDTH, height: ROUTER_MINIMAP_HEIGHT }}
-        ariaLabel="路由图概览"
-        nodeBorderRadius={5}
-        nodeStrokeColor="var(--background)"
-        nodeStrokeWidth={2}
-        maskColor="color-mix(in oklch, var(--foreground) 6%, transparent)"
-        nodeColor={(node) => {
-          const type = (node.data as RouterFlowData).routerNode.type
-          return `var(--router-${type.replace("_models", "")})`
-        }}
-      />}
     </ReactFlow>
   </div>
 }
@@ -593,17 +603,34 @@ function RouterCanvasSurface({
 function CandidateEditor({
   node,
   models,
+  displayModels = [],
   onChange,
 }: {
   node: ModelRouterNode
   models: ManagedModel[]
+  displayModels?: ModelRouterModelReference[]
   onChange: (node: ModelRouterNode) => void
 }) {
   const [search, setSearch] = useState("")
   const candidatePoolModels = models.filter((model) => !model.capabilities.includes("decision"))
+  const activeIds = new Set(candidatePoolModels.map((model) => model.id))
+  const displayById = new Map(displayModels.map((model) => [model.id, model]))
+  const unavailableSelectedModels = node.candidates
+    .filter((candidate) => !activeIds.has(candidate.model_id))
+    .map((candidate) => {
+      const ref = displayById.get(candidate.model_id)
+      return {
+        id: candidate.model_id,
+        display_name: ref?.display_name ?? candidate.model_id,
+        model_key: ref?.model_key ?? candidate.model_id,
+        provider_name: ref ? `${ref.provider_name} · 不可用` : "已移除 · 不可用",
+        family_key: ref?.family_key ?? null,
+      }
+    })
+  const allPickerModels = [...unavailableSelectedModels, ...candidatePoolModels]
   const candidatesById = new Map(node.candidates.map((candidate) => [candidate.model_id, candidate]))
   const normalizedSearch = search.trim().toLocaleLowerCase()
-  const visibleModels = candidatePoolModels.filter((model) => !normalizedSearch
+  const visibleModels = allPickerModels.filter((model) => !normalizedSearch
     || `${model.display_name} ${model.model_key} ${model.provider_name}`.toLocaleLowerCase().includes(normalizedSearch))
   const selectedCount = node.candidates.length
   return <div className="router-candidate-editor">
@@ -635,7 +662,7 @@ function CandidateEditor({
           </label>
         </div>
       })}
-      {!visibleModels.length && <p className="router-properties-empty">{models.length ? "没有匹配的可用模型。" : "当前用户没有可用于路由的模型。"}</p>}
+      {!visibleModels.length && <p className="router-properties-empty">{allPickerModels.length ? "没有匹配的可用模型。" : "当前用户没有可用于路由的模型。"}</p>}
     </div>
   </div>
 }
@@ -743,7 +770,7 @@ function RouterProperties({
         </label>
         {selected.condition?.operator !== "exists" && <label className="router-field"><span>比较值</span><Input placeholder={selected.condition?.operator === "matches_any" ? "多个关键词用逗号分隔，如：证明, 算法, theorem" : undefined} value={String(selected.condition?.value ?? "")} onChange={(event) => updateNode({ ...selected, condition: { field: selected.condition?.field ?? "task_type", operator: selected.condition?.operator ?? "equals", value: event.target.value } })} /></label>}
       </>}
-      {selected.type === "candidate_models" && <CandidateEditor node={selected} models={models} onChange={updateNode} />}
+      {selected.type === "candidate_models" && <CandidateEditor node={selected} models={models} displayModels={displayModels} onChange={updateNode} />}
       {selected.type === "strategy" && <>
         <label className="router-field"><span>选择策略</span>
           <Select value={selected.strategy_type ?? "priority"} onValueChange={(value) => updateNode({ ...selected, strategy_type: (value ?? "priority") as ModelRouterStrategyType, routing_model_id: value === "model_based" ? selected.routing_model_id ?? models.find((model) => model.capabilities.includes("decision"))?.id ?? candidateIds[0] ?? null : null })}>
@@ -758,13 +785,14 @@ function RouterProperties({
         {selected.strategy_type === "model_based" && <label className="router-field"><span>Routing Model</span>
           <Select value={selected.routing_model_id ?? ""} onValueChange={(value) => updateNode({ ...selected, routing_model_id: value ?? null })}>
             <SelectTrigger aria-label="选择 Routing Model" title={selected.routing_model_id ?? undefined}>
-              <SelectValue>{selected.routing_model_id ? <>
+              <SelectValue>{selected.routing_model_id ? <span className="registry-option">
+                <ModelBrandLogo familyKey={routingModel?.family_key} identity={`${routingModel?.display_name ?? ""} ${routingModel?.model_key ?? ""}`} providerName={routingModel?.provider_name ?? ""} size={15} />
                 <span>{routingModel?.display_name ?? "已不可用的模型"}</span>
                 {routingModel && routingModel.status !== "available" && <small>{routerModelStatusLabel(routingModel.status)}</small>}
-              </> : "选择判路由模型"}</SelectValue>
+              </span> : "选择判路由模型"}</SelectValue>
             </SelectTrigger>
             <SelectContent align="end">
-              {models.map((model) => <SelectItem key={model.id} value={model.id}>{model.display_name}</SelectItem>)}
+              {models.map((model) => <SelectItem key={model.id} value={model.id}><span className="registry-option"><ModelBrandLogo familyKey={model.family_key} identity={`${model.display_name} ${model.model_key}`} providerName={model.provider_name} size={15} /><span>{model.display_name}</span></span></SelectItem>)}
             </SelectContent>
           </Select>
         </label>}
@@ -808,11 +836,20 @@ export function RouterCanvas({
   onChange: (definition: ModelRouterDefinition) => void
   onMetadataChange: (name: string, description: string) => void
 }) {
+  const isMobile = useIsMobile()
+  const [propertiesOpen, setPropertiesOpen] = useState(false)
   const [propertiesWidth, setPropertiesWidth] = useState(propertiesWidthFromStorage)
   const definitionRef = useRef(definition)
   const historyRef = useRef<ModelRouterDefinition[]>([])
   const futureRef = useRef<ModelRouterDefinition[]>([])
   const [historyRevision, setHistoryRevision] = useState(0)
+  useEffect(() => {
+    setPropertiesOpen(false)
+  }, [isMobile])
+  const selectNode = useCallback((nodeId: string | null) => {
+    onSelectedNodeChange(nodeId)
+    if (isMobile && nodeId) setPropertiesOpen(true)
+  }, [isMobile, onSelectedNodeChange])
   useEffect(() => {
     if (JSON.stringify(definitionRef.current) === JSON.stringify(definition)) return
     definitionRef.current = definition
@@ -896,21 +933,36 @@ export function RouterCanvas({
       savePropertiesWidth(PROPERTIES_WIDTH_MAX)
     }
   }
+  const properties = <RouterProperties
+    definition={definition}
+    models={models}
+    displayModels={displayModels}
+    routerName={routerName}
+    routerDescription={routerDescription}
+    selectedNodeId={selectedNodeId}
+    onSelectedNodeChange={onSelectedNodeChange}
+    onChange={applyDefinition}
+    onMetadataChange={onMetadataChange}
+  />
   return <div className="router-canvas-layout" style={{ "--router-properties-width": `${propertiesWidth}px` } as CSSProperties}>
     <ReactFlowProvider>
       <RouterCanvasSurface
         definition={definition}
         models={displayModels}
         selectedNodeId={selectedNodeId}
-        onSelectedNodeChange={onSelectedNodeChange}
+        onSelectedNodeChange={selectNode}
         onChange={applyDefinition}
         canUndo={historyRef.current.length > 0}
         canRedo={futureRef.current.length > 0}
         onUndo={undo}
         onRedo={redo}
+        onOpenProperties={isMobile ? () => {
+          onSelectedNodeChange(null)
+          setPropertiesOpen(true)
+        } : undefined}
       />
     </ReactFlowProvider>
-    <button
+    {!isMobile && <button
       className="router-properties-handle"
       type="button"
       role="separator"
@@ -923,17 +975,13 @@ export function RouterCanvas({
       onPointerDown={startPropertiesResize}
       onKeyDown={resizePropertiesWithKeyboard}
       onDoubleClick={() => savePropertiesWidth(PROPERTIES_WIDTH_DEFAULT)}
-    />
-    <RouterProperties
-      definition={definition}
-      models={models}
-      displayModels={displayModels}
-      routerName={routerName}
-      routerDescription={routerDescription}
-      selectedNodeId={selectedNodeId}
-      onSelectedNodeChange={onSelectedNodeChange}
-      onChange={applyDefinition}
-      onMetadataChange={onMetadataChange}
-    />
+    />}
+    {!isMobile && properties}
+    {isMobile && <Dialog open={propertiesOpen} onOpenChange={setPropertiesOpen}>
+      <DialogContent className="apim-native-route-drawer router-settings-drawer" finalFocus={false}>
+        <DialogHeader className="apim-native-route-drawer-header"><DialogTitle>{selectedNodeId ? "节点属性" : "路由设置"}</DialogTitle><DialogDescription className="sr-only">{definition.nodes.find((node) => node.id === selectedNodeId)?.label ?? routerName}</DialogDescription><DialogClose render={<Button type="button" variant="ghost" size="icon-sm" className="apim-native-route-drawer-close" />}><X size={16} /><span className="sr-only">关闭</span></DialogClose></DialogHeader>
+        {properties}
+      </DialogContent>
+    </Dialog>}
   </div>
 }

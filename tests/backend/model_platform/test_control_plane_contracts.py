@@ -390,6 +390,101 @@ def test_budget_existing_model_cannot_fall_back_to_unapproved_counting() -> None
         BudgetPublicationContracts.capture(publication, registry, fence)
 
 
+@pytest.mark.parametrize("fault", [
+    None, "epoch", "gateway", "inactive", "future", "model", "changed_route",
+])
+def test_budget_route_reconcile_inherits_independently_active_model_contract(
+    fault: str | None,
+) -> None:
+    from turnstile_core.services.storage_route_publisher import FixedRoutePublisherFactory
+
+    source, fence = budget_publication_contract_fixture()
+    source_binding = source.desired_spec.bindings[0]
+    alias = source_binding.model.model_key
+    original = BudgetPublicationContracts.model_validate({
+        "publication_id": source.id, "gateway_profile_id": source.gateway_profile_id,
+        "epoch": fence["epoch"], "release_spec_sha256": source.desired_spec_sha256,
+        "binding_sha256": {alias: hashlib.sha256(json.dumps(
+            source_binding.model_dump(mode="json"), sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()},
+        "model_contracts": {alias: {
+            "model_id": UUID(int=6000), "algorithm": "legacy_request_estimate_v1",
+            "output_estimate": 256, "output_field": "max_completion_tokens",
+            "operations": ["chat-completions"], "evidence_sha256": "c" * 64,
+            "verified_at": source.created_at,
+        }},
+    })
+    source = source.model_copy(update={
+        "status": PublicationStatus.ACTIVE,
+        "resource_manifest": {"budget_contracts": original.model_dump(mode="json")},
+    })
+    previous = source.model_copy(update={
+        "id": UUID(int=6001),
+        "desired_spec": source.desired_spec.model_copy(update={"bindings": []}),
+        "resource_manifest": {},
+    })
+    baseline = BudgetPublicationContracts.capture(previous, {"models": []}, fence)
+    previous = previous.model_copy(update={
+        "resource_manifest": {"budget_contracts": baseline.model_dump(mode="json")},
+    })
+    publication = source.model_copy(update={
+        "id": UUID(int=6002), "publication_kind": PublicationKind.ROUTE_RECONCILE,
+        "created_at": source.created_at + timedelta(seconds=1), "resource_manifest": {},
+    })
+    binding = publication.desired_spec.bindings[0]
+    contract = original.model_contracts[binding.model.model_key]
+    registry = {"models": [{
+        "id": str(contract.model_id), "model_key": binding.model.model_key,
+        "runtime_id": binding.runtime_id,
+    }]}
+    if fault == "epoch":
+        original = original.model_copy(update={"epoch": UUID(int=6003)})
+    elif fault == "gateway":
+        source = source.model_copy(update={"gateway_profile_id": UUID(int=6003)})
+        original = original.model_copy(update={"gateway_profile_id": UUID(int=6003)})
+    elif fault == "inactive":
+        source = source.model_copy(update={"status": PublicationStatus.FAILED})
+    elif fault in {"future", "model"}:
+        changed_contract = contract.model_copy(update={
+            "verified_at": publication.created_at + timedelta(seconds=1),
+        } if fault == "future" else {"model_id": UUID(int=6003)})
+        original = original.model_copy(update={
+            "model_contracts": {binding.model.model_key: changed_contract},
+        })
+    elif fault == "changed_route":
+        verified = ModelCountContract.model_validate({
+            "model_id": contract.model_id,
+            "input_ceiling": 1000, "output_ceiling": 100,
+            "output_field": "max_completion_tokens", "operations": ["chat-completions"],
+            "evidence_sha256": "a" * 64, "verified_at": source.created_at,
+        })
+        original = original.model_copy(update={
+            "model_contracts": {binding.model.model_key: verified},
+        })
+        publication = publication.model_copy(update={
+            "desired_spec": publication.desired_spec.model_copy(update={
+                "bindings": [binding.model_copy(update={"backend_path": "/changed"})],
+            }),
+        })
+    source = source.model_copy(update={
+        "resource_manifest": {"budget_contracts": original.model_dump(mode="json")},
+    })
+    repository = MagicMock(spec=InMemoryRepository)
+    repository.registry.return_value = registry
+    repository.active_model_route_publications.return_value = [source.model_dump(mode="json")]
+    factory = FixedRoutePublisherFactory(
+        repository, MagicMock(), active_fence=lambda _target: fence,
+        availability_projector=MagicMock(),
+    )
+    if fault is not None:
+        with pytest.raises(ValueError):
+            factory._budget_contracts(publication, previous)
+        return
+    snapshot = factory._budget_contracts(publication, previous)
+    snapshot.validate_publication(publication)
+    assert snapshot.model_contracts[binding.model.model_key] == contract
+
+
 @pytest.mark.parametrize("identity", [
     {"deployment_name": "gpt-4.1-845778"},
     {"model_key": "gpt-4.1", "display_name": "GPT-4.1", "upstream_model_id": "gpt-4.1"},
@@ -653,6 +748,108 @@ def test_route_credential_vault_persists_encrypted_intent_once_and_recovers_read
         assert requests.count("PUT") == 1
 
 
+@pytest.mark.parametrize("failure", ["credential", "budget", "program"])
+@pytest.mark.parametrize("fault", [
+    None, "prepared", "probed", "paid", "leased", "revision", "policy", "base", "spec",
+    "method", "path", "status", "code",
+])
+def test_pool_resubmission_preserves_zero_effect_credential_denial(
+    fault: str | None, failure: str,
+) -> None:
+    from copy import deepcopy
+
+    repository = InMemoryRepository()
+    service = GatewayControlPlaneService(repository, apim_principal_id=str(UUID(int=705)))
+    request = foundry_publication()
+    request.provider = ProviderTarget(existing_id=next(
+        item["id"] for item in repository.providers if item["brand_key"] == "microsoft_foundry"
+    ))
+    baseline = service.seed_legacy_publication(request, "unit-owner")
+    baseline_row = repository.get_gateway_publication(baseline.id)
+    assert baseline_row is not None
+    baseline_row.update(status="active", resource_manifest={"fixed_route_program": {}})
+    repository.effective_gateway_releases[APIM_ID] = baseline.id
+    repository.gateway_publication_outbox[0].update(status="completed")
+    spec = baseline.desired_spec.model_dump(mode="python")
+    digest = "d" * 64
+    failed = repository.create_gateway_publication(
+        APIM_ID, spec, digest, "route_reconcile", "unit-owner",
+        expected_base_release_id=baseline.id,
+    )
+    diagnostic = {"method": "POST", "path": "/namedValues/unit-observer-key/listValue",
+                  "status": 403, "code": "AuthorizationFailed"}
+    if fault in {"method", "path", "status", "code"}:
+        diagnostic[fault] = {"method": "PUT", "path": "/backends/unit-backend",
+                             "status": 400, "code": "BadRequest"}[fault]
+    failed.update(status="failed", error_code="PolicyCompilationError",
+                  error_message="APIM management failed: " + json.dumps(diagnostic))
+    if failure == "budget":
+        failed.update(
+            error_code="ValueError",
+            error_message="An existing model is missing its approved budget contract",
+            resource_manifest={"route_credentials": {}, "route_preparation": {},
+                               "route_dependencies": {}, "route_last_progress_attempt": 1},
+        )
+        if fault in {"method", "path", "status", "code"}:
+            failed["error_message"] += " (different failure)"
+    elif failure == "program":
+        failed.update(
+            error_code="ValidationError",
+            error_message="1 validation error for RoutePublicationTask\n"
+            "  Value error, ROUTE_PUBLICATION_TASK_INVALID [type=value_error, "
+            "input_value={}, input_type=dict]",
+            resource_manifest={"route_credentials": {}, "route_dependencies": {},
+                               "route_last_progress_attempt": 1},
+        )
+        if fault in {"method", "path", "status", "code"}:
+            failed["error_message"] = failed["error_message"].replace(
+                "ROUTE_PUBLICATION_TASK_INVALID", "OTHER_TASK_FAILURE",
+            )
+    outbox = repository.gateway_publication_outbox[-1]
+    outbox.update(status="completed", lease_owner=None, lease_expires_at=None)
+    if fault == "prepared":
+        failed["resource_manifest"][
+            "route_preparation" if failure == "credential" else "route_cutover"
+        ] = {}
+    elif fault == "probed":
+        repository.gateway_publication_audit.append({
+            "publication_id": failed["id"], "detail": {"probe_request": {}},
+        })
+    elif fault == "paid":
+        repository.billable_requests[UUID(int=707)] = MagicMock(
+            scope_type="system", scope_id=f"publication:{failed['id']}",
+        )
+    elif fault == "leased":
+        outbox["status"] = "leased"
+    elif fault == "revision":
+        failed["apim_revision"] = "candidate"
+    elif fault == "policy":
+        failed["policy_sha256"] = "e" * 64
+    elif fault == "base":
+        failed["base_release_id"] = UUID(int=706)
+    elif fault == "spec":
+        failed["desired_spec"] = {**spec, "discovery_models": []}
+    preserved = deepcopy(failed)
+
+    def submit() -> dict[str, Any]:
+        return repository.create_gateway_publication(
+            APIM_ID, spec, digest, "route_reconcile", "unit-owner",
+            expected_base_release_id=baseline.id,
+        )
+
+    if fault is None:
+        created = submit()
+        assert created["id"] != failed["id"]
+        assert created["status"] == "queued"
+        assert created["base_release_id"] == baseline.id
+        assert created["desired_spec"] == spec
+    else:
+        with pytest.raises(ValueError):
+            submit()
+    assert failed == preserved
+    assert outbox["status"] == ("leased" if fault == "leased" else "completed")
+
+
 def test_fixed_policy_compaction_preserves_xml_strings_and_executable_tokens() -> None:
     expression = ('@{ var url = "https://unit.example.test/a b";\n'
                   ' // unit comment\n return url + " x"; }')
@@ -683,7 +880,8 @@ def test_fixed_program_verifier_requires_current_management_and_exact_authentica
     operation = ("<policies><inbound><base/></inbound><backend><base/></backend>"
                  "<outbound><base/></outbound><on-error><base/></on-error></policies>")
     parent = operation.replace("<inbound><base/>", '<inbound><base/><set-variable '
-                                'name="routeProgram" value="' + "0" * 64 + '"/>')
+                                'name="routeProgram" value="' + "0" * 64 + '"/>'
+                                '<set-variable name="routeVaultOrigins" value="[]"/>')
     policies = {name: operation for name in contracts}
     digest = fixed_program_digest(parent, policies, tuple((name, *route)
                                                           for name, route in contracts.items()))
@@ -2896,10 +3094,10 @@ def test_foundry_api_key_contract_rejects_incomplete_credentials() -> None:
     with pytest.raises(ValueError, match="inference endpoint and API key"):
         RuntimeTarget(
             foundry_project_endpoint=HttpUrl(
-                "https://admin-8382-resource.services.ai.azure.com/api/projects/admin-8382"
+                "https://unit-foundry-account.services.ai.azure.com/api/projects/unit-foundry-project"
             ),
             foundry_inference_endpoint=HttpUrl(
-                "https://admin-8382-resource.openai.azure.com/openai/v1"
+                "https://unit-foundry-account.openai.azure.com/openai/v1"
             ),
         )
 
@@ -2943,7 +3141,7 @@ def test_foundry_project_connection_derives_a_managed_identity_binding() -> None
     assert not hasattr(request.model, "capabilities")
     publication = GatewayControlPlaneService(
         repository,
-        apim_principal_id="39deeba0-9799-4806-96c4-2f65eb0f22d1",
+        apim_principal_id="00000000-0000-0000-0000-000000000705",
     ).publish(request, "owner@example.com")
     binding = publication.desired_spec.bindings[-1]
 
@@ -2960,7 +3158,7 @@ def test_foundry_project_connection_derives_a_managed_identity_binding() -> None
     authorization = binding.runtime_config["authorization"]
     assert isinstance(authorization, dict)
     assert authorization["principal_id"] == (
-        "39deeba0-9799-4806-96c4-2f65eb0f22d1"
+        "00000000-0000-0000-0000-000000000705"
     )
     assert authorization["role_id"] == (
         "a97b65f3-24c7-4388-baec-2e87135dc908"
@@ -3168,6 +3366,282 @@ def test_compiler_emits_native_apim_pool_breakers_retry_and_probe_routes() -> No
     assert "BackendConnectionFailure" not in retry_block
     assert "Timeout" not in retry_block
     ElementTree.fromstring(policy)
+
+def test_backend_pool_accepts_distinct_deployments_in_one_runtime() -> None:
+    runtime_id = UUID("30000000-0000-4000-8000-000000000001")
+    model_ids = [
+        UUID("40000000-0000-4000-8000-000000000091"),
+        UUID("40000000-0000-4000-8000-000000000092"),
+    ]
+    pool = GatewayBackendPoolWrite.model_validate({
+        "members": [
+            {"runtime_id": runtime_id, "model_id": model_id, "priority": 0, "weight": 1}
+            for model_id in model_ids
+        ],
+        "rate_limit": {
+            "max_attempts_per_request": 2,
+            "retry_interval_seconds": 1,
+            "first_fast_retry": True,
+            "circuit_breaker": {
+                "failure_count": 1,
+                "interval_seconds": 60,
+                "trip_duration_seconds": 60,
+                "accept_retry_after": True,
+            },
+        },
+    })
+
+    assert [member.model_id for member in pool.members] == model_ids
+    assert {member.runtime_id for member in pool.members} == {runtime_id}
+
+
+@pytest.mark.parametrize("invalid", [
+    None, "disabled", "runtime", "provider", "image", "decision", "embeddings",
+    "family", "protocol", "unrelated-model", "version-lookalike",
+])
+@pytest.mark.parametrize("independent", [False, True])
+@pytest.mark.parametrize("deployment_name", ["gpt-5-unit-chat", "unit-future-chat"])
+def test_backend_pool_resolves_registered_deployments_in_one_runtime(
+    invalid: str | None, independent: bool, deployment_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = InMemoryRepository()
+    provider = next(
+        item for item in repository.providers if item["brand_key"] == "microsoft_foundry"
+    )
+    runtime = next(item for item in repository.runtimes if item["provider_id"] == provider["id"])
+    runtime["config"].update(
+        control_plane_managed=True,
+        project_endpoint="https://pool-deployments.services.ai.azure.com/api/projects/main",
+        backend_url="https://pool-deployments.services.ai.azure.com/api/projects/main",
+        backend_path="/openai/v1/chat/completions",
+        auth_strategy="managed_identity",
+        managed_identity_resource="https://ai.azure.com",
+        streaming_mode="native",
+    )
+    service = GatewayControlPlaneService(repository)
+    publication = service.publish(GatewayPublicationCreate(
+        gateway_profile_id=APIM_ID,
+        provider=ProviderTarget(existing_id=provider["id"]),
+        runtime=RuntimeTarget(existing_id=runtime["id"]),
+        model=ModelCreateTarget(deployment_name=deployment_name),
+    ), "owner@example.com")
+    binding = publication.desired_spec.bindings[-1]
+    model = {**binding.model.model_dump(mode="python"), "id": UUID(int=901),
+             "runtime_id": runtime["id"], "provider_id": provider["id"], "enabled": True}
+    replica_name = f"{deployment_name}-2"
+    replica = {**model, "id": UUID(int=902), "model_key": "secondary-public",
+               "upstream_model_id": replica_name}
+    if invalid == "disabled":
+        replica["enabled"] = False
+    elif invalid == "runtime":
+        replica["runtime_id"] = UUID(int=903)
+    elif invalid == "provider":
+        replica["provider_id"] = UUID(int=904)
+    elif invalid == "image":
+        replica["capabilities"] = ["image_generation"]
+    elif invalid == "decision":
+        replica["capabilities"] = ["decision"]
+    elif invalid == "embeddings":
+        replica["capabilities"] = ["embeddings"]
+    elif invalid == "family":
+        replica["family_key"] = "claude"
+    elif invalid == "protocol":
+        runtime["config"]["api_format"] = "anthropic_messages"
+    elif invalid == "unrelated-model":
+        replica["upstream_model_id"] = "unrelated-unit-deployment"
+    elif invalid == "version-lookalike":
+        replica["upstream_model_id"] = f"{deployment_name}-2026-10-01"
+    write = GatewayBackendPoolMemberWrite(
+        runtime_id=runtime["id"], model_id=replica["id"], priority=0, weight=1,
+    )
+    if invalid is not None:
+        with pytest.raises(ControlPlaneConflictError):
+            service._backend_pool_member(
+                binding, write, model, [runtime], [model, replica], APIM_ID,
+            )
+        source_row = repository.models[0]
+        repository.models = [{**source_row, **model}, {**source_row, **replica}]
+        monkeypatch.setattr(repository, "effective_gateway_publication", lambda _gateway:
+                            publication.model_dump(mode="python"))
+        with patch.object(httpx.Client, "request", side_effect=AssertionError("No cloud reads")):
+            assert replica["id"] not in {
+                item.model_id for item in service.model_backend_pool_candidates(model["id"])
+            }
+        with patch.object(service, "_queue_route_reconcile") as queue:
+            with pytest.raises(ControlPlaneConflictError):
+                service.configure_model_backend_pool(model["id"], GatewayBackendPoolWrite(
+                    members=[GatewayBackendPoolMemberWrite(
+                        runtime_id=runtime["id"], model_id=model["id"], priority=0, weight=1,
+                    ), write],
+                    rate_limit=GatewayRateLimitResilience(
+                        max_attempts_per_request=2, retry_interval_seconds=1,
+                        first_fast_retry=True, circuit_breaker=GatewayRateLimitCircuitBreaker(
+                            failure_count=1, interval_seconds=60, trip_duration_seconds=60,
+                            accept_retry_after=True,
+                        ),
+                    ),
+                ), "owner@example.com")
+            queue.assert_not_called()
+        return
+    member = service._backend_pool_member(
+        binding, write, model, [runtime], [model, replica], APIM_ID,
+    )
+    assert member.model_id == replica["id"]
+    assert member.runtime_id == runtime["id"]
+    assert member.upstream_model_id == replica_name
+    assert member.backend_url == binding.backend_url
+    from turnstile_core.services.route_publication import pool_member_bindings
+
+    primary_member = service._backend_pool_member(binding, GatewayBackendPoolMemberWrite(
+        runtime_id=runtime["id"], model_id=model["id"], priority=0, weight=1,
+    ), model, [runtime], [model, replica], APIM_ID)
+    pooled = binding.model_copy(update={"runtime_config": {
+        **binding.runtime_config,
+        "apim_backend_pool": GatewayBackendPoolConfig(
+            members=[primary_member, member],
+            rate_limit=GatewayRateLimitResilience(
+                max_attempts_per_request=2, retry_interval_seconds=1, first_fast_retry=True,
+                circuit_breaker=GatewayRateLimitCircuitBreaker(
+                    failure_count=1, interval_seconds=60, trip_duration_seconds=60,
+                    accept_retry_after=True,
+                ),
+            ),
+        ).model_dump(mode="json"),
+    }})
+    sources = pool_member_bindings(pooled)
+    assert [source.model.upstream_model_id for source in sources] == [
+        deployment_name, replica_name,
+    ]
+    assert sources[0].runtime_id == sources[1].runtime_id == runtime["id"]
+    assert (
+        sources[0].runtime_config["project_endpoint"]
+        == sources[1].runtime_config["project_endpoint"]
+    )
+    from turnstile_core.integrations.apim_control_plane_contract import BackendResource
+
+    compiled = ApimPolicyCompiler(
+        usage_observer_url="https://observer.example.com",
+        usage_observer_key_named_value="unit-observer-key",
+    ).compile(publication.model_copy(update={"desired_spec":
+        publication.desired_spec.model_copy(update={"bindings": [pooled]}),
+    }))
+    member_backends = [backend for backend in compiled.backends
+                       if isinstance(backend, BackendResource)
+                       and backend.id.startswith("turnstile-pool-member-")]
+    assert len(member_backends) == 2
+    assert len({backend.id for backend in member_backends}) == 2
+    assert [dict(backend.headers).get("x-turnstile-pool-deployment")
+            for backend in member_backends] == [None, replica_name]
+    assert member_backends[0].url == member_backends[1].url
+    from turnstile_core.services.control_plane import GatewayControlPlaneService as PoolService
+
+    source_row = repository.models[0]
+    repository.models = [{**source_row, **model}, {**source_row, **replica}]
+    effective = publication.model_copy(update={"desired_spec":
+        publication.desired_spec.model_copy(update={"bindings": [pooled]}),
+    }).model_dump(mode="python")
+    if independent:
+        source = publication.model_copy(update={
+            "id": UUID(int=906), "status": PublicationStatus.ACTIVE,
+            "desired_spec": publication.desired_spec.model_copy(update={"bindings": [pooled]}),
+            "resource_manifest": {"model_route_addition": {
+                "version": 1, "program_release_id": str(publication.id),
+                "alias": model["model_key"],
+            }},
+        })
+        repository.gateway_publications.append(source.model_dump(mode="python"))
+        baseline = binding.model_copy(update={"model": binding.model.model_copy(update={
+            "model_key": "baseline-public", "upstream_model_id": "baseline-deployment",
+        })})
+        effective["desired_spec"].update({
+            "bindings": [baseline.model_dump(mode="python")],
+            "discovery_models": [{"id": "baseline-public", "display_name": "Baseline model"}],
+        })
+    monkeypatch.setattr(repository, "effective_gateway_publication", lambda _gateway: effective)
+    monkeypatch.setattr(repository, "effective_gateway_publications", lambda _gateways: [effective])
+    candidate_service = PoolService(repository)
+    with patch.object(httpx.Client, "request", side_effect=AssertionError("No cloud reads in GET")):
+        candidates = candidate_service.model_backend_pool_candidates(model["id"])
+    assert [item.model_id for item in candidates] == [model["id"], replica["id"]]
+    assert [item.deployment_name for item in candidates] == [
+        deployment_name, replica_name,
+    ]
+    assert {item.runtime_id for item in candidates} == {runtime["id"]}
+    assert all(candidate.model_version is None for candidate in candidates)
+    summaries = candidate_service.model_backend_pools()
+    assert len(summaries) == 1
+    assert summaries[0].model_id == model["id"]
+    assert [item.model_id for item in summaries[0].pool.members] == [model["id"], replica["id"]]
+    assert candidate_service.model_backend_pool(model["id"]) == pooled.backend_pool
+    with patch.object(
+        candidate_service, "_queue_route_reconcile", return_value=publication,
+    ) as queue:
+        candidate_service.configure_model_backend_pool(model["id"], GatewayBackendPoolWrite(
+            members=[GatewayBackendPoolMemberWrite(
+                runtime_id=item.runtime_id, model_id=item.model_id,
+                priority=item.priority, weight=item.weight,
+            ) for item in pooled.backend_pool.members],
+            rate_limit=pooled.backend_pool.rate_limit,
+        ), "owner@example.com")
+        configured = next(item for item in queue.call_args.args[1].bindings
+                          if item.model.model_key == model["model_key"])
+        assert configured.backend_pool is not None
+        assert len(configured.backend_pool.members) == 2
+        candidate_service.remove_model_backend_pool(model["id"], "owner@example.com")
+        removed = next(item for item in queue.call_args.args[1].bindings
+                       if item.model.model_key == model["model_key"])
+        assert removed.backend_pool is None
+    from turnstile_core.domain.storage_routes import (
+        ConnectionRevision,
+        RouteBackendPool,
+        RouteCredential,
+        RoutePoolMember,
+        RouteScope,
+        document_digest,
+    )
+    from turnstile_core.services.route_publication import _pool_matches_binding, pool_header_name
+
+    third_member = member.model_copy(update={
+        "model_id": UUID(int=905), "upstream_model_id": "third-deployment", "weight": 2,
+    })
+    triple_pool = pooled.backend_pool.model_copy(update={
+        "members": [primary_member, member, third_member],
+    })
+    scope = RouteScope(target_id=str(APIM_ID), api_id="unit-api", gateway_id="managed")
+    snapshot_pool = RouteBackendPool(
+        members=tuple(RoutePoolMember(
+            runtime_id=str(runtime["id"]), backend_id="unit-member-" + str(index),
+            dependency_sha256="a" * 64, priority=0, weight=weight,
+        ) for index, weight in enumerate((1, 1, 2))),
+        rate_limit=triple_pool.rate_limit,
+        configuration_sha256=document_digest(triple_pool),
+        header_values={pool_header_name(scope, value): value for value in (
+            "pool-deployments.services.ai.azure.com", runtime["name"],
+            replica_name, "third-deployment",
+        )},
+    )
+    connection = ConnectionRevision(
+        scope=scope, revision_id=str(UUID(int=906)), backend_id="unit-pool",
+        origin="https://pool-deployments.services.ai.azure.com",
+        path="/openai/v1/chat/completions", dependency_sha256="a" * 64,
+        credential=RouteCredential(mode="managed_identity", header="Authorization",
+                                   audience="https://ai.azure.com"),
+        observer=True, pool=snapshot_pool,
+    )
+    unchanged = binding.model_copy(update={"runtime_config": {
+        **binding.runtime_config, "apim_backend_pool": triple_pool.model_dump(mode="json"),
+    }})
+    assert _pool_matches_binding(unchanged, connection, {})
+    swapped_pool = triple_pool.model_copy(update={"members": [
+        primary_member, third_member.model_copy(update={"weight": 1}),
+        member.model_copy(update={"weight": 2}),
+    ]})
+    swapped = binding.model_copy(update={"runtime_config": {
+        **binding.runtime_config, "apim_backend_pool": swapped_pool.model_dump(mode="json"),
+    }})
+    assert not _pool_matches_binding(swapped, connection, {})
+
 
 def test_backend_pool_contract_rejects_duplicate_and_zero_weight_groups() -> None:
     runtime_id = UUID("30000000-0000-4000-8000-000000000001")
@@ -3506,7 +3980,7 @@ def test_claude_first_foundry_activation_preserves_shared_connection_protocol() 
     ]
     service = GatewayControlPlaneService(
         repository,
-        apim_principal_id="39deeba0-9799-4806-96c4-2f65eb0f22d1",
+        apim_principal_id="00000000-0000-0000-0000-000000000705",
     )
     publication = service.publish(
         foundry_publication("claude-opus-5"), "owner@example.com"
@@ -3559,7 +4033,7 @@ def test_external_tenant_foundry_key_is_encrypted_outside_the_release() -> None:
     encrypted = repository.gateway_publication_credential(publication.id)
 
     assert str(binding.backend_url).rstrip("/") == (
-        "https://admin-8382-resource.openai.azure.com"
+        "https://unit-foundry-account.openai.azure.com"
     )
     assert binding.backend_path == "/openai/v1/chat/completions"
     assert binding.auth_strategy.value == "named_value_api_key"
@@ -3569,7 +4043,7 @@ def test_external_tenant_foundry_key_is_encrypted_outside_the_release() -> None:
     assert binding.runtime_config["max_tokens_field"] == "max_completion_tokens"
     assert binding.runtime_config["supports_temperature"] is False
     assert binding.runtime_config["inference_endpoint"] == (
-        "https://admin-8382-resource.openai.azure.com/openai/v1"
+        "https://unit-foundry-account.openai.azure.com/openai/v1"
     )
     assert "authorization" not in binding.runtime_config
     assert encrypted is not None
@@ -3596,7 +4070,7 @@ def test_external_tenant_foundry_policy_uses_secret_api_key_header() -> None:
     assert 'template="/openai/v1/chat/completions"' in policy
     assert f"{{{{{binding.named_value_name}}}}}" in responses_policy
     assert 'template="/openai/v1/responses"' in responses_policy
-    assert 'body[&quot;model&quot;] = &quot;gpt-5.6-sol&quot;' in responses_policy
+    assert 'body[&quot;model&quot;] = &quot;gpt-5-unit-deployment&quot;' in responses_policy
     assert 'template="/openai/v1/responses/compact"' in compiled.responses_compact_policy
     assert 'name="selectedContextWindow"' in compiled.responses_compact_policy
     assert '<set-header name="Accept-Encoding" exists-action="override">' in responses_policy
@@ -3621,11 +4095,11 @@ def test_usage_observer_preserves_foundry_route_auth_and_model_transform() -> No
     assert backend.url == "https://observer.example.com"
     assert backend.headers == (
         ("x-adapter-key", "{{turnstile-envoy-adapter-key}}"),
-        ("x-turnstile-upstream-host", "admin-8382-resource.openai.azure.com"),
+        ("x-turnstile-upstream-host", "unit-foundry-account.openai.azure.com"),
     )
     assert f"{{{{{binding.named_value_name}}}}}" in policy
     assert 'template="/openai/v1/chat/completions"' in policy
-    assert 'body[&quot;model&quot;] = &quot;gpt-5.6-sol&quot;' in policy
+    assert 'body[&quot;model&quot;] = &quot;gpt-5-unit-deployment&quot;' in policy
     assert 'streamOptions[&quot;include_usage&quot;] = true' in policy
     assert 'name="selectedRoutingManaged" value="@(true)"' in policy
     assert "x-turnstile-api-format" in policy
@@ -3642,7 +4116,7 @@ def test_usage_observer_preserves_foundry_managed_identity_and_project_path() ->
     request.provider = ProviderTarget(existing_id=provider["id"])
     publication = GatewayControlPlaneService(
         repository,
-        apim_principal_id="39deeba0-9799-4806-96c4-2f65eb0f22d1",
+        apim_principal_id="00000000-0000-0000-0000-000000000705",
     ).publish(request, "owner@example.com")
 
     compiled = ApimPolicyCompiler(
@@ -3925,7 +4399,7 @@ def test_foundry_activation_normalizes_older_release_token_field() -> None:
     runtime = next(
         item
         for item in repository.runtimes
-        if item["name"] == "Microsoft Foundry admin-8382-resource/admin-8382 via APIM"
+        if item["name"] == "Microsoft Foundry unit-foundry-account/unit-foundry-project via APIM"
     )
     assert runtime["config"]["max_tokens_field"] == "max_completion_tokens"
     assert runtime["config"]["supports_temperature"] is False
@@ -4169,7 +4643,7 @@ def test_foundry_chat_policy_owns_backend_auth_path_and_deployment_mapping() -> 
     ]
     publication = GatewayControlPlaneService(
         repository,
-        apim_principal_id="39deeba0-9799-4806-96c4-2f65eb0f22d1",
+        apim_principal_id="00000000-0000-0000-0000-000000000705",
     ).publish(foundry_publication(), "owner@example.com")
 
     compiled = ApimPolicyCompiler().compile(publication)

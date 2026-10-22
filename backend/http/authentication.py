@@ -122,12 +122,15 @@ def login_with_entra(
 
 @router.get("/api/v1/auth/me", response_model=Profile)
 def whoami(identity: CurrentSession) -> Profile:
+    method: Literal["password", "entra"] = (
+        "entra" if identity.method == "entra" else "password"
+    )
     return Profile(
         id=identity.id,
         email=identity.email,
         name=identity.name,
         role=identity.role,
-        method=identity.method,
+        method=method,
         session_expires_at=identity.session_expires_at,
     )
 

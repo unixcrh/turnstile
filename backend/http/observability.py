@@ -37,6 +37,9 @@ from turnstile_core.domain.models import (
     UsageRequestListResponse,
     UsageRequestSummary,
 )
+from turnstile_core.integrations.router_table_projection import (
+    sync_apim_router_traces_if_configured,
+)
 from turnstile_core.persistence.repository import UsageFilters
 
 from .dependencies import Repository
@@ -154,6 +157,7 @@ def list_usage_requests(
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     cursor: str | None = None,
 ) -> UsageRequestListResponse:
+    sync_apim_router_traces_if_configured(repository)
     after: tuple[datetime, str] | None = None
     if cursor:
         try:
@@ -188,7 +192,18 @@ def list_usage_requests(
 
 @router.get("/api/v1/observability/requests/{request_id}", response_model=UsageRequestDetail)
 def get_usage_request(request_id: str, repository: Repository) -> UsageRequestDetail:
+    sync_apim_router_traces_if_configured(repository, request_id=request_id)
     row = repository.get_usage_request(request_id)
+    if row is not None and row.get("router_id") is None and row.get("request_id"):
+        sync_apim_router_traces_if_configured(
+            repository, request_id=str(row["request_id"])
+        )
+        row = repository.get_usage_request(request_id)
+    if row is None:
+        sync_apim_router_traces_if_configured(
+            repository, force=True, request_id=request_id
+        )
+        row = repository.get_usage_request(request_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Usage request not found")
     return UsageRequestDetail.model_validate(row)
