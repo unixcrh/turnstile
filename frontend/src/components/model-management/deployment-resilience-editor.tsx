@@ -3,10 +3,10 @@ import {
   CircleAlert,
   ListChecks,
   LoaderCircle,
-  PowerOff,
   RotateCcw,
   Send,
   ShieldCheck,
+  Trash2,
 } from "lucide-react"
 import { useEffect, useRef, useState, type ReactNode } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
@@ -103,15 +103,21 @@ type PublicationAction = "configure" | "remove"
 function draftFromPool(
   pool: GatewayBackendPoolConfig | null,
   model: ManagedModel,
+  models: ManagedModel[] = [],
 ): GatewayBackendPoolWrite {
   if (pool) {
     return {
-      members: pool.members.map(({ runtime_id, model_id, priority, weight }) => ({
-        runtime_id,
-        ...(model_id ? { model_id } : {}),
-        priority,
-        weight,
-      })),
+      members: pool.members.map((member) => {
+        const resolvedModelId = member.model_id ?? (
+          models.length ? poolDeploymentModelId(member, model, models) : undefined
+        )
+        return {
+          runtime_id: member.runtime_id,
+          ...(resolvedModelId ? { model_id: resolvedModelId } : {}),
+          priority: member.priority,
+          weight: member.weight,
+        }
+      }),
       rate_limit: pool.rate_limit,
       session_affinity: pool.session_affinity === true,
     }
@@ -177,7 +183,7 @@ export function DeploymentResilienceEditor({
 
   useEffect(() => {
     if (!pool.isSuccess) return
-    const next = draftFromPool(pool.data, model)
+    const next = draftFromPool(pool.data, model, registry.data?.models ?? [])
     const previous = baselineRef.current
     baselineRef.current = next
     setBaselineSignature(draftSignature(next))
@@ -185,7 +191,7 @@ export function DeploymentResilienceEditor({
     setDraft((current) => draftSignature(current) === draftSignature(previous)
       ? next
       : current)
-  }, [model, pool.data, pool.dataUpdatedAt, pool.isSuccess, primaryMemberId])
+  }, [model, pool.data, pool.dataUpdatedAt, pool.isSuccess, primaryMemberId, registry.data?.models])
 
   useEffect(() => {
     const status = publication.data?.status
@@ -373,7 +379,7 @@ export function DeploymentResilienceEditor({
     <Button className="router-action-primary" type="button" size="sm" disabled={busy || !canConfigure || !validDraft} onClick={() => save.mutate()}>{configuring ? <LoaderCircle className="spin" size={13} /> : <Send size={13} />}{configuring ? "正在发布" : hasEffectivePool ? "发布到 APIM" : "创建"}</Button>
   </span> : null
   const disableAction = canManage && pool.data
-    ? <Button className="apim-native-route-disable" type="button" variant="destructive" size="sm" disabled={busy} onClick={() => setRemoveOpen(true)}><PowerOff size={13} />停用 Pool</Button>
+    ? <Button className="apim-native-route-disable" type="button" variant="destructive" size="sm" disabled={busy} onClick={() => setRemoveOpen(true)}><Trash2 size={13} />删除 Pool</Button>
     : null
   const externalControls = pool.isLoading || registry.isLoading || !primaryRuntime || primaryRuntime.config.control_plane_managed !== true ? null : <>
     {hasEffectivePool && <span className="apim-native-route-status" data-active>{"已生效"}</span>}
@@ -457,12 +463,12 @@ export function DeploymentResilienceEditor({
       <AlertDialog open={removeOpen} onOpenChange={(open) => { if (!busy) setRemoveOpen(open) }}>
         <AlertDialogContent className="model-delete-dialog router-confirm-dialog">
           <div className="model-delete-body">
-            <AlertDialogTitle>停用 APIM 后端池？</AlertDialogTitle>
+            <AlertDialogTitle>删除 APIM 后端池？</AlertDialogTitle>
             <AlertDialogDescription>恢复单一后端，并影响该模型的所有调用。</AlertDialogDescription>
           </div>
           <AlertDialogFooter className="model-delete-footer">
             <AlertDialogCancel disabled={busy}>取消</AlertDialogCancel>
-            <AlertDialogAction variant="destructive" disabled={busy} onClick={() => remove.mutate()}>{remove.isPending ? "正在提交" : "停用"}</AlertDialogAction>
+            <AlertDialogAction variant="destructive" disabled={busy} onClick={() => remove.mutate()}>{remove.isPending ? "正在提交" : "删除"}</AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>

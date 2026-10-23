@@ -141,7 +141,10 @@ def _execution_usage(row: dict[str, Any]) -> dict[str, Any]:
             cache_write_tokens=evidence["cache_write_tokens"],
             output_tokens=evidence["output_tokens"],
             tokens_consumed=total, estimated=False, ingest_error=None, usage_complete=True,
-            runtime_authoritative=_text(row, "pool_runtime", "") not in {"", "unattributed"},
+            runtime_authoritative=(
+                _text(row, "pool_runtime", "") not in {"", "unattributed"}
+                or _text(row, "pool_deployment", "") not in {"", "unattributed"}
+            ),
         )
     except (KeyError, TypeError, ValueError, OverflowError):
         pass
@@ -176,6 +179,16 @@ def normalize_access_row(row: dict[str, Any]) -> dict[str, Any] | None:
     pool_runtime = _text(row, "pool_runtime", "")
     if pool_runtime == "unattributed":
         pool_runtime = ""
+    pool_deployment = _text(row, "pool_deployment", "")
+    if pool_deployment == "unattributed":
+        pool_deployment = ""
+    effective_runtime = pool_runtime or _text(row, "runtime")
+    if (
+        pool_deployment
+        and pool_deployment != _text(row, "model", "")
+        and pool_deployment not in effective_runtime
+    ):
+        effective_runtime = f"{effective_runtime} ({pool_deployment})"
     return {
         "id": request_id,
         "request_id": request_id,
@@ -198,8 +211,8 @@ def normalize_access_row(row: dict[str, Any]) -> dict[str, Any] | None:
         "provider": _text(row, "provider", "microsoft_foundry"),
         "model": _text(row, "model"),
         "model_id": _text(row, "model_id"),
-        "runtime": pool_runtime or _text(row, "runtime"),
-        "runtime_authoritative": bool(pool_runtime),
+        "runtime": effective_runtime,
+        "runtime_authoritative": bool(pool_runtime or pool_deployment),
         "request_source": _text(row, "request_source"),
         "input_tokens": input_tokens,
         "cached_tokens": cached_tokens,

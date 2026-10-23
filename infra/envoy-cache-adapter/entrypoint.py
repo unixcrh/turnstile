@@ -64,7 +64,10 @@ def rewrite_pool_deployment(body: bytes, deployment: str) -> bytes:
 class PoolDeploymentHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         try:
-            body = self.rfile.read(int(self.headers["Content-Length"]))
+            length = int(self.headers["Content-Length"])
+            if length <= 0 or length > 16 * 1024 * 1024:
+                raise ValueError("Pool deployment request length is out of bounds")
+            body = self.rfile.read(length)
             replacement = rewrite_pool_deployment(
                 body, self.headers.get("x-turnstile-pool-deployment", ""),
             )

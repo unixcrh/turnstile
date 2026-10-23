@@ -34,9 +34,9 @@ def test_pool_affinity_editor_is_capability_and_owner_gated() -> None:
     assert "disabled={!canManage || busy || !affinitySupported || !validMemberCount}" in editor
     assert 'const canManage = user?.role === "owner"' in editor
     assert (
-        "const canConfigure = canManage && "
-        "(hasEffectivePool || compatibleRuntimes.length >= 2)" in editor
+        "const canConfigure = canManage && pool.isSuccess && "
+        "(hasEffectivePool || selectableCandidates.length >= 2)" in editor
     )
-    assert "disabled={busy || !validDraft}" in editor
+    assert "disabled={busy || !canConfigure || !validDraft}" in editor
     assert "registry.backend_pool_session_affinity_supported === true" in api
     assert ".router-resilience-affinity { min-width: 0;" in read_frontend_styles()

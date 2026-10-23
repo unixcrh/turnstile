@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from http.cookies import SimpleCookie
 from pathlib import Path
+from threading import Lock
 from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import quote
 
@@ -307,6 +308,7 @@ class OpenAICompatibleGatewayAdapter:
     def __init__(self, implementation: GatewayKind, client: httpx.Client | None = None) -> None:
         self._implementation = implementation
         self._client = client or httpx.Client()
+        self._affinity_lock = Lock()
         self._affinity_cookies: OrderedDict[tuple[str, str, str, str], dict[str, str]] = (
             OrderedDict()
         )
@@ -330,6 +332,18 @@ class OpenAICompatibleGatewayAdapter:
             session_ref,
         )
 
+    def _affinity_cookie_header(
+        self,
+        request: ModelInvocationRequest | ImageInvocationRequest | DecisionInvocationRequest,
+        route: Mapping[str, Any],
+    ) -> dict[str, str]:
+        scope = self._affinity_scope(request, route)
+        with self._affinity_lock:
+            cookies = dict(self._affinity_cookies.get(scope) or {})
+        if not cookies:
+            return {}
+        return {"cookie": "; ".join(f"{k}={v}" for k, v in cookies.items())}
+
     def _record_affinity_cookies(
         self,
         scope: tuple[str, str, str, str],
@@ -352,15 +366,16 @@ class OpenAICompatibleGatewayAdapter:
             for name, morsel in jar.items():
                 if name.startswith("TurnstileAffinity-") and morsel.value:
                     matched[name] = morsel.value
-        if matched:
-            existing = dict(self._affinity_cookies.get(scope) or {})
-            existing.update(matched)
-            self._affinity_cookies[scope] = existing
-            self._affinity_cookies.move_to_end(scope)
-            while len(self._affinity_cookies) > 2048:
-                self._affinity_cookies.popitem(last=False)
-        if hasattr(self._client, "cookies"):
-            self._client.cookies.clear()
+        with self._affinity_lock:
+            if matched:
+                existing = dict(self._affinity_cookies.get(scope) or {})
+                existing.update(matched)
+                self._affinity_cookies[scope] = existing
+                self._affinity_cookies.move_to_end(scope)
+                while len(self._affinity_cookies) > 2048:
+                    self._affinity_cookies.popitem(last=False)
+            if hasattr(self._client, "cookies"):
+                self._client.cookies.clear()
 
     def _base_url(self, route: dict[str, Any]) -> str:
         value = route.get("gateway_base_url") or route.get("provider_endpoint_url")
@@ -441,18 +456,7 @@ class OpenAICompatibleGatewayAdapter:
             "x-hive-turn-index": str(metadata.turn_index),
             "x-hive-model": str(route["model_key"]),
             "x-hive-runtime": str(route["runtime_name"]),
-            **(
-                {
-                    "cookie": "; ".join(
-                        f"{k}={v}"
-                        for k, v in self._affinity_cookies[
-                            self._affinity_scope(request, route)
-                        ].items()
-                    )
-                }
-                if self._affinity_scope(request, route) in self._affinity_cookies
-                else {}
-            ),
+            **self._affinity_cookie_header(request, route),
         }
 
     def invoke(self, request: ModelInvocationRequest, route: dict[str, Any]) -> GatewayResult:

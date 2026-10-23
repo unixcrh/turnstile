@@ -873,6 +873,33 @@ class InMemoryPublicationRepositoryMixin:
                 before_record()
             gateway.update(config=config, updated_at=datetime.now(UTC))
 
+    def _supersede_absorbed_model_additions(self, publication: Mapping[str, Any]) -> None:
+        if any(name in publication.get("resource_manifest", {}) for name in (
+            "model_route_addition", "model_route_removal",
+        )):
+            return
+        absorbed_aliases = {
+            str(binding["model"]["model_key"]).casefold()
+            for binding in (publication.get("desired_spec") or {}).get("bindings") or ()
+            if isinstance(binding, Mapping) and isinstance(binding.get("model"), Mapping)
+            and binding["model"].get("model_key")
+        }
+        if not absorbed_aliases:
+            return
+        for item in self.gateway_publications:
+            if (
+                item["gateway_profile_id"] == publication["gateway_profile_id"]
+                and item["id"] != publication["id"]
+                and item["status"] == "active"
+                and item["publication_kind"] == "model_add"
+                and str(
+                    item.get("resource_manifest", {})
+                    .get("model_route_addition", {})
+                    .get("alias", "")
+                ).casefold() in absorbed_aliases
+            ):
+                item["status"] = "superseded"
+
     def active_model_route_publications(
         self, gateway_profile_id: UUID,
     ) -> Sequence[dict[str, Any]]:
@@ -883,11 +910,29 @@ class InMemoryPublicationRepositoryMixin:
             and item["status"] == "active" and item["publication_kind"] == "model_remove"
             and "model_route_removal" in item.get("resource_manifest", {})
         }
-        rows = [item for item in self.gateway_publications
-                if item["gateway_profile_id"] == gateway_profile_id
-                and item["status"] == "active" and item["publication_kind"] == "model_add"
-                and "model_route_addition" in item.get("resource_manifest", {})
-                and str(item["id"]) not in removed]
+        effective = self.effective_gateway_publication(gateway_profile_id)
+        effective_id = effective["id"] if effective is not None else None
+        effective_aliases = {
+            str(binding["model"]["model_key"]).casefold()
+            for binding in (effective or {}).get("desired_spec", {}).get("bindings") or ()
+            if isinstance(binding, Mapping) and isinstance(binding.get("model"), Mapping)
+            and binding["model"].get("model_key")
+        }
+        rows = [
+            item for item in self.gateway_publications
+            if item["gateway_profile_id"] == gateway_profile_id
+            and item["status"] == "active" and item["publication_kind"] == "model_add"
+            and "model_route_addition" in item.get("resource_manifest", {})
+            and str(item["id"]) not in removed
+            and not (
+                effective_id is not None
+                and effective_id != item["id"]
+                and effective_id != item.get("base_release_id")
+                and str(
+                    item["resource_manifest"]["model_route_addition"].get("alias", "")
+                ).casefold() in effective_aliases
+            )
+        ]
         if len(rows) > 10000:
             raise ValueError("Model route publication catalog exceeds its bound")
         return sorted(rows, key=lambda item: str(item["id"]))
@@ -1900,6 +1945,7 @@ class InMemoryPublicationRepositoryMixin:
                     self.gateway_publications, previous_release_id, "publication"
                 )["status"] = "superseded"
             if not independent:
+                self._supersede_absorbed_model_additions(publication)
                 self.effective_gateway_releases[publication["gateway_profile_id"]] = publication_id
             publication["status"] = "active"
             publication["completed_at"] = changed_at
@@ -1934,6 +1980,7 @@ class InMemoryPublicationRepositoryMixin:
                 self._require(
                     self.gateway_publications, previous_release_id, "publication"
                 )["status"] = "superseded"
+            self._supersede_absorbed_model_additions(publication)
             self.effective_gateway_releases[
                 publication["gateway_profile_id"]
             ] = publication_id
@@ -1998,6 +2045,7 @@ class InMemoryPublicationRepositoryMixin:
                 self._require(
                     self.gateway_publications, previous_release_id, "publication"
                 )["status"] = "superseded"
+            self._supersede_absorbed_model_additions(publication)
             self.effective_gateway_releases[
                 publication["gateway_profile_id"]
             ] = publication_id
@@ -2184,6 +2232,7 @@ class InMemoryPublicationRepositoryMixin:
                 self._require(
                     self.gateway_publications, previous_release_id, "publication"
                 )["status"] = "superseded"
+            self._supersede_absorbed_model_additions(publication)
             self.effective_gateway_releases[publication["gateway_profile_id"]] = publication_id
         publication["status"] = "active"
         publication["completed_at"] = datetime.now(UTC)

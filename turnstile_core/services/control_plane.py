@@ -2526,6 +2526,9 @@ class GatewayControlPlaneService:
                 "runtime_id": primary_runtime["id"],
             }
         )
+        include_deployment_identity = any(
+            item.model_id is not None for item in write.members
+        )
         members = [
             self._backend_pool_member(
                 target,
@@ -2534,6 +2537,7 @@ class GatewayControlPlaneService:
                 registry["runtimes"],
                 registry["models"],
                 gateway_id,
+                include_deployment_identity=include_deployment_identity,
             )
             for item in write.members
         ]
@@ -2676,6 +2680,8 @@ class GatewayControlPlaneService:
         runtimes: Sequence[dict[str, Any]],
         models: Sequence[dict[str, Any]],
         gateway_id: UUID,
+        *,
+        include_deployment_identity: bool = False,
     ) -> GatewayBackendPoolMember:
         runtime = self._find(runtimes, member.runtime_id)
         if runtime is None or not runtime["enabled"]:
@@ -2833,12 +2839,21 @@ class GatewayControlPlaneService:
             raise ControlPlaneConflictError(
                 "The normalized backend pool runtime has no backend URL"
             )
+        record_deployment = (
+            member.model_id is not None
+            or include_deployment_identity
+            or deployment.casefold() != upstream_model_id
+        )
         return GatewayBackendPoolMember(
             runtime_id=runtime["id"],
-            model_id=member.model_id,
-            upstream_model_id=deployment if member.model_id is not None else None,
+            model_id=(
+                member.model_id or deployment_model["id"]
+                if record_deployment
+                else None
+            ),
+            upstream_model_id=deployment if record_deployment else None,
             project_endpoint=(
-                config.get("project_endpoint") if member.model_id is not None else None
+                config.get("project_endpoint") if record_deployment else None
             ),
             runtime_name=str(runtime["name"]),
             backend_url=normalized.backend_url,
@@ -3872,8 +3887,14 @@ class GatewayControlPlaneService:
         )
         source_row = self._repository.get_gateway_publication(source_id) \
             if source_id is not None else None
-        if source_row is not None and "model_route_addition" in source_row.get(
-            "resource_manifest", {},
+        in_effective_release = previous is not None and any(
+            binding.model.model_key.casefold() == alias
+            for binding in previous.desired_spec.bindings
+        )
+        if (
+            source_row is not None
+            and "model_route_addition" in source_row.get("resource_manifest", {})
+            and not in_effective_release
         ):
             source = GatewayPublication.model_validate(source_row)
             if (previous is None or source.gateway_profile_id != gateway_id
@@ -3902,12 +3923,22 @@ class GatewayControlPlaneService:
                     "model_id": str(model["id"]), "alias": str(model["model_key"]),
                 }},
             )
+        reconciled = (
+            self._backend_pool_release_spec(previous, registry)
+            if previous is not None and any(
+                field in previous.resource_manifest
+                for field in ("fixed_route_program", "route_configuration")
+            )
+            else previous.desired_spec
+            if previous is not None
+            else None
+        )
         bindings = [
             binding
-            for binding in (previous.desired_spec.bindings if previous else [])
+            for binding in (reconciled.bindings if reconciled else [])
             if binding.model.model_key.casefold() != alias
         ]
-        discovery = list(previous.desired_spec.discovery_models) if previous else []
+        discovery = list(reconciled.discovery_models) if reconciled else []
         discovery.extend(self._existing_discovery(gateway_id, registry))
         remaining = {
             item.id.casefold(): item
@@ -3919,7 +3950,7 @@ class GatewayControlPlaneService:
             discovery_models=sorted(remaining.values(), key=lambda item: item.id),
             bindings=bindings,
             gateway_deployments=(
-                previous.desired_spec.gateway_deployments if previous else ()
+                reconciled.gateway_deployments if reconciled else ()
             ),
             removed_models=[
                 ModelRemovalTarget(
@@ -3931,11 +3962,20 @@ class GatewayControlPlaneService:
             ],
         )
         spec = self._refresh_release_deployments(spec)
+        expected_base_id = (
+            previous.id
+            if previous is not None and any(
+                field in previous.resource_manifest
+                for field in ("fixed_route_program", "route_configuration")
+            )
+            else None
+        )
         return self._queue_release(
             spec,
             PublicationKind.MODEL_REMOVE,
             created_by,
             None,
+            expected_base_release_id=expected_base_id,
         )
 
     def rotate_credential(

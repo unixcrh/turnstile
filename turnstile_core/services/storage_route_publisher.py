@@ -1738,7 +1738,10 @@ class FixedRoutePublisherFactory:
                 for row in self._repository.active_model_route_publications(
                     publication.gateway_profile_id,
                 )
-            ) if publication.publication_kind is PublicationKind.ROUTE_RECONCILE else (),
+            ) if publication.publication_kind in {
+                PublicationKind.ROUTE_RECONCILE,
+                PublicationKind.MODEL_REMOVE,
+            } else (),
         )
 
     @staticmethod
@@ -1891,6 +1894,21 @@ class FixedRoutePublisherFactory:
     def _credential_bindings(publication: GatewayPublication) -> dict[str, str]:
         return credential_bindings(publication.resource_manifest)
 
+    def _inherited_credential_bindings(
+        self, publication: GatewayPublication, previous: GatewayPublication,
+    ) -> dict[str, str]:
+        inherited = self._credential_bindings(previous)
+        if publication.publication_kind in {
+            PublicationKind.ROUTE_RECONCILE,
+            PublicationKind.MODEL_REMOVE,
+        }:
+            for row in self._repository.active_model_route_publications(
+                publication.gateway_profile_id,
+            ):
+                if row.get("id") != publication.id:
+                    inherited.update(credential_bindings(row.get("resource_manifest") or {}))
+        return inherited
+
     def _prepare_credentials(
         self, publication: GatewayPublication, previous: GatewayPublication,
         installation: FixedProgramInstallation, management: FixedProgramManagement,
@@ -1910,10 +1928,26 @@ class FixedRoutePublisherFactory:
             if bindings:
                 raise PolicyCompilationError("Route credential bindings have no source")
             return publication, {}
-        inherited = self._credential_bindings(previous)
-        previous_bindings = tuple(
-            source for binding in previous.desired_spec.bindings
+        inherited = self._inherited_credential_bindings(publication, previous)
+        addition_bindings = tuple(
+            source
+            for row in (
+                self._repository.active_model_route_publications(publication.gateway_profile_id)
+                if publication.publication_kind in {
+                    PublicationKind.ROUTE_RECONCILE,
+                    PublicationKind.MODEL_REMOVE,
+                } else ()
+            )
+            if row.get("id") != publication.id
+            for binding in GatewayPublication.model_validate(row).desired_spec.bindings
             for source in pool_member_bindings(binding) or (binding,)
+        )
+        previous_bindings = (
+            *tuple(
+                source for binding in previous.desired_spec.bindings
+                for source in pool_member_bindings(binding) or (binding,)
+            ),
+            *addition_bindings,
         )
         previous_sources = {
             route_credential_source(binding) for binding in previous_bindings
@@ -2193,11 +2227,12 @@ class FixedRoutePublisherFactory:
     def _credential_references(
         self, publication: GatewayPublication, previous: GatewayPublication,
         installation: FixedProgramInstallation,
+        *, changed_aliases: frozenset[str] | None = None,
     ) -> dict[str, SecretStr | None]:
         from ..services.route_publication import pool_member_bindings, route_credential_source
 
         bindings = self._credential_bindings(publication)
-        inherited = self._credential_bindings(previous)
+        inherited = self._inherited_credential_bindings(publication, previous)
         raw = publication.resource_manifest.get("route_preparation")
         if raw is not None and not isinstance(raw, dict):
             raise PolicyCompilationError("Route credential preparation is invalid")
@@ -2244,6 +2279,12 @@ class FixedRoutePublisherFactory:
                 ):
                     raise PolicyCompilationError("Route credential source intent changed")
                 expected = SecretStr(body["value"])
+            if (
+                changed_aliases is not None
+                and binding.model.model_key not in changed_aliases
+                and expected is None
+            ):
+                continue
             references[secret_id] = expected
         if references and self._cipher is None:
             raise PolicyCompilationError("Route credential verification is unavailable")
@@ -2252,9 +2293,12 @@ class FixedRoutePublisherFactory:
     def _verify_credentials(
         self, publication: GatewayPublication, previous: GatewayPublication,
         installation: FixedProgramInstallation,
+        *, changed_aliases: frozenset[str] | None = None,
     ) -> None:
         self._verify_credential_references(
-            self._credential_references(publication, previous, installation),
+            self._credential_references(
+                publication, previous, installation, changed_aliases=changed_aliases,
+            ),
         )
 
     def _verify_credential_references(self, references: Mapping[str, SecretStr | None]) -> None:
@@ -3000,6 +3044,23 @@ class FixedRoutePublisherFactory:
 
         binding = binding or publication.desired_spec.bindings[0]
         project = binding.runtime_config.get("project_endpoint")
+        if (
+            binding.runtime_id is not None
+            and (project is None or "/api/projects/" not in str(project))
+        ):
+            runtime = next(
+                (
+                    row
+                    for row in self._repository.registry()["runtimes"]
+                    if row["id"] == binding.runtime_id
+                ),
+                None,
+            )
+            runtime_project = (
+                (runtime.get("config") or {}).get("project_endpoint") if runtime else None
+            )
+            if runtime_project:
+                project = runtime_project
         if project is None:
             return None
 
@@ -3548,6 +3609,19 @@ class FixedRoutePublisherFactory:
                 ),
                 prepare_availability=self._prepare_availability,
                 clock=self._clock,
+                absorbed_model_aliases=lambda: tuple(
+                    str(
+                        row.get("resource_manifest", {})
+                        .get("model_route_addition", {})
+                        .get("alias", "")
+                    )
+                    for row in self._repository.active_model_route_publications(
+                        config.gateway_profile_id
+                    )
+                    if row.get("resource_manifest", {})
+                    .get("model_route_addition", {})
+                    .get("alias")
+                ),
             ), management
 
     def _prepare_availability(self, task: RoutePublicationTask, route: RouteContent) -> bool:
@@ -3648,7 +3722,14 @@ class FixedRoutePublisherFactory:
         })
         verified = task.configuration_only and verification_key in self._verified_connections
         if not verified:
-            self._verify_credentials(publication, dependency_source, installation)
+            changed_aliases = (
+                frozenset(task.plan.changed_aliases)
+                if migration is None and "route_rollback" not in publication.resource_manifest
+                else None
+            )
+            self._verify_credentials(
+                publication, dependency_source, installation, changed_aliases=changed_aliases,
+            )
         approved = self.approved_connections(
             publication, installation, management, baseline=baseline,
             initial_migration=migration is not None,
@@ -3981,6 +4062,7 @@ class FixedRoutePublisherPort:
         prepare_availability: Callable[[RoutePublicationTask, RouteContent], bool],
         clock: Callable[[], int] = lambda: int(time()),
         serving_verifiers: tuple[FixedProgramVerifier, ...] = (),
+        absorbed_model_aliases: Callable[[], tuple[str, ...]] = lambda: (),
     ) -> None:
         self.projection = projection
         self._verifier = verifier
@@ -3991,6 +4073,7 @@ class FixedRoutePublisherPort:
         self._prepare_availability = prepare_availability
         self._clock = clock
         self._serving_verifiers = serving_verifiers
+        self._absorbed_model_aliases = absorbed_model_aliases
 
     @property
     def program_record(self) -> dict[str, Any]:
@@ -4077,6 +4160,13 @@ class FixedRoutePublisherPort:
         head.require_ready(task.plan.program, proof, task.plan.snapshot.approval.budget_epoch,
                            self._clock())
         self._verifier.confirm(head)
+        if not task.model_addition:
+            absorbed = {alias.casefold() for alias in self._absorbed_model_aliases()}
+            for route in task.plan.snapshot.routes:
+                if route.alias.casefold() in absorbed:
+                    current = self.projection.read_model_active(route.alias)
+                    if current is not None:
+                        self.projection.remove_model_head(current[0], current[1])
 
     def confirm_model(self, task: RoutePublicationTask, model: ModelRouteHead) -> None:
         if (not task.model_addition or model.publication_id != task.publication_id

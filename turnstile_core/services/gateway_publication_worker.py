@@ -583,7 +583,10 @@ class GatewayPublicationWorker:
                 validate_pool = getattr(client, "validate_pool_deployments", None)
                 if not callable(validate_pool):
                     raise PolicyCompilationError("Pool deployment validation is unavailable")
-                validate_pool(publication)
+                try:
+                    validate_pool(publication, runtimes=registry["runtimes"])
+                except TypeError:
+                    validate_pool(publication)
             encrypted = self._repository.gateway_publication_credential(publication.id)
             credential = None
             if encrypted is not None:

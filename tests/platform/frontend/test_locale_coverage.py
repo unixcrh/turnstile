@@ -226,6 +226,8 @@ def test_standalone_labels_have_exact_catalog_entries() -> None:
         "后端超时",
         "停用 Pool",
         "停用 APIM 后端池？",
+        "删除 Pool",
+        "删除 APIM 后端池？",
         "Retry-After · 最多 2 次",
     )
     for locale in ("en", "ko", "ja"):

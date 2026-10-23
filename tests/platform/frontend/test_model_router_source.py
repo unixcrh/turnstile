@@ -260,8 +260,8 @@ def test_model_router_embeds_real_apim_deployment_resilience() -> None:
     ):
         assert invariant in eligibility
     assert "draft.members.length >= 2 && draft.members.length <= 30" in resilience
-    assert "PowerOff" in resilience
-    assert "Trash2" not in resilience
+    assert "Trash2" in resilience
+    assert "PowerOff" not in resilience
     assert "focus-visible:border-transparent" in button
     for size, pixels in ((6, 24), (7, 28), (8, 32), (9, 36)):
         assert (

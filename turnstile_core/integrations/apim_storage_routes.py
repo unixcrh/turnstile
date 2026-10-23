@@ -1931,7 +1931,23 @@ def fixed_operation(operation: str, binding: FixedRouteBinding) -> str:
         pooled = ET.SubElement(choices, "when", {
             "condition": f'@({route}["connection"]["pool"] is JObject)',
         })
-        ET.SubElement(pooled, "forward-request", {
+        retry_choices = ET.SubElement(pooled, "choose")
+        budgeted = ET.SubElement(retry_choices, "when", {
+            "condition": '@(context.Variables.ContainsKey("executionReceiptHeader"))',
+        })
+        ET.SubElement(budgeted, "forward-request", {
+            "timeout": "120", "buffer-request-body": "true",
+            "buffer-response": "true" if operation == "microsoft-decision" else "false",
+            "fail-on-error-status-code": "false",
+        })
+        unbudgeted = ET.SubElement(retry_choices, "otherwise")
+        retry_node = ET.SubElement(unbudgeted, "retry", {
+            "condition": "@(context.Response != null && context.Response.StatusCode == 429)",
+            "count": "1",
+            "interval": "1",
+            "first-fast-retry": "true",
+        })
+        ET.SubElement(retry_node, "forward-request", {
             "timeout": "120", "buffer-request-body": "true",
             "buffer-response": "true" if operation == "microsoft-decision" else "false",
             "fail-on-error-status-code": "false",

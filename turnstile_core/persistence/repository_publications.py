@@ -1048,22 +1048,46 @@ class PostgreSqlPublicationRepositoryMixin:
     ) -> Sequence[dict[str, Any]]:
         with self._connection() as connection:
             rows = connection.execute(
-                                """SELECT publication.* FROM gateway_publication publication
-                                     WHERE publication.gateway_profile_id = %s
-                                         AND publication.status = 'active'
-                                         AND publication.publication_kind = 'model_add'
-                                         AND publication.resource_manifest ? 'model_route_addition'
-                                         AND NOT EXISTS (
-                                                 SELECT 1 FROM gateway_publication removal
-                                                 WHERE removal.gateway_profile_id
-                                                     = publication.gateway_profile_id
-                                                     AND removal.publication_kind = 'model_remove'
-                                                     AND removal.status = 'active'
-                                                     AND removal.resource_manifest #>>
-                                                               '{model_route_removal,source_publication_id}'
-                                                               = publication.id::text
-                                         )
-                                     ORDER BY publication.id LIMIT 10001""",
+                """SELECT publication.* FROM gateway_publication publication
+                   WHERE publication.gateway_profile_id = %s
+                     AND publication.status = 'active'
+                     AND publication.publication_kind = 'model_add'
+                     AND publication.resource_manifest ? 'model_route_addition'
+                     AND NOT EXISTS (
+                         SELECT 1 FROM gateway_publication removal
+                         WHERE removal.gateway_profile_id
+                               = publication.gateway_profile_id
+                           AND removal.publication_kind = 'model_remove'
+                           AND removal.status = 'active'
+                           AND removal.resource_manifest #>>
+                               '{model_route_removal,source_publication_id}'
+                               = publication.id::text
+                     )
+                     AND NOT EXISTS (
+                         SELECT 1 FROM effective_gateway_release effective
+                         JOIN gateway_publication current_release
+                           ON current_release.id = effective.publication_id
+                         CROSS JOIN LATERAL jsonb_array_elements(
+                             COALESCE(
+                                 current_release.desired_spec->'bindings',
+                                 '[]'::jsonb
+                             )
+                         ) AS absorbed(binding)
+                         WHERE effective.gateway_profile_id
+                               = publication.gateway_profile_id
+                           AND current_release.id <> publication.id
+                           AND (
+                               publication.base_release_id IS NULL
+                               OR current_release.id
+                                  <> publication.base_release_id
+                           )
+                           AND lower(absorbed.binding->'model'->>'model_key')
+                               = lower(
+                                   publication.resource_manifest
+                                   ->'model_route_addition'->>'alias'
+                               )
+                     )
+                   ORDER BY publication.id LIMIT 10001""",
                 (gateway_profile_id,),
             ).fetchall()
         if len(rows) > 10000:
@@ -2778,6 +2802,22 @@ class PostgreSqlPublicationRepositoryMixin:
                     """UPDATE gateway_publication SET status = 'superseded', updated_at = now()
                        WHERE id = %s AND status = 'active'""",
                     (previous["publication_id"],),
+                )
+            absorbed_aliases = [
+                str(binding["model"]["model_key"]).casefold()
+                for binding in (publication.get("desired_spec") or {}).get("bindings") or ()
+                if isinstance(binding, Mapping) and isinstance(binding.get("model"), Mapping)
+                and binding["model"].get("model_key")
+            ]
+            if absorbed_aliases:
+                connection.execute(
+                    """UPDATE gateway_publication SET status = 'superseded', updated_at = now()
+                       WHERE gateway_profile_id = %s AND id <> %s
+                         AND status = 'active' AND publication_kind = 'model_add'
+                         AND resource_manifest ? 'model_route_addition'
+                         AND lower(resource_manifest->'model_route_addition'->>'alias')
+                             = ANY(%s)""",
+                    (publication["gateway_profile_id"], publication_id, absorbed_aliases),
                 )
             connection.execute(
                 """INSERT INTO effective_gateway_release (gateway_profile_id, publication_id)

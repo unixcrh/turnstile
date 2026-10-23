@@ -569,3 +569,269 @@ def test_pool_probe_baseline_uses_only_verified_previous_member_ids(
         with pytest.raises(httpx.HTTPStatusError):
             client.probe_revision("candidate", candidate, baseline_publication=previous)
         assert baseline_requests == []
+
+
+def test_route_reconcile_absorbs_model_add_and_resolves_legacy_member_project_endpoint() -> None:
+    from unittest.mock import Mock
+
+    from turnstile_core.domain.storage_routes import ActiveRouteHead, ModelRouteHead
+    from turnstile_core.persistence.repository_support import _route_reconcile_preparation_failed
+    from turnstile_core.services.storage_route_publisher import (
+        FixedRoutePublisherFactory,
+        FixedRoutePublisherPort,
+    )
+
+    repository = InMemoryRepository()
+    publication = _pooled_publication()
+    binding = publication.desired_spec.bindings[0]
+    alias = binding.model.model_key
+    gateway_id = publication.gateway_profile_id
+    base_id = uuid4()
+    addition_id = uuid4()
+    reconcile_id = uuid4()
+    repository.effective_gateway_releases[gateway_id] = base_id
+    repository.gateway_publications.extend([
+        {
+            **publication.model_dump(mode="python"),
+            "id": base_id,
+            "generation": 1,
+            "status": "active",
+            "publication_kind": "route_reconcile",
+            "desired_spec": publication.desired_spec.model_copy(update={"bindings": []}).model_dump(
+                mode="python"
+            ),
+        },
+        {
+            **publication.model_dump(mode="python"),
+            "id": addition_id,
+            "generation": 2,
+            "base_release_id": base_id,
+            "status": "active",
+            "publication_kind": "model_add",
+            "resource_manifest": {"model_route_addition": {"alias": alias}},
+        },
+        {
+            **publication.model_dump(mode="python"),
+            "id": reconcile_id,
+            "generation": 3,
+            "base_release_id": base_id,
+            "status": "active",
+            "publication_kind": "route_reconcile",
+        },
+    ])
+    assert [row["id"] for row in repository.active_model_route_publications(gateway_id)] == [
+        addition_id
+    ]
+    repository._supersede_absorbed_model_additions(repository.gateway_publications[-1])
+    repository.effective_gateway_releases[gateway_id] = reconcile_id
+    assert repository.active_model_route_publications(gateway_id) == []
+    assert repository.gateway_publications[1]["status"] == "superseded"
+
+    projection = Mock()
+    verifier = Mock()
+    task = Mock()
+    task.model_addition = False
+    route = Mock()
+    route.alias = alias
+    task.plan.snapshot.routes = (route,)
+    task.plan.program = Mock()
+    task.plan.snapshot.approval = Mock()
+    task.plan.snapshot.approval.budget_epoch = "epoch-1"
+    head = Mock(spec=ActiveRouteHead)
+    head.approval = Mock()
+    model_head = Mock(spec=ModelRouteHead)
+    projection.read_model_active.return_value = (model_head, 'W/"model-etag"')
+    port = FixedRoutePublisherPort(
+        projection,
+        verifier,
+        SecretStr("unit-key"),
+        Mock(),
+        active_fence=Mock(),
+        verify_connections=Mock(),
+        prepare_availability=Mock(),
+        clock=lambda: 1000,
+        absorbed_model_aliases=lambda: (alias,),
+    )
+    port.check = Mock(return_value=Mock())  # type: ignore[method-assign]
+    port.confirm(task, head)
+    projection.remove_model_head.assert_called_once_with(model_head, 'W/"model-etag"')
+
+    assert _route_reconcile_preparation_failed({
+        "publication_kind": "route_reconcile",
+        "error_code": "PolicyCompilationError",
+        "error_message": "Route credential verification was rejected",
+        "resource_manifest": {
+            "route_credentials": {},
+            "route_dependencies": {},
+            "route_configuration": {},
+            "route_last_progress_attempt": 1,
+        },
+    }) is True
+    assert _route_reconcile_preparation_failed({
+        "publication_kind": "route_reconcile",
+        "error_code": "PolicyCompilationError",
+        "error_message": "Foundry deployment metadata target does not match connection",
+        "resource_manifest": {
+            "route_credentials": {},
+            "route_preparation": {},
+            "route_dependencies": {},
+        },
+    }) is True
+    assert _route_reconcile_preparation_failed({
+        "publication_kind": "route_reconcile",
+        "error_code": "PolicyCompilationError",
+        "error_message": "Route credential verification was rejected",
+        "resource_manifest": {
+            "route_credentials": {},
+            "route_activation": {},
+        },
+    }) is False
+
+    project_url = "https://secondary.services.ai.azure.com/api/projects/secondary"
+    repository.runtimes.append({
+        "id": binding.runtime_id,
+        "provider_id": binding.provider_id,
+        "gateway_profile_id": gateway_id,
+        "name": binding.runtime_name,
+        "runtime_kind": binding.runtime_kind.value,
+        "enabled": True,
+        "is_default": False,
+        "brand_key": binding.runtime_brand_key.value,
+        "config": {
+            **binding.runtime_config,
+            "project_endpoint": project_url,
+        },
+        "allowed_roles": ["owner"],
+    })
+    fallback_binding = binding.model_copy(
+        update={
+            "backend_url": HttpUrl("https://secondary.openai.azure.com"),
+            "auth_strategy": AuthStrategy.MANAGED_IDENTITY,
+            "runtime_config": {
+                **binding.runtime_config,
+                "project_endpoint": "https://secondary.openai.azure.com",
+            },
+        }
+    )
+    factory = FixedRoutePublisherFactory(
+        repository,
+        Mock(),
+        active_fence=lambda _gateway: {},
+        availability_projector=Mock(),
+    )
+    factory._tokens = Mock(token=Mock(return_value="unit-token"))
+    captured_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_urls.append(str(request.url))
+        return httpx.Response(
+            200,
+            json={
+                "value": [
+                    {
+                        "name": fallback_binding.model.upstream_model_id,
+                        "modelName": "gpt-5.4-mini",
+                        "modelVersion": "2026-03-17",
+                        "modelPublisher": "OpenAI",
+                    }
+                ]
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        metadata = factory._validate_deployment(
+            publication,
+            Mock(),
+            http_client,
+            Mock(),
+            binding=fallback_binding,
+        )
+    assert metadata is not None
+    assert captured_urls == [f"{project_url}/deployments?api-version=v1"]
+
+    from turnstile_core.domain.control_plane import pool_member_binding
+
+    cross_runtime_member = GatewayBackendPoolMember(
+        runtime_id=uuid4(),
+        runtime_name="Cross Foundry OpenAI URL",
+        backend_url=HttpUrl("https://secondary.openai.azure.com"),
+        auth_strategy=AuthStrategy.NAMED_VALUE_API_KEY,
+        named_value_name="secondary-key",
+        priority=0,
+        weight=1,
+    )
+    expanded_member = pool_member_binding(
+        binding.model_copy(
+            update={
+                "runtime_config": {
+                    **binding.runtime_config,
+                    "project_endpoint": "https://primary.services.ai.azure.com/api/projects/main",
+                }
+            }
+        ),
+        cross_runtime_member,
+    )
+    assert "project_endpoint" not in expanded_member.runtime_config
+
+    from turnstile_core.domain.storage_routes import RouteScope
+    from turnstile_core.integrations.apim_storage_routes import (
+        FixedRouteBinding,
+        fixed_operation,
+    )
+
+    pool_operation_xml = fixed_operation(
+        "chat-completions",
+        FixedRouteBinding(
+            scope=RouteScope(
+                target_id=str(gateway_id),
+                api_id="finops-foundry-llm",
+                gateway_id="managed",
+            ),
+            api_revision="fixed-abi2-60e4f760",
+            table_endpoint="https://unitstore.table.core.windows.net",
+            table_name="Routes",
+            ledger_table_endpoint="https://unitstore.table.core.windows.net",
+            ledger_table_name="TurnstileLedger",
+            trust_binding_sha256="a" * 64,
+            pool_enabled=True,
+        ),
+    )
+    assert "<retry" in pool_operation_xml
+    assert 'count="1"' in pool_operation_xml
+    assert 'first-fast-retry="true"' in pool_operation_xml
+
+    provider_id = repository.providers[0]["id"]
+    repository.runtimes[-1]["provider_id"] = provider_id
+    absorbed_model = repository.create_registry_item(
+        "model",
+        {
+            "provider_id": provider_id,
+            "runtime_id": binding.runtime_id,
+            "model_key": alias,
+            "display_name": binding.model.display_name,
+            "family_key": binding.model.family_key.value,
+            "upstream_model_id": binding.model.upstream_model_id,
+            "assignment_required": False,
+            "enabled": True,
+            "is_default": False,
+            "capabilities": ["chat"],
+            "context_window": 128000,
+            "input_cost_per_million": 1.0,
+            "output_cost_per_million": 2.0,
+            "cached_cost_per_million": None,
+            "cache_write_cost_per_million": None,
+            "allowed_roles": ["owner", "admin", "member"],
+            "publication_id": addition_id,
+        },
+    )
+    repository.gateway_publications[-1]["resource_manifest"] = {
+        "fixed_route_program": {"version": 1}
+    }
+    service = GatewayControlPlaneService(repository)
+    removal_pub = service.remove_model(absorbed_model["id"], "owner@example.com")
+    assert removal_pub.publication_kind is PublicationKind.MODEL_REMOVE
+    assert removal_pub.base_release_id == reconcile_id
+    assert "model_route_removal" not in removal_pub.resource_manifest
+    assert [m.model_id for m in removal_pub.desired_spec.removed_models] == [
+        absorbed_model["id"]
+    ]

@@ -145,6 +145,7 @@ export function AgentInvocation({ entities }: { entities: EnterpriseEntityCatalo
   const [result, setResult] = useState<((ModelInvocationResponse | DecisionInvocationResponse) & { requested_max_output_tokens?: number }) | null>(null);
   const [isInvoking, setIsInvoking] = useState(false);
   const [invokeError, setInvokeError] = useState<string | null>(null);
+  const [sessionId] = useState(() => crypto.randomUUID());
   const selectUser = (value: string | undefined) => {
     setUserId(value ?? "");
     if (invocationTarget.startsWith(ROUTER_TARGET_PREFIX)) {
@@ -206,11 +207,13 @@ export function AgentInvocation({ entities }: { entities: EnterpriseEntityCatalo
                 request_parameter: prompt,
                 user_id: invocationUser.id,
                 required_capability: "chat",
+                session_id: sessionId,
               },
             }
             : { runtime_id: explicitGateway ? undefined : model!.runtime_id, model_id: model!.id,
               gateway_profile_id: explicitGateway ? gatewaySelection.targetId! : undefined,
-              gateway_deployment_id: explicitGateway ? gatewaySelection.deploymentId! : undefined }),
+              gateway_deployment_id: explicitGateway ? gatewaySelection.deploymentId! : undefined,
+              router_context: { session_id: sessionId } }),
         metadata: {
           organization_id: entities.organizations[0].id,
           organization: entities.organizations[0].name,

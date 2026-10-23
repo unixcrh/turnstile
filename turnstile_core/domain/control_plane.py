@@ -749,8 +749,14 @@ def pool_member_binding(
     config = {name: value for name, value in binding.runtime_config.items() if name not in {
         "apim_backend_pool", "apim_backend_pool_session_affinity",
     }}
-    if member.project_endpoint is not None or "project_endpoint" in config:
-        config["project_endpoint"] = str(member.project_endpoint or member.backend_url).rstrip("/")
+    if member.project_endpoint is not None:
+        config["project_endpoint"] = str(member.project_endpoint).rstrip("/")
+    elif member.runtime_id != binding.runtime_id:
+        backend = str(member.backend_url).rstrip("/")
+        if "/api/projects/" in backend:
+            config["project_endpoint"] = backend
+        else:
+            config.pop("project_endpoint", None)
     return GatewayModelBinding.model_validate({
         **binding.model_dump(mode="python"), "runtime_id": member.runtime_id,
         "model": binding.model.model_copy(update={

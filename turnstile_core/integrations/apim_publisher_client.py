@@ -672,7 +672,12 @@ class AzureApimPublisherClient(AzureSelfHostedGatewayManagementMixin):
             str(binding.backend_url), binding.model.upstream_model_id, headers,
         )
 
-    def validate_pool_deployments(self, publication: GatewayPublication) -> None:
+    def validate_pool_deployments(
+        self,
+        publication: GatewayPublication,
+        *,
+        runtimes: Sequence[Mapping[str, Any]] = (),
+    ) -> None:
         from ..domain.control_plane import pool_member_bindings
         from .gateway_connection_probe import (
             foundry_model_identity,
@@ -714,6 +719,20 @@ class AzureApimPublisherClient(AzureSelfHostedGatewayManagementMixin):
                 secret_id = credentials.get(route_credential_source(source))
                 if source.key_vault_secret_id is None and secret_id is not None:
                     source = source.model_copy(update={"key_vault_secret_id": secret_id})
+                if not source.runtime_config.get("project_endpoint") and source.runtime_id:
+                    matched_runtime = next(
+                        (item for item in runtimes if item.get("id") == source.runtime_id),
+                        None,
+                    )
+                    runtime_project = (
+                        (matched_runtime.get("config") or {}).get("project_endpoint")
+                        if matched_runtime else None
+                    )
+                    if runtime_project:
+                        source = source.model_copy(update={"runtime_config": {
+                            **source.runtime_config,
+                            "project_endpoint": str(runtime_project).rstrip("/"),
+                        }})
                 key = (str(source.runtime_id), str(source.runtime_config.get("project_endpoint")))
                 if key not in catalogs:
                     catalogs[key] = self.pool_deployment_catalog(source)

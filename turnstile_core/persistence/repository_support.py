@@ -331,34 +331,49 @@ def _route_reconcile_credential_read_denied(publication: Mapping[str, Any]) -> b
 
 
 def _route_reconcile_preparation_failed(publication: Mapping[str, Any]) -> bool:
-    if publication.get("publication_kind") != "route_reconcile":
+    if (
+        publication.get("publication_kind") != "route_reconcile"
+        or publication.get("status", "failed") != "failed"
+        or publication.get("apim_revision") is not None
+        or publication.get("policy_sha256") is not None
+        or _route_reconcile_credential_read_denied(publication)
+    ):
         return False
-    keys = set(publication.get("resource_manifest") or {})
-    message = publication.get("error_message") or ""
-    return (
-        publication.get("error_code") == "ValueError"
-        and message == "An existing model is missing its approved budget contract"
-        and keys == {
-            "route_credentials", "route_preparation", "route_dependencies",
-            "route_last_progress_attempt",
-        }
-    ) or (
-        publication.get("error_code") == "ValidationError"
-        and message.startswith("1 validation error for RoutePublicationTask")
-        and "Value error, ROUTE_PUBLICATION_TASK_INVALID [type=value_error," in message
-        and keys == {"route_credentials", "route_dependencies", "route_last_progress_attempt"}
-    ) or (
-        publication.get("error_code") == "ValueError"
-        and message == "MODEL_PROGRAM_UPGRADE_BINDING_CHANGED"
-        and not keys
-    ) or (
-        publication.get("error_code") == "PolicyCompilationError"
-        and message == "Route credential version is unavailable"
-        and keys == {
-            "route_credentials", "route_dependencies", "route_configuration",
-            "route_last_progress_attempt",
-        }
-    )
+    manifest = publication.get("resource_manifest")
+    if not isinstance(manifest, Mapping):
+        return False
+    keys = set(manifest)
+    if not keys <= {
+        "route_credentials",
+        "route_preparation",
+        "route_dependencies",
+        "route_configuration",
+        "route_last_progress_attempt",
+    }:
+        return False
+    error_code = str(publication.get("error_code") or "")
+    message = str(publication.get("error_message") or "")
+    if error_code == "PolicyCompilationError" and message.startswith(
+        "APIM management failed: "
+    ):
+        return False
+    if error_code == "ValueError" and keys == {
+        "route_credentials",
+        "route_preparation",
+        "route_dependencies",
+        "route_last_progress_attempt",
+    }:
+        return message == "An existing model is missing its approved budget contract"
+    if error_code == "ValidationError" and keys == {
+        "route_credentials",
+        "route_dependencies",
+        "route_last_progress_attempt",
+    }:
+        return (
+            message.startswith("1 validation error for RoutePublicationTask")
+            and "Value error, ROUTE_PUBLICATION_TASK_INVALID [type=value_error," in message
+        )
+    return bool(error_code and message)
 
 
 def _program_migration_manifest(
