@@ -239,12 +239,18 @@ export function ModelManagementPage({ onToggleSidebar }: { onToggleSidebar: () =
   const [runtimeDetailId, setRuntimeDetailId] = useState(() => new URL(window.location.href).searchParams.get("runtime"))
   const [modelDetailId, setModelDetailId] = useState(() => new URL(window.location.href).searchParams.get("model"))
   const runtimeHealthWindow = useMemo(() => usageWindow(30), [])
+  const runtimeHealthNames = useMemo(
+    () => [...new Set((data?.runtimes ?? []).map((runtime) => runtime.name))],
+    [data?.runtimes],
+  )
   // One scoped page per runtime matches the detail view. Filtering the global 200-row page
   // would hide older probes for busy runtimes and recreate the list/detail disagreement.
   const runtimeHealthQueries = useQueries({
-    queries: (data?.runtimes ?? []).map((runtime) => ({
-      ...finopsQueries.requests({ ...runtimeHealthWindow, runtime: [runtime.name] }),
-      enabled: tab === "connections" && !runtimeDetailId && runtime.enabled,
+    queries: runtimeHealthNames.map((runtimeName) => ({
+      ...finopsQueries.requests({ ...runtimeHealthWindow, runtime: [runtimeName] }),
+      enabled: tab === "connections" && !runtimeDetailId && (data?.runtimes ?? []).some(
+        (runtime) => runtime.name === runtimeName && runtime.enabled,
+      ),
     })),
   })
 
@@ -473,12 +479,18 @@ export function ModelManagementPage({ onToggleSidebar }: { onToggleSidebar: () =
   if (isLoading) return <div className="registry-loading"><RefreshCw className="spin" />加载模型目录</div>
   if (error || !data) return <div className="registry-error">无法加载模型管理 API：{String(error)}</div>
 
+  const runtimeHealthIndexByName = new Map(
+    runtimeHealthNames.map((name, index) => [name, index] as const),
+  )
   const effectiveRegistry = {
     ...data,
-    runtimes: data.runtimes.map((runtime, index) => runtimeWithTelemetryHealth(
-      runtime,
-      runtimeHealthQueries[index]?.data ?? [],
-    )),
+    runtimes: data.runtimes.map((runtime) => {
+      const index = runtimeHealthIndexByName.get(runtime.name) ?? -1
+      return runtimeWithTelemetryHealth(
+        runtime,
+        runtimeHealthQueries[index]?.data ?? [],
+      )
+    }),
   }
   const checkingRuntimeIds = new Set([
     ...health.attempts.filter(attempt => attempt.status === "pending").map(attempt => attempt.request.runtimeId),

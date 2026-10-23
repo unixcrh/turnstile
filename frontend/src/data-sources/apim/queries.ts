@@ -280,7 +280,7 @@ export const finopsQueries = {
   gatewayPublication: (id: string | null) => queryOptions({
     queryKey: finopsKeys.gatewayPublication(id ?? ""),
     queryFn: () => dataSource.gatewayPublication(id!),
-    enabled: Boolean(id),
+    enabled: Boolean(id && !id.startsWith("submitting:")),
     refetchIntervalInBackground: true,
     refetchInterval: (query) => {
       const status = query.state.data?.status

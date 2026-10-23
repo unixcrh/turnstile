@@ -61,6 +61,111 @@ export type PendingBackendPoolSubmission = {
   action?: PublicationAction
 }
 
+export const PENDING_SUBMISSIONS_STORAGE_KEY = "turnstile_apim_native_route_pending_submissions"
+
+let cachedPendingSubmissions: Record<string, PendingBackendPoolSubmission> | null = null
+const pendingSubmissionListeners = new Set<() => void>()
+
+export function isSubmittingPublicationId(id: string | null | undefined): boolean {
+  return Boolean(id && id.startsWith("submitting:"))
+}
+
+export function createOptimisticPoolPublication(
+  model: ManagedModel,
+  gatewayProfileId?: string | null,
+): GatewayPublication {
+  const now = new Date().toISOString()
+  return {
+    id: `submitting:${model.id}:${Date.now()}`,
+    configuration_only: true,
+    gateway_profile_id: gatewayProfileId ?? "",
+    generation: 0,
+    publication_kind: "route_reconcile",
+    model_key: model.model_key,
+    display_name: model.display_name,
+    status: "queued",
+    error_code: null,
+    error_message: null,
+    failure: null,
+    authorization: null,
+    retry_requires_credential: false,
+    attempt_count: 0,
+    created_by: "",
+    created_at: now,
+    started_at: null,
+    completed_at: null,
+    updated_at: now,
+  }
+}
+
+export function readPendingBackendPoolSubmissions(): Record<string, PendingBackendPoolSubmission> {
+  if (cachedPendingSubmissions) return cachedPendingSubmissions
+  if (typeof sessionStorage !== "undefined") {
+    try {
+      const raw = sessionStorage.getItem(PENDING_SUBMISSIONS_STORAGE_KEY)
+      if (raw) {
+        const parsed = JSON.parse(raw) as Record<string, PendingBackendPoolSubmission>
+        if (parsed && typeof parsed === "object") {
+          const restored: Record<string, PendingBackendPoolSubmission> = {}
+          for (const [key, item] of Object.entries(parsed)) {
+            if (item?.publication?.id && !isSubmittingPublicationId(item.publication.id)) {
+              restored[key] = item
+            }
+          }
+          cachedPendingSubmissions = restored
+          return restored
+        }
+      }
+    } catch {
+      // Ignore storage read failures
+    }
+  }
+  cachedPendingSubmissions = {}
+  return cachedPendingSubmissions
+}
+
+function writePendingBackendPoolSubmissions(next: Record<string, PendingBackendPoolSubmission>) {
+  cachedPendingSubmissions = next
+  if (typeof sessionStorage !== "undefined") {
+    try {
+      if (Object.keys(next).length === 0) {
+        sessionStorage.removeItem(PENDING_SUBMISSIONS_STORAGE_KEY)
+      } else {
+        sessionStorage.setItem(PENDING_SUBMISSIONS_STORAGE_KEY, JSON.stringify(next))
+      }
+    } catch {
+      // Ignore storage write failures
+    }
+  }
+  for (const listener of pendingSubmissionListeners) listener()
+}
+
+export function upsertPendingBackendPoolSubmission(submission: PendingBackendPoolSubmission) {
+  const current = readPendingBackendPoolSubmissions()
+  writePendingBackendPoolSubmissions({
+    ...current,
+    [submission.modelId]: {
+      ...submission,
+      action: submission.action ?? "configure",
+    },
+  })
+}
+
+export function removePendingBackendPoolSubmission(modelId: string) {
+  const current = readPendingBackendPoolSubmissions()
+  if (!(modelId in current)) return
+  const next = { ...current }
+  delete next[modelId]
+  writePendingBackendPoolSubmissions(next)
+}
+
+export function subscribePendingBackendPoolSubmissions(listener: () => void) {
+  pendingSubmissionListeners.add(listener)
+  return () => {
+    pendingSubmissionListeners.delete(listener)
+  }
+}
+
 const DEFAULT_RATE_LIMIT: GatewayBackendPoolWrite["rate_limit"] = {
   max_attempts_per_request: 2,
   retry_interval_seconds: 1,
@@ -209,6 +314,9 @@ export function DeploymentResilienceEditor({
 
   useEffect(() => {
     if (!pool.isSuccess) return
+    if (!pool.data && (initialPublicationAction === "remove" || publicationAction === "remove")) {
+      return
+    }
     const next = draftFromPool(pool.data, model, registry.data?.models ?? [])
     const previous = baselineRef.current
     baselineRef.current = next
@@ -223,19 +331,28 @@ export function DeploymentResilienceEditor({
     setDraft((current) => draftSignature(current) === draftSignature(previous)
       ? next
       : current)
-  }, [model, pool.data, pool.dataUpdatedAt, pool.isSuccess, primaryMemberId, providedInitialDraft, registry.data?.models])
+  }, [initialPublicationAction, model, pool.data, pool.dataUpdatedAt, pool.isSuccess, primaryMemberId, providedInitialDraft, publicationAction, registry.data?.models])
 
   useEffect(() => {
     const status = publication.data?.status
     if (!publicationId || !status || !TERMINAL_PUBLICATION_STATUSES.has(status)) return
     if (status === "active") {
+      if (publicationAction === "remove") {
+        queryClient.setQueryData<GatewayBackendPoolSummary[]>(
+          finopsKeys.modelBackendPools,
+          (current) => current?.filter((item) => item.model_id !== model.id),
+        )
+        queryClient.setQueryData?.(finopsKeys.modelBackendPool(model.id), null)
+        removePendingBackendPoolSubmission(model.id)
+      } else {
+        void queryClient.invalidateQueries({ queryKey: finopsKeys.modelBackendPool(model.id) })
+      }
       setNotice({
         status,
         message: publicationAction === "remove"
           ? "APIM 后端池已移除，直接后端已恢复"
           : "APIM 部署韧性配置已生效",
       })
-      void queryClient.invalidateQueries({ queryKey: finopsKeys.modelBackendPool(model.id) })
       void queryClient.invalidateQueries({ queryKey: finopsKeys.modelBackendPools })
       void queryClient.invalidateQueries({ queryKey: finopsKeys.modelBackendPoolCandidates(model.id) })
       void queryClient.invalidateQueries({ queryKey: finopsKeys.gatewayPublications })
@@ -256,7 +373,30 @@ export function DeploymentResilienceEditor({
     mutationFn: () => dataSource.saveModelBackendPool(
       model.id, poolPublicationPayload(draft, affinitySupported),
     ),
-    onSuccess: (accepted) => {
+    onMutate: () => {
+      const optimistic = createOptimisticPoolPublication(
+        model,
+        primaryRuntime?.gateway_profile_id,
+      )
+      const submittedDraft = structuredClone(draft)
+      const submission: PendingBackendPoolSubmission = {
+        modelId: model.id,
+        publication: optimistic,
+        draft: submittedDraft,
+        action: "configure",
+      }
+      setNotice(null)
+      setPublicationAction("configure")
+      setPublicationId(optimistic.id)
+      queryClient.setQueryData?.(
+        finopsKeys.gatewayPublication(optimistic.id),
+        optimistic,
+      )
+      upsertPendingBackendPoolSubmission(submission)
+      onSubmitted?.(submission)
+      return submission
+    },
+    onSuccess: (accepted, _variables, context) => {
       setNotice(null)
       setPublicationAction("configure")
       setPublicationId(accepted.publication.id)
@@ -264,17 +404,72 @@ export function DeploymentResilienceEditor({
         finopsKeys.gatewayPublication(accepted.publication.id),
         accepted.publication,
       )
-      onSubmitted?.({
+      const submission: PendingBackendPoolSubmission = {
         modelId: model.id,
         publication: accepted.publication,
-        draft: structuredClone(draft),
+        draft: context?.draft ?? structuredClone(draft),
         action: "configure",
+      }
+      upsertPendingBackendPoolSubmission(submission)
+      onSubmitted?.(submission)
+    },
+    onError: (err, _variables, context) => {
+      const base = context?.publication ?? createOptimisticPoolPublication(
+        model,
+        primaryRuntime?.gateway_profile_id,
+      )
+      const failed: GatewayPublication = {
+        ...base,
+        status: "failed",
+        error_message: err instanceof Error ? err.message : String(err),
+      }
+      setPublicationId(null)
+      setPublicationAction(null)
+      setNotice({
+        status: "failed",
+        message: failed.error_message ?? "APIM 后端池发布失败",
       })
+      queryClient.setQueryData?.(
+        finopsKeys.gatewayPublication(failed.id),
+        failed,
+      )
+      const submission: PendingBackendPoolSubmission = {
+        modelId: model.id,
+        publication: failed,
+        draft: context?.draft ?? structuredClone(draft),
+        action: "configure",
+      }
+      upsertPendingBackendPoolSubmission(submission)
+      onSubmitted?.(submission)
     },
   })
   const remove = useMutation({
     mutationFn: () => dataSource.deleteModelBackendPool(model.id),
-    onSuccess: (accepted) => {
+    onMutate: () => {
+      const optimistic = createOptimisticPoolPublication(
+        model,
+        primaryRuntime?.gateway_profile_id,
+      )
+      const submittedDraft = structuredClone(draft)
+      const submission: PendingBackendPoolSubmission = {
+        modelId: model.id,
+        publication: optimistic,
+        draft: submittedDraft,
+        action: "remove",
+      }
+      setRemoveOpen(false)
+      setNotice(null)
+      setPublicationAction("remove")
+      setPublicationId(optimistic.id)
+      queryClient.setQueryData?.(
+        finopsKeys.gatewayPublication(optimistic.id),
+        optimistic,
+      )
+      upsertPendingBackendPoolSubmission(submission)
+      onSubmitted?.(submission)
+      return submission
+    },
+    onSuccess: (accepted, _variables, context) => {
       setRemoveOpen(false)
       setNotice(null)
       setPublicationAction("remove")
@@ -283,16 +478,48 @@ export function DeploymentResilienceEditor({
         finopsKeys.gatewayPublication(accepted.publication.id),
         accepted.publication,
       )
-      onSubmitted?.({
+      const submission: PendingBackendPoolSubmission = {
         modelId: model.id,
         publication: accepted.publication,
-        draft: structuredClone(draft),
+        draft: context?.draft ?? structuredClone(draft),
         action: "remove",
+      }
+      upsertPendingBackendPoolSubmission(submission)
+      onSubmitted?.(submission)
+    },
+    onError: (err, _variables, context) => {
+      const base = context?.publication ?? createOptimisticPoolPublication(
+        model,
+        primaryRuntime?.gateway_profile_id,
+      )
+      const failed: GatewayPublication = {
+        ...base,
+        status: "failed",
+        error_message: err instanceof Error ? err.message : String(err),
+      }
+      setPublicationId(null)
+      setPublicationAction(null)
+      setNotice({
+        status: "failed",
+        message: failed.error_message ?? "APIM 后端池发布失败",
       })
+      queryClient.setQueryData?.(
+        finopsKeys.gatewayPublication(failed.id),
+        failed,
+      )
+      const submission: PendingBackendPoolSubmission = {
+        modelId: model.id,
+        publication: failed,
+        draft: context?.draft ?? structuredClone(draft),
+        action: "remove",
+      }
+      upsertPendingBackendPoolSubmission(submission)
+      onSubmitted?.(submission)
     },
   })
 
   const publicationStatus = publication.data?.status
+    ?? (isSubmittingPublicationId(publicationId) ? "queued" : undefined)
   const publishing = Boolean(
     publicationId
     && publicationStatus
@@ -414,8 +641,12 @@ export function DeploymentResilienceEditor({
   const canConfigure = canManage && pool.isSuccess && (hasEffectivePool || selectableCandidates.length >= 2)
     && (!showCandidates || (candidates.isPending || candidates.isSuccess)
       && [...selectedIds].every(id => selectableIds.has(id)))
+  const isRemoveFlow = initialPublicationAction === "remove"
+    || publicationAction === "remove"
+    || notice?.message === "APIM 后端池已移除，直接后端已恢复"
   const awaitingPoolRefresh = !pool.data && Boolean(providedInitialDraft) && visiblePublicationStatus === "active"
   const showChangeActions = canManage
+    && !isRemoveFlow
     && (dirty || configuring || !hasEffectivePool)
     && !(Boolean(renderFrame) && hasEffectivePool && (publishing || awaitingPoolRefresh))
   const changeActions = showChangeActions ? <span className="apim-native-route-change-actions">
@@ -508,7 +739,7 @@ export function DeploymentResilienceEditor({
       {visiblePublicationStatus && visiblePublicationMessage && <div className="router-resilience-state" data-status={visiblePublicationStatus}>{publishing ? <LoaderCircle className="spin" size={14} /> : publicationHasError || visiblePublicationStatus === "awaiting_authorization" ? <CircleAlert size={14} /> : <CheckCircle2 size={14} />}<span>{visiblePublicationMessage}</span></div>}
       {error && <div className="router-resilience-state error"><CircleAlert size={14} /><span data-no-localize>{String(error)}</span></div>}
       {!renderFrame && (disableAction || changeActions) && <footer>{disableAction}{changeActions}</footer>}
-      <AlertDialog open={removeOpen} onOpenChange={(open) => { if (!busy) setRemoveOpen(open) }}>
+      {removeOpen && <AlertDialog open={removeOpen} onOpenChange={(open) => { if (!busy) setRemoveOpen(open) }}>
         <AlertDialogContent className="model-delete-dialog router-confirm-dialog">
           <div className="model-delete-body">
             <AlertDialogTitle>删除 APIM 后端池？</AlertDialogTitle>
@@ -519,7 +750,7 @@ export function DeploymentResilienceEditor({
             <AlertDialogAction variant="destructive" disabled={busy} onClick={() => remove.mutate()}>{remove.isPending ? "正在提交" : "删除"}</AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
-      </AlertDialog>
+      </AlertDialog>}
     </>}
   </section>
   return renderFrame ? renderFrame(editor, externalControls) : editor

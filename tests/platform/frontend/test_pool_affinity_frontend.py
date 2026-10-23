@@ -44,10 +44,12 @@ def test_pool_affinity_editor_is_capability_and_owner_gated() -> None:
     assert "<h4" not in editor
     assert '<span className="router-resilience-member-role"' in editor
     assert '<span className="router-resilience-member-connection"' in editor
-    assert "onSubmitted?.({" in editor
+    assert "createOptimisticPoolPublication(" in editor
+    assert "onSubmitted?.(submission)" in editor
     assert 'action: "configure"' in editor
     assert 'action: "remove"' in editor
     assert "const hasEffectivePool = Boolean(pool.data || providedInitialDraft)" in editor
+    assert "const isRemoveFlow =" in editor
     assert 'data-pending>{PUBLICATION_LABELS[publicationStatus]}' in editor
     dialog = (
         FRONTEND_SOURCE / "components/model-management/apim-native-route-create-dialog.tsx"
@@ -58,6 +60,8 @@ def test_pool_affinity_editor_is_capability_and_owner_gated() -> None:
         FRONTEND_SOURCE / "pages/apim-native-routes-page.tsx"
     ).read_text(encoding="utf-8")
     assert "PENDING_SUBMISSIONS_STORAGE_KEY" in native_page
+    assert "subscribePendingBackendPoolSubmissions" in native_page
+    assert "const isRemovedModel =" in native_page
     assert "const [pendingSubmissions, setPendingSubmissions] =" in native_page
     assert (
         'initialDraft={selectedPending && selectedPending.action !== "remove" '

@@ -8,6 +8,11 @@ import {
 } from "../components/model-management/apim-native-route-create-dialog"
 import {
   DeploymentResilienceEditor,
+  PENDING_SUBMISSIONS_STORAGE_KEY,
+  readPendingBackendPoolSubmissions,
+  removePendingBackendPoolSubmission,
+  subscribePendingBackendPoolSubmissions,
+  upsertPendingBackendPoolSubmission,
   type PendingBackendPoolSubmission,
 } from "../components/model-management/deployment-resilience-editor"
 import { finopsKeys, finopsQueries } from "../data-sources/apim/queries"
@@ -26,7 +31,6 @@ const NATIVE_ROUTE_PANE_WIDTH_KEY = "turnstile_apim_native_route_pane_width"
 const NATIVE_ROUTE_PANE_WIDTH_DEFAULT = 304
 const NATIVE_ROUTE_PANE_WIDTH_MIN = 240
 const NATIVE_ROUTE_PANE_WIDTH_MAX = 420
-const PENDING_SUBMISSIONS_STORAGE_KEY = "turnstile_apim_native_route_pending_submissions"
 const SELECTED_MODEL_STORAGE_KEY = "turnstile_apim_native_route_selected_model_id"
 
 const TERMINAL_PENDING_STATUSES = new Set<GatewayPublicationStatus>([
@@ -37,39 +41,7 @@ const TERMINAL_PENDING_STATUSES = new Set<GatewayPublicationStatus>([
   "superseded",
 ])
 
-let cachedPendingSubmissions: Record<string, PendingBackendPoolSubmission> | null = null
 let cachedSelectedModelId: string | null = null
-
-function readPendingSubmissions(): Record<string, PendingBackendPoolSubmission> {
-  if (cachedPendingSubmissions) return cachedPendingSubmissions
-  try {
-    const raw = sessionStorage.getItem(PENDING_SUBMISSIONS_STORAGE_KEY)
-    if (raw) {
-      const parsed = JSON.parse(raw) as Record<string, PendingBackendPoolSubmission>
-      if (parsed && typeof parsed === "object") {
-        cachedPendingSubmissions = parsed
-        return parsed
-      }
-    }
-  } catch {
-    // Ignore storage read failures
-  }
-  cachedPendingSubmissions = {}
-  return cachedPendingSubmissions
-}
-
-function writePendingSubmissions(next: Record<string, PendingBackendPoolSubmission>) {
-  cachedPendingSubmissions = next
-  try {
-    if (Object.keys(next).length === 0) {
-      sessionStorage.removeItem(PENDING_SUBMISSIONS_STORAGE_KEY)
-    } else {
-      sessionStorage.setItem(PENDING_SUBMISSIONS_STORAGE_KEY, JSON.stringify(next))
-    }
-  } catch {
-    // Ignore storage write failures
-  }
-}
 
 function readSelectedModelId(): string | null {
   if (cachedSelectedModelId) return cachedSelectedModelId
@@ -126,16 +98,28 @@ function PendingPublicationWatcher({
 
   useEffect(() => {
     if (latest.status !== "active") return
+    if (action === "remove") {
+      queryClient.setQueryData<GatewayBackendPoolSummary[]>(
+        finopsKeys.modelBackendPools,
+        (current) => current?.filter((item) => item.model_id !== submission.modelId),
+      )
+      queryClient.setQueryData(finopsKeys.modelBackendPool(submission.modelId), null)
+    }
     if (refreshingRef.current !== latest.id) {
       refreshingRef.current = latest.id
       void Promise.all([
-        queryClient.invalidateQueries({ queryKey: finopsKeys.modelBackendPool(submission.modelId) }),
+        ...(action === "remove"
+          ? []
+          : [queryClient.invalidateQueries({ queryKey: finopsKeys.modelBackendPool(submission.modelId) })]),
         queryClient.invalidateQueries({ queryKey: finopsKeys.modelBackendPools }),
         queryClient.invalidateQueries({ queryKey: finopsKeys.modelBackendPoolCandidates(submission.modelId) }),
         queryClient.invalidateQueries({ queryKey: finopsKeys.gatewayPublications }),
       ]).then(() => {
         onSettled(submission.modelId, action)
       })
+      if (action === "remove") {
+        onSettled(submission.modelId, action)
+      }
       return
     }
     const expectedHasPool = action !== "remove"
@@ -166,19 +150,15 @@ export function ApimNativeRoutesPage({
   const [search, setSearch] = useState("")
   const [selectedModelId, setSelectedModelIdState] = useState<string | null>(readSelectedModelId)
   const [pendingCreatedModelId, setPendingCreatedModelId] = useState<string | null>(null)
-  const [pendingSubmissions, setPendingSubmissions] = useState<Record<string, PendingBackendPoolSubmission>>(readPendingSubmissions)
+  const [pendingSubmissions, setPendingSubmissions] = useState<Record<string, PendingBackendPoolSubmission>>(
+    readPendingBackendPoolSubmissions,
+  )
+  useEffect(() => subscribePendingBackendPoolSubmissions(() => {
+    setPendingSubmissions(readPendingBackendPoolSubmissions())
+  }), [])
   const selectModel = useCallback((modelId: string | null) => {
     writeSelectedModelId(modelId)
     setSelectedModelIdState(modelId)
-  }, [])
-  const updatePendingSubmissions = useCallback((
-    updater: (current: Record<string, PendingBackendPoolSubmission>) => Record<string, PendingBackendPoolSubmission>,
-  ) => {
-    setPendingSubmissions((current) => {
-      const next = updater(current)
-      writePendingSubmissions(next)
-      return next
-    })
   }, [])
   const {
     width: paneWidth,
@@ -204,14 +184,21 @@ export function ApimNativeRoutesPage({
       .sort((left, right) => left.model_key.localeCompare(right.model_key))
   }, [registry.data])
   const poolByModelId = new Map((pools.data ?? []).map(item => [item.model_id, item.pool] as const))
+  const isRemovedModel = (modelId: string) =>
+    pendingSubmissions[modelId]?.action === "remove"
+    && pendingSubmissions[modelId]?.publication.status === "active"
   const activeRoutes = managedModels.filter(
-    model => poolByModelId.has(model.id)
-      || Boolean(pendingSubmissions[model.id] && pendingSubmissions[model.id].action !== "remove"),
+    model => !isRemovedModel(model.id) && (
+      poolByModelId.has(model.id)
+      || Boolean(pendingSubmissions[model.id] && pendingSubmissions[model.id].action !== "remove")
+    ),
   )
   const routeOptions: NativeRouteModelOption[] = managedModels.map(model => ({
     model,
-    state: poolByModelId.has(model.id)
+    state: !isRemovedModel(model.id) && (
+      poolByModelId.has(model.id)
       || Boolean(pendingSubmissions[model.id] && pendingSubmissions[model.id].action !== "remove")
+    )
       ? "active"
       : "available",
   }))
@@ -233,42 +220,26 @@ export function ApimNativeRoutesPage({
   const handleRouteSubmitted = useCallback((submission: PendingBackendPoolSubmission) => {
     onAddOpenChange(false)
     setSearch("")
-    updatePendingSubmissions((current) => ({
-      ...current,
-      [submission.modelId]: {
-        ...submission,
-        action: submission.action ?? "configure",
-      },
-    }))
+    upsertPendingBackendPoolSubmission(submission)
     selectModel(submission.modelId)
     setPendingCreatedModelId(submission.modelId)
-  }, [onAddOpenChange, selectModel, updatePendingSubmissions])
+  }, [onAddOpenChange, selectModel])
 
   const handlePendingPublicationChange = useCallback((modelId: string, publication: GatewayPublication) => {
-    updatePendingSubmissions((current) => {
-      const existing = current[modelId]
-      if (!existing) return current
-      return {
-        ...current,
-        [modelId]: {
-          ...existing,
-          publication,
-        },
-      }
+    const existing = readPendingBackendPoolSubmissions()[modelId]
+    if (!existing) return
+    upsertPendingBackendPoolSubmission({
+      ...existing,
+      publication,
     })
-  }, [updatePendingSubmissions])
+  }, [])
 
   const handlePendingSettled = useCallback((modelId: string, action: "configure" | "remove") => {
     const freshPools = queryClient.getQueryData<GatewayBackendPoolSummary[]>(finopsKeys.modelBackendPools)
     const existsInFresh = freshPools?.some((item) => item.model_id === modelId) ?? false
     if (action === "remove" ? existsInFresh : !existsInFresh) return
-    updatePendingSubmissions((current) => {
-      if (!(modelId in current)) return current
-      const next = { ...current }
-      delete next[modelId]
-      return next
-    })
-  }, [queryClient, updatePendingSubmissions])
+    removePendingBackendPoolSubmission(modelId)
+  }, [queryClient])
 
   useEffect(() => {
     if (!pendingCreatedModelId || !activeRoutes.some((model) => model.id === pendingCreatedModelId)) return
@@ -285,7 +256,9 @@ export function ApimNativeRoutesPage({
     onRouteDrawerOpenChange(false)
   }, [isMobile, onRouteDrawerOpenChange])
 
-  const selectedModel = activeRoutes.find((model) => model.id === selectedModelId) ?? null
+  const selectedModel = activeRoutes.find((model) => model.id === selectedModelId)
+    ?? activeRoutes[0]
+    ?? null
   const selectedPool = selectedModel
     ? poolByModelId.get(selectedModel.id)
     : null
