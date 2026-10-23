@@ -45,6 +45,9 @@ def test_pool_affinity_editor_is_capability_and_owner_gated() -> None:
     assert '<span className="router-resilience-member-role"' in editor
     assert '<span className="router-resilience-member-connection"' in editor
     assert "onSubmitted?.({" in editor
+    assert 'action: "configure"' in editor
+    assert 'action: "remove"' in editor
+    assert "const hasEffectivePool = Boolean(pool.data || providedInitialDraft)" in editor
     assert 'data-pending>{PUBLICATION_LABELS[publicationStatus]}' in editor
     dialog = (
         FRONTEND_SOURCE / "components/model-management/apim-native-route-create-dialog.tsx"
@@ -54,9 +57,14 @@ def test_pool_affinity_editor_is_capability_and_owner_gated() -> None:
     native_page = (
         FRONTEND_SOURCE / "pages/apim-native-routes-page.tsx"
     ).read_text(encoding="utf-8")
-    assert "const [pendingSubmission, setPendingSubmission] =" in native_page
-    assert "initialDraft={selectedPending?.draft ?? null}" in native_page
+    assert "PENDING_SUBMISSIONS_STORAGE_KEY" in native_page
+    assert "const [pendingSubmissions, setPendingSubmissions] =" in native_page
+    assert (
+        'initialDraft={selectedPending && selectedPending.action !== "remove" '
+        "? selectedPending.draft : null}" in native_page
+    )
     assert "initialPublicationId={selectedPending?.publication.id ?? null}" in native_page
+    assert "initialPublicationAction={selectedPending?.action ?? null}" in native_page
     assert "onSubmitted={handleRouteSubmitted}" in native_page
     assert '<LoaderCircle className="spin" size={15} />' in native_page
     assert "registry.backend_pool_session_affinity_supported === true" in api

@@ -2926,7 +2926,6 @@ class FixedRoutePublisherFactory:
             )
             if migration is None:
                 runtime_ids = {binding.runtime_id for binding in publication.desired_spec.bindings}
-                self._verified_connections.add(task.context_sha256)
                 self._verified_connections.add(document_digest({
                     "task": task.context_sha256, "installation": document_digest(installation),
                     "source": str(dependency_source.id),
@@ -3736,14 +3735,6 @@ class FixedRoutePublisherFactory:
         require_route_specification(publication, recorded)
         if task.credential_bindings != self._credential_bindings(publication):
             raise PolicyCompilationError("Route credential bindings changed after preparation")
-        if (
-            (
-                task.configuration_only
-                or "fixed_route_migration" not in publication.resource_manifest
-            )
-            and task.context_sha256 in self._verified_connections
-        ):
-            return
         previous_row = (
             self._repository.get_gateway_publication(publication.base_release_id)
             if publication.base_release_id is not None else None
@@ -3825,7 +3816,6 @@ class FixedRoutePublisherFactory:
             raise PolicyCompilationError("Fixed route independent connection approval changed")
         if task.configuration_only or migration is None:
             self._verified_connections.add(verification_key)
-            self._verified_connections.add(task.context_sha256)
 
     def approved_connections(
         self, publication: GatewayPublication, installation: FixedProgramInstallation,

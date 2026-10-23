@@ -52,10 +52,13 @@ import {
 export { deploymentMode } from "./pool-session-affinity"
 export type { DeploymentMode } from "./pool-session-affinity"
 
+export type PublicationAction = "configure" | "remove"
+
 export type PendingBackendPoolSubmission = {
   modelId: string
   publication: GatewayPublication
   draft: GatewayBackendPoolWrite
+  action?: PublicationAction
 }
 
 const DEFAULT_RATE_LIMIT: GatewayBackendPoolWrite["rate_limit"] = {
@@ -105,8 +108,6 @@ type PublicationNotice = {
   message: string
 }
 
-type PublicationAction = "configure" | "remove"
-
 function draftFromPool(
   pool: GatewayBackendPoolConfig | null,
   model: ManagedModel,
@@ -144,6 +145,7 @@ export function DeploymentResilienceEditor({
   model,
   initialDraft: providedInitialDraft,
   initialPublicationId,
+  initialPublicationAction,
   onSubmitted,
   onActivated,
   onBusyChange,
@@ -152,6 +154,7 @@ export function DeploymentResilienceEditor({
   model: ManagedModel
   initialDraft?: GatewayBackendPoolWrite | null
   initialPublicationId?: string | null
+  initialPublicationAction?: PublicationAction | null
   onSubmitted?: (submission: PendingBackendPoolSubmission) => void
   onActivated?: () => void
   onBusyChange?: (busy: boolean) => void
@@ -192,7 +195,7 @@ export function DeploymentResilienceEditor({
   const [mode, setMode] = useState<DeploymentMode | null>(null)
   const [publicationId, setPublicationId] = useState<string | null>(initialPublicationId ?? null)
   const [publicationAction, setPublicationAction] = useState<PublicationAction | null>(
-    initialPublicationId ? "configure" : null,
+    initialPublicationAction ?? (initialPublicationId ? "configure" : null),
   )
   const [notice, setNotice] = useState<PublicationNotice | null>(null)
   const [removeOpen, setRemoveOpen] = useState(false)
@@ -201,19 +204,21 @@ export function DeploymentResilienceEditor({
   useEffect(() => {
     if (!initialPublicationId) return
     setPublicationId(initialPublicationId)
-    setPublicationAction("configure")
-  }, [initialPublicationId])
+    setPublicationAction(initialPublicationAction ?? "configure")
+  }, [initialPublicationAction, initialPublicationId])
 
   useEffect(() => {
     if (!pool.isSuccess) return
-    if (!pool.data && providedInitialDraft) {
-      setMode(deploymentMode(providedInitialDraft.members, primaryMemberId))
-      return
-    }
     const next = draftFromPool(pool.data, model, registry.data?.models ?? [])
     const previous = baselineRef.current
     baselineRef.current = next
     setBaselineSignature(draftSignature(next))
+    if (providedInitialDraft) {
+      const pendingDraft = structuredClone(providedInitialDraft)
+      setMode(deploymentMode(pendingDraft.members, primaryMemberId))
+      setDraft(pendingDraft)
+      return
+    }
     setMode(pool.data ? deploymentMode(next.members, primaryMemberId) : null)
     setDraft((current) => draftSignature(current) === draftSignature(previous)
       ? next
@@ -263,6 +268,7 @@ export function DeploymentResilienceEditor({
         modelId: model.id,
         publication: accepted.publication,
         draft: structuredClone(draft),
+        action: "configure",
       })
     },
   })
@@ -277,6 +283,12 @@ export function DeploymentResilienceEditor({
         finopsKeys.gatewayPublication(accepted.publication.id),
         accepted.publication,
       )
+      onSubmitted?.({
+        modelId: model.id,
+        publication: accepted.publication,
+        draft: structuredClone(draft),
+        action: "remove",
+      })
     },
   })
 
@@ -298,7 +310,7 @@ export function DeploymentResilienceEditor({
   const selectedWeights = draft.members.map((member) => member.weight)
   const weightedIsDistinct = mode !== "weighted" || new Set(selectedWeights).size > 1
   const validDraft = validMemberCount && weightedIsDistinct
-  const hasEffectivePool = Boolean(pool.data)
+  const hasEffectivePool = Boolean(pool.data || providedInitialDraft)
   const hasPendingPool = !hasEffectivePool && validMemberCount
   const visiblePublicationStatus = publicationStatus ?? notice?.status
   const visiblePublicationMessage = publicationStatus
@@ -402,9 +414,13 @@ export function DeploymentResilienceEditor({
   const canConfigure = canManage && pool.isSuccess && (hasEffectivePool || selectableCandidates.length >= 2)
     && (!showCandidates || (candidates.isPending || candidates.isSuccess)
       && [...selectedIds].every(id => selectableIds.has(id)))
-  const changeActions = canManage && (dirty || configuring || !hasEffectivePool) ? <span className="apim-native-route-change-actions">
-    {hasEffectivePool && dirty && !configuring && <span className="apim-native-route-dirty">未保存</span>}
-    {hasEffectivePool && dirty && !busy && <Button type="button" variant="ghost" size="icon-sm" title="取消更改" aria-label="取消更改" onClick={() => {
+  const awaitingPoolRefresh = !pool.data && Boolean(providedInitialDraft) && visiblePublicationStatus === "active"
+  const showChangeActions = canManage
+    && (dirty || configuring || !hasEffectivePool)
+    && !(Boolean(renderFrame) && hasEffectivePool && (publishing || awaitingPoolRefresh))
+  const changeActions = showChangeActions ? <span className="apim-native-route-change-actions">
+    {Boolean(pool.data) && dirty && !configuring && <span className="apim-native-route-dirty">未保存</span>}
+    {Boolean(pool.data) && dirty && !busy && <Button type="button" variant="ghost" size="icon-sm" title="取消更改" aria-label="取消更改" onClick={() => {
       setDraft(structuredClone(baselineRef.current))
       setMode(pool.data ? deploymentMode(baselineRef.current.members, primaryMemberId) : null)
     }}><RotateCcw size={13} /></Button>}
@@ -415,7 +431,7 @@ export function DeploymentResilienceEditor({
     : null
   const externalControls = pool.isLoading || registry.isLoading || !primaryRuntime || primaryRuntime.config.control_plane_managed !== true ? null : <>
     {publishing && publicationStatus && <span className="apim-native-route-status" data-pending>{PUBLICATION_LABELS[publicationStatus]}</span>}
-    {!publishing && hasEffectivePool && <span className="apim-native-route-status" data-active>{"已生效"}</span>}
+    {!publishing && (Boolean(pool.data) || awaitingPoolRefresh) && <span className="apim-native-route-status" data-active>{"已生效"}</span>}
     {changeActions}
     {disableAction}
   </>
