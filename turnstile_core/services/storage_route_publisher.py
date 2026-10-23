@@ -2830,9 +2830,25 @@ class FixedRoutePublisherFactory:
             publication, credentials = self._prepare_credentials(
                 publication, dependency_source, installation, management, worker_id, heartbeat,
             )
-            self._validate_pool_deployments(publication, management, port._client, installation)
+            self._validate_pool_deployments(
+                publication, management, port._client, installation, previous=dependency_source,
+            )
             publication = self._prepare_oauth(
                 publication, dependency_source, installation, management, worker_id, heartbeat,
+            )
+            previous_by_alias = {
+                item.model.model_key: item for item in dependency_source.desired_spec.bindings
+            }
+            prepare_changed_aliases = (
+                frozenset(
+                    binding.model.model_key
+                    for binding in publication.desired_spec.bindings
+                    if previous_by_alias.get(binding.model.model_key) != binding
+                )
+                if migration is None
+                and "route_rollback" not in publication.resource_manifest
+                and dependency_snapshot is not None
+                else None
             )
             connections = self.approved_connections(
                 publication, installation, management, baseline=dependency_snapshot,
@@ -2841,6 +2857,7 @@ class FixedRoutePublisherFactory:
                                     else self._connection_preparer(
                     publication, installation, config, management, worker_id, heartbeat,
                 )),
+                changed_aliases=prepare_changed_aliases,
             )
             dependencies = {
                 "version": 1,
@@ -3111,11 +3128,17 @@ class FixedRoutePublisherFactory:
     def _validate_pool_deployments(
         self, publication: GatewayPublication, management: FixedProgramManagement,
         client: httpx.Client, installation: FixedProgramInstallation,
+        *, previous: GatewayPublication | None = None,
     ) -> None:
         from ..integrations.gateway_connection_probe import foundry_model_identity
         from .route_publication import pool_member_bindings
 
+        previous_bindings = {
+            item.model.model_key: item for item in previous.desired_spec.bindings
+        } if previous is not None else {}
         for binding in publication.desired_spec.bindings:
+            if previous_bindings.get(binding.model.model_key) == binding:
+                continue
             pool = binding.backend_pool
             if pool is None or binding.provider_brand_key.value != "microsoft_foundry" or not any(
                 member.model_id is not None or (
@@ -3720,13 +3743,16 @@ class FixedRoutePublisherFactory:
                 for row in registry["runtimes"] if row["id"] in runtime_ids
             },
         })
-        verified = task.configuration_only and verification_key in self._verified_connections
+        verified = (
+            (task.configuration_only or migration is None)
+            and verification_key in self._verified_connections
+        )
+        changed_aliases = (
+            frozenset(task.plan.changed_aliases)
+            if migration is None and "route_rollback" not in publication.resource_manifest
+            else None
+        )
         if not verified:
-            changed_aliases = (
-                frozenset(task.plan.changed_aliases)
-                if migration is None and "route_rollback" not in publication.resource_manifest
-                else None
-            )
             self._verify_credentials(
                 publication, dependency_source, installation, changed_aliases=changed_aliases,
             )
@@ -3734,12 +3760,13 @@ class FixedRoutePublisherFactory:
             publication, installation, management, baseline=baseline,
             initial_migration=migration is not None,
             verify_readback=not verified,
+            changed_aliases=changed_aliases,
             registry=registry,
         )
         if any(approved.get(member.alias) != member.connection_approval
                for member in task.plan.snapshot.members):
             raise PolicyCompilationError("Fixed route independent connection approval changed")
-        if task.configuration_only:
+        if task.configuration_only or migration is None:
             self._verified_connections.add(verification_key)
 
     def approved_connections(
@@ -3751,6 +3778,7 @@ class FixedRoutePublisherFactory:
             [GatewayModelBinding], tuple[ConnectionRevision, int]
         ] | None = None,
         verify_readback: bool = True,
+        changed_aliases: frozenset[str] | None = None,
         registry: Mapping[str, Sequence[dict[str, Any]]] | None = None,
     ) -> dict[str, ConnectionApproval]:
         from ..services.route_publication import (
@@ -3803,6 +3831,10 @@ class FixedRoutePublisherFactory:
             }
         issued_at = self._clock()
         pool_config: ApimTargetClientConfig | None = None
+        baseline_members = {
+            member.alias: member.connection_approval
+            for member in (baseline.members if baseline is not None else ())
+        }
         for binding in publication.desired_spec.bindings:
             runtime = next((row for row in runtimes if row["id"] == binding.runtime_id), None)
             if (
@@ -3904,7 +3936,17 @@ class FixedRoutePublisherFactory:
                 )
             selected = matches[0]
             key = canonical_document(selected.connection)
-            if verify_readback and key not in checked:
+            baseline_approval = baseline_members.get(binding.model.model_key)
+            now_epoch = self._clock()
+            unchanged_baseline = (
+                changed_aliases is not None
+                and binding.model.model_key not in changed_aliases
+                and baseline_approval is not None
+                and baseline_approval.connection == selected.connection
+                and baseline_approval.state == "approved"
+                and baseline_approval.issued_epoch <= now_epoch < baseline_approval.expires_epoch
+            )
+            if verify_readback and not unchanged_baseline and key not in checked:
                 if management.verify_route_connection(selected.connection) != (
                     selected.connection.dependency_sha256
                 ):

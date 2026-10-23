@@ -1111,7 +1111,7 @@ class RouteConfigurationExecutor:
     def __init__(
         self, repository: QueryRepository,
         resolve: Callable[[RoutePublicationTask], AbstractContextManager[RoutePublicationPort]],
-        *, clock: Callable[[], int] = lambda: int(time()), maximum_entities: int = 16,
+        *, clock: Callable[[], int] = lambda: int(time()), maximum_entities: int = 100,
         prepare: Callable[
             [GatewayPublication, str, Callable[[], None]], RoutePublicationTask
         ] | None = None,

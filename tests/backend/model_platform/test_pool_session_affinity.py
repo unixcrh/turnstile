@@ -882,3 +882,8 @@ def test_route_reconcile_absorbs_model_add_and_resolves_legacy_member_project_en
     retried_removal = service.remove_model(absorbed_model["id"], "owner@example.com")
     assert retried_removal.id != removal_pub.id
     assert retried_removal.status.value == "queued"
+
+    from turnstile_core.services.route_publication import RouteConfigurationExecutor
+
+    executor = RouteConfigurationExecutor(repository, Mock())
+    assert executor._maximum_entities == 100

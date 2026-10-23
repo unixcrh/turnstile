@@ -1461,6 +1461,17 @@ button.model-availability-status { cursor: pointer; }
 .router-resilience-member-connection > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .router-resilience-runtime-list[data-pool="true"] .router-resilience-member-role { max-width: 144px; flex: 0 0 auto; white-space: normal; overflow-wrap: anywhere; font-size: 12px; }
 .router-resilience-runtime-list[data-pool="true"] .router-resilience-member-meta small { display: inline; }
+.router-resilience-runtime-list[data-pool="false"] { container-type: inline-size; gap: 8px; border-top: 1px solid var(--border); padding-top: 8px; }
+.router-resilience-runtime-list[data-pool="false"] > .router-resilience-project { display: grid; gap: 8px; }
+.router-resilience-runtime-list[data-pool="false"] > .router-resilience-project > h4 { padding: 4px 0 0; }
+.router-resilience-runtime-list[data-pool="false"] .router-resilience-runtime { position: relative; grid-template-columns: minmax(0, 1fr) auto; min-height: 0; gap: 4px 16px; padding: 12px; border: 0; border-radius: 8px; background: var(--muted); }
+.router-resilience-runtime-list[data-pool="false"] .router-resilience-member-heading { gap: 16px; padding-left: 32px; }
+.router-resilience-runtime-list[data-pool="false"] .router-resilience-member-heading > [data-slot="checkbox"] { position: absolute; top: 50%; left: 12px; transform: translateY(-50%); }
+.router-resilience-runtime-list[data-pool="false"] .router-resilience-member-heading > span { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; }
+.router-resilience-runtime-list[data-pool="false"] .router-resilience-member-meta { grid-column: 2; justify-content: flex-end; gap: 6px 12px; margin: 0; border: 0; padding: 0; }
+.router-resilience-runtime-list[data-pool="false"] .router-resilience-member-role { max-width: 144px; flex: 0 0 auto; white-space: normal; overflow-wrap: anywhere; font-size: 12px; }
+.router-resilience-runtime-list[data-pool="false"] .router-resilience-member-meta small { display: inline; }
+.router-resilience-runtime-list[data-pool] .router-resilience-member-role { justify-self: end; text-align: right; }
 @container (max-width: 540px) {
 	.router-resilience-runtime-list[data-pool="true"] .router-resilience-member-heading { grid-column: 1 / -1; }
 	.router-resilience-runtime-list[data-pool="true"] .router-resilience-member-connection { grid-column: 1; grid-row: 2; }

@@ -81,11 +81,11 @@ const TERMINAL_PUBLICATION_STATUSES = new Set<GatewayPublicationStatus>([
 const PUBLICATION_LABELS: Record<GatewayPublicationStatus, string> = {
   queued: "等待发布",
   validating: "正在创建 APIM 后端",
-  provisioning: "正在创建候选 Revision",
-  building_revision: "正在写入 Pool 策略",
+  provisioning: "正在同步路由数据",
+  building_revision: "正在校验路由快照",
   verifying: "正在逐成员验证",
   awaiting_authorization: "等待提供方授权",
-  promoting: "正在切换生效 Revision",
+  promoting: "正在切换生效路由",
   active: "配置已生效",
   failed: "发布失败",
   superseded: "已被后续发布替代",
@@ -419,7 +419,7 @@ export function DeploymentResilienceEditor({
             : deployment.runtime_name).replace(/\s+via APIM$/i, "")
           return <div className="router-resilience-runtime" role="listitem" data-selected={shownSelected} data-unavailable={unavailable} key={deployment.model_id}>
             <label className="router-resilience-member-heading"><Checkbox checked={shownSelected} title={primary ? "主部署（必选）" : deployment.deployment_name} disabled={!canManage || busy || primary || (!selected && (!candidates.isPending && !verifiedIds.has(deployment.model_id) || draft.members.length >= 30))} onCheckedChange={(checked) => toggleDeployment(deployment, checked === true)} /><span><b data-no-localize title={deployment.deployment_name}>{deployment.deployment_name}</b>{hasEffectivePool && <small>{membershipState}</small>}</span></label>
-            {(hasEffectivePool || primary) && <span className="router-resilience-member-role" data-primary={primary} data-selected={selected}>{role}</span>}
+            {(hasEffectivePool || primary || (hasPendingPool && selected)) && <span className="router-resilience-member-role" data-primary={primary} data-selected={selected}>{role}</span>}
             {hasEffectivePool && <span className="router-resilience-member-connection" data-no-localize title={deployment.runtime_name}><ProviderBrandLogo brand={connectionBrand} size={14} /><span>{connectionName}</span></span>}
             {(hasEffectivePool || hasPendingPool && member) && <div className="router-resilience-member-meta">
               <span className="router-resilience-member-priority"><small>APIM</small><b>{member ? `P${member.priority + 1}` : "--"}</b></span>

@@ -38,5 +38,15 @@ def test_pool_affinity_editor_is_capability_and_owner_gated() -> None:
         "(hasEffectivePool || selectableCandidates.length >= 2)" in editor
     )
     assert "disabled={busy || !canConfigure || !validDraft}" in editor
+    assert 'provisioning: "正在同步路由数据"' in editor
+    assert 'building_revision: "正在校验路由快照"' in editor
+    assert 'promoting: "正在切换生效路由"' in editor
+    assert "(hasEffectivePool || primary || (hasPendingPool && selected))" in editor
     assert "registry.backend_pool_session_affinity_supported === true" in api
-    assert ".router-resilience-affinity { min-width: 0;" in read_frontend_styles()
+    styles = read_frontend_styles()
+    assert ".router-resilience-affinity { min-width: 0;" in styles
+    assert (
+        '.router-resilience-runtime-list[data-pool="false"] '
+        ".router-resilience-runtime {" in styles
+    )
+    assert '.router-resilience-runtime-list[data-pool] .router-resilience-member-role {' in styles

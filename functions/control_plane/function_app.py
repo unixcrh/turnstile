@@ -504,8 +504,10 @@ def publish_gateway_changes(timer: func.TimerRequest) -> None:
                 route_configuration = result.resource_manifest.get("route_configuration")
                 model_removal = "model_route_removal" in result.resource_manifest
                 advancing = {"queued", "validating", "provisioning", "building_revision"}
-                if (isinstance(route_configuration, dict)
-                        and route_configuration.get("configuration_only") is True) or model_removal:
+                if (
+                    isinstance(route_configuration, dict)
+                    and "fixed_route_migration" not in result.resource_manifest
+                ) or model_removal:
                     advancing |= {"verifying", "promoting"}
                 if (result.status.value not in advancing
                     or (route_configuration is None and not model_removal)
