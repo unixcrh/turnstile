@@ -1573,6 +1573,54 @@ class ModelRuntimeService:
                 ),
             )
 
+    def _verified_router_authorization(
+        self,
+        request: ModelInvocationRequest,
+        route: Mapping[str, Any],
+    ) -> str | None:
+        raw_router_id = request.router_context.get("_router_authorized_id")
+        if not isinstance(raw_router_id, str) or not raw_router_id.strip():
+            return None
+        try:
+            router_uuid = UUID(raw_router_id.strip())
+        except (TypeError, ValueError):
+            return None
+        user_id = request.metadata.user_id.strip()
+        if not user_id:
+            return None
+        get_callable = getattr(self._repository, "get_callable_model_router", None)
+        router_row = (
+            get_callable(router_uuid, user_id) if callable(get_callable) else None
+        )
+        if (
+            router_row is None
+            and request.router_context.get("subscription_key_authenticated")
+            and user_id.lower().endswith("@applications.turnstile.local")
+        ):
+            get_pub = getattr(self._repository, "get_published_model_router", None)
+            router_row = get_pub(router_uuid) if callable(get_pub) else None
+        if not isinstance(router_row, Mapping):
+            return None
+        definition = router_row.get("definition")
+        nodes = definition.get("nodes", []) if isinstance(definition, Mapping) else []
+        allowed_in_router: set[str] = set()
+        for node in nodes:
+            if not isinstance(node, Mapping):
+                continue
+            rm_id = node.get("routing_model_id")
+            if rm_id is not None:
+                allowed_in_router.add(str(rm_id).strip().lower())
+            for cand in node.get("candidates") or ():
+                if isinstance(cand, Mapping) and cand.get("model_id") is not None:
+                    allowed_in_router.add(str(cand["model_id"]).strip().lower())
+            for cfg in node.get("model_configs") or ():
+                if isinstance(cfg, Mapping) and cfg.get("model_id") is not None:
+                    allowed_in_router.add(str(cfg["model_id"]).strip().lower())
+        route_model_id = str(route.get("model_id") or "").strip().lower()
+        if not route_model_id or route_model_id not in allowed_in_router:
+            return None
+        return str(router_uuid).lower()
+
     def _assert_model_allowed(
         self,
         request: ModelInvocationRequest | ImageInvocationRequest | DecisionInvocationRequest,
@@ -1600,7 +1648,7 @@ class ModelRuntimeService:
             return
         if (
             isinstance(request, ModelInvocationRequest)
-            and request.router_context.get("_router_authorized_id")
+            and self._verified_router_authorization(request, route) is not None
         ):
             return
         if self._model_policy_allows(route, self._person_model_policy(user_id)):
@@ -1713,9 +1761,9 @@ class ModelRuntimeService:
             )
         auth_router_id = ""
         if isinstance(request, ModelInvocationRequest):
-            auth_router_id = str(
-                request.router_context.get("_router_authorized_id") or ""
-            ).strip()
+            auth_router_id = (
+                self._verified_router_authorization(request, route) or ""
+            )
         elif isinstance(request, DecisionInvocationRequest) and request.metadata.workflow in {
             "model-router-decision",
             "model-router-decision-trial",

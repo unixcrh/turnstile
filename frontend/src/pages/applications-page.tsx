@@ -620,7 +620,7 @@ function ApplicationDetailView({
   const isAgent = application.application_type === "agent"
   const budget = application.budget
   const budgetPending = applicationBudgetPending(budget)
-  const budgetUpdating = refreshing || budgetPending
+  const budgetUpdating = budgetPending || (refreshing && !budget)
   const pendingTokens = budget?.pending_reserved_tokens
   const usdBudget = budget?.budget_mode === "usd"
   const usdVerified = budget?.usd_cost_available !== false && budget?.ledger_status !== "unavailable" && budget?.ledger_status !== "prepared"

@@ -11,6 +11,7 @@ from .repository_support import (
     model_router_v3_view,
     model_router_view,
     published_model_router_view,
+    router_v3_spec_sha256,
 )
 
 
@@ -453,6 +454,14 @@ class InMemoryRouterRepositoryMixin:
             None,
         )
         if row is None:
+            return None
+        expected_spec_sha256 = (
+            str(compiled_plan.get("spec_sha256") or "").strip().lower()
+        )
+        if (
+            expected_spec_sha256
+            and router_v3_spec_sha256(row["draft_spec"]) != expected_spec_sha256
+        ):
             return None
         now = datetime.now(UTC)
         version = int(row["version"]) + 1

@@ -1,7 +1,9 @@
 # ruff: noqa: E501
 from __future__ import annotations
 
-from .apim_policy_components import parse_policy, serialize_policy
+from xml.etree import ElementTree as ET
+
+from .apim_policy_components import parse_policy
 
 ROUTER_GLOBAL_POLICY_MARKER = "turnstileRouterEngineVersion"
 
@@ -31,9 +33,14 @@ def build_router_global_service_policy(
         root = parse_policy(base_service_policy_xml)
     except Exception:
         # When base_service_policy_xml is in APIM rawxml format (containing unescaped < or >
-        # inside C# policy expressions), splice the validated router engine fragments directly.
-        inbound_serialized = serialize_policy(parse_policy(inbound_xml))
-        outbound_serialized = serialize_policy(parse_policy(outbound_xml))
+        # inside C# policy expressions), validate and serialize the router engine fragments
+        # with standard XML attribute escaping so single-line C# string literals do not break.
+        inbound_serialized = ET.tostring(
+            ET.fromstring(inbound_xml), encoding="unicode"
+        )
+        outbound_serialized = ET.tostring(
+            ET.fromstring(outbound_xml), encoding="unicode"
+        )
         inbound_snippet = (
             inbound_serialized.removeprefix("<inbound>").removesuffix("</inbound>").strip()
         )
@@ -75,15 +82,15 @@ def build_router_global_service_policy(
             ):
                 parent.remove(child)
 
-    inbound_engine = parse_policy(inbound_xml)
+    inbound_engine = ET.fromstring(inbound_xml)
     for child in list(inbound_engine):
         inbound.append(child)
 
-    outbound_engine = parse_policy(outbound_xml)
+    outbound_engine = ET.fromstring(outbound_xml)
     for child in list(outbound_engine):
         outbound.append(child)
 
-    return serialize_policy(root)
+    return ET.tostring(root, encoding="unicode")
 
 
 _INBOUND_ROUTER_ENGINE_XML = r"""<inbound>
@@ -191,6 +198,22 @@ _INBOUND_ROUTER_ENGINE_XML = r"""<inbound>
           </choose>
         </when>
       </choose>
+      <choose>
+        <when condition="@(context.Subscription != null &amp;&amp; context.Request.Headers.ContainsKey(&quot;Authorization&quot;))">
+          <choose>
+            <when condition="@{
+              var auth = context.Request.Headers.GetValueOrDefault(&quot;Authorization&quot;, &quot;&quot;).Trim();
+              if (auth.StartsWith(&quot;Bearer &quot;, StringComparison.OrdinalIgnoreCase)) {
+                var token = auth.Substring(7).Trim();
+                return !token.Contains(&quot;.&quot;);
+              }
+              return false;
+            }">
+              <set-header name="Authorization" exists-action="delete" />
+            </when>
+          </choose>
+        </when>
+      </choose>
 
       <!-- Branch 1: GET /v1/models (Expose published Model Routers + Models to consumers; keep probe catalog untouched) -->
       <choose>
@@ -273,48 +296,80 @@ _INBOUND_ROUTER_ENGINE_XML = r"""<inbound>
                   if (tableResp != null &amp;&amp; tableResp.StatusCode == 200) {
                     var entities = JObject.Parse(tableResp.Body.As&lt;string&gt;(preserveContent: true))[&quot;value&quot;] as JArray ?? new JArray();
                     var routerItems = new List&lt;JObject&gt;();
+                    var seenRouterIds = new HashSet&lt;string&gt;(StringComparer.OrdinalIgnoreCase);
                     foreach (var token in entities) {
                       var ent = token as JObject;
                       if (ent == null || (bool?)ent[&quot;PrimaryEntry&quot;] != true || (string)ent[&quot;Status&quot;] != &quot;published&quot;) { continue; }
+                      var candidateDocs = new List&lt;JObject&gt;();
                       var docStr = (string)ent[&quot;Document&quot;];
-                      if (string.IsNullOrEmpty(docStr)) { continue; }
-                      var rDoc = JObject.Parse(docStr);
-                      if (hasPersonAuth) {
-                        if (string.IsNullOrEmpty(callerEmail)) { continue; }
-                        var assignedArr = rDoc[&quot;assigned_user_ids&quot;] as JArray;
-                        string ownerEmail = ((string)rDoc[&quot;owner_email&quot;] ?? &quot;&quot;).Trim().ToLowerInvariant();
-                        if (assignedArr != null) {
-                          bool userAllowed = (!string.IsNullOrEmpty(ownerEmail) &amp;&amp; string.Equals(ownerEmail, callerEmail, StringComparison.OrdinalIgnoreCase))
-                            || assignedArr.Values&lt;string&gt;().Any(u =&gt; string.Equals((u ?? &quot;&quot;).Trim(), callerEmail, StringComparison.OrdinalIgnoreCase));
-                          if (!userAllowed) { continue; }
-                        }
-                      } else {
-                        if (rDoc[&quot;allowed_subscription_ids&quot;] is JArray allowedSubs) {
-                          if (string.IsNullOrEmpty(subKeyId) || !allowedSubs.Values&lt;string&gt;().Any(s =&gt; string.Equals((s ?? &quot;&quot;).Trim(), subKeyId, StringComparison.OrdinalIgnoreCase))) {
-                            continue;
-                          }
-                        }
-                        if (allowedBaseIds.Count &gt; 0 &amp;&amp; rDoc[&quot;candidate_model_ids&quot;] is JArray candIdsArr &amp;&amp; candIdsArr.Count &gt; 0) {
-                          if (!candIdsArr.Values&lt;string&gt;().All(cid =&gt; allowedBaseIds.Contains(cid ?? &quot;&quot;))) {
-                            continue;
-                          }
-                        }
+                      if (!string.IsNullOrEmpty(docStr)) {
+                        try { candidateDocs.Add(JObject.Parse(docStr)); } catch {}
                       }
-                      var item = new JObject(
-                        new JProperty(&quot;id&quot;, (string)rDoc[&quot;router_name&quot;]),
-                        new JProperty(&quot;object&quot;, &quot;model&quot;),
-                        new JProperty(&quot;type&quot;, &quot;model_router&quot;),
-                        new JProperty(&quot;created_at&quot;, (string)rDoc[&quot;published_at&quot;] ?? (string)rDoc[&quot;created_at&quot;]),
-                        new JProperty(&quot;display_name&quot;, (string)rDoc[&quot;router_name&quot;]),
-                        new JProperty(&quot;owned_by&quot;, &quot;turnstile-model-router&quot;),
-                        new JProperty(&quot;router_id&quot;, (string)rDoc[&quot;router_id&quot;]),
-                        new JProperty(&quot;router_version&quot;, (int?)rDoc[&quot;router_version&quot;] ?? 1),
-                        new JProperty(&quot;description&quot;, (string)rDoc[&quot;description&quot;] ?? &quot;&quot;),
-                        new JProperty(&quot;strategy_types&quot;, rDoc[&quot;strategy_types&quot;] ?? new JArray()),
-                        new JProperty(&quot;condition_fields&quot;, rDoc[&quot;condition_fields&quot;] ?? new JArray()),
-                        new JProperty(&quot;candidate_models&quot;, rDoc[&quot;candidate_models&quot;] ?? new JArray())
-                      );
-                      routerItems.Add(item);
+                      var altStr = (string)ent[&quot;AlternateDocuments&quot;];
+                      if (!string.IsNullOrEmpty(altStr)) {
+                        try {
+                          var altArr = JArray.Parse(altStr);
+                          foreach (var altTok in altArr) {
+                            var altObj = altTok as JObject;
+                            if (altObj != null) { candidateDocs.Add(altObj); }
+                            else if (altTok != null &amp;&amp; altTok.Type == JTokenType.String &amp;&amp; !string.IsNullOrEmpty((string)altTok)) {
+                              candidateDocs.Add(JObject.Parse((string)altTok));
+                            }
+                          }
+                        } catch {}
+                      }
+                      foreach (var rDoc in candidateDocs) {
+                        string rid = ((string)rDoc[&quot;router_id&quot;] ?? &quot;&quot;).Trim();
+                        if (!string.IsNullOrEmpty(rid) &amp;&amp; !seenRouterIds.Add(rid)) { continue; }
+                        if (hasPersonAuth) {
+                          if (string.IsNullOrEmpty(callerEmail)) { continue; }
+                          var assignedArr = rDoc[&quot;assigned_user_ids&quot;] as JArray;
+                          string ownerEmail = ((string)rDoc[&quot;owner_email&quot;] ?? &quot;&quot;).Trim().ToLowerInvariant();
+                          bool userAllowed = (!string.IsNullOrEmpty(ownerEmail) &amp;&amp; string.Equals(ownerEmail, callerEmail, StringComparison.OrdinalIgnoreCase))
+                            || (assignedArr != null &amp;&amp; assignedArr.Values&lt;string&gt;().Any(u =&gt; string.Equals((u ?? &quot;&quot;).Trim(), callerEmail, StringComparison.OrdinalIgnoreCase)));
+                          if (!userAllowed) { continue; }
+                        } else {
+                          var allowedSubs = rDoc[&quot;allowed_subscription_ids&quot;] as JArray;
+                          if (allowedSubs == null || string.IsNullOrEmpty(subKeyId) || !allowedSubs.Values&lt;string&gt;().Any(s =&gt; string.Equals((s ?? &quot;&quot;).Trim(), subKeyId, StringComparison.OrdinalIgnoreCase))) {
+                            continue;
+                          }
+                          if (allowedBaseIds.Count &gt; 0 &amp;&amp; rDoc[&quot;candidate_model_ids&quot;] is JArray candIdsArr &amp;&amp; candIdsArr.Count &gt; 0) {
+                            var candsMap = rDoc[&quot;candidates_by_id&quot;] as JObject;
+                            bool allCandsAllowed = true;
+                            foreach (var cidTok in candIdsArr) {
+                              string key = (string)cidTok ?? &quot;&quot;;
+                              if (allowedBaseIds.Contains(key)) { continue; }
+                              var cObj = candsMap != null ? (candsMap[key] as JObject) : null;
+                              string alias = cObj != null ? ((string)cObj[&quot;apim_alias&quot;] ?? &quot;&quot;) : &quot;&quot;;
+                              string mKey = cObj != null ? ((string)cObj[&quot;model_key&quot;] ?? &quot;&quot;) : &quot;&quot;;
+                              if ((!string.IsNullOrEmpty(alias) &amp;&amp; allowedBaseIds.Contains(alias))
+                                  || (!string.IsNullOrEmpty(mKey) &amp;&amp; allowedBaseIds.Contains(mKey))) {
+                                continue;
+                              }
+                              allCandsAllowed = false;
+                              break;
+                            }
+                            if (!allCandsAllowed) {
+                              continue;
+                            }
+                          }
+                        }
+                        var item = new JObject(
+                          new JProperty(&quot;id&quot;, (string)rDoc[&quot;router_name&quot;]),
+                          new JProperty(&quot;object&quot;, &quot;model&quot;),
+                          new JProperty(&quot;type&quot;, &quot;model_router&quot;),
+                          new JProperty(&quot;created_at&quot;, (string)rDoc[&quot;published_at&quot;] ?? (string)rDoc[&quot;created_at&quot;]),
+                          new JProperty(&quot;display_name&quot;, (string)rDoc[&quot;router_name&quot;]),
+                          new JProperty(&quot;owned_by&quot;, &quot;turnstile-model-router&quot;),
+                          new JProperty(&quot;router_id&quot;, (string)rDoc[&quot;router_id&quot;]),
+                          new JProperty(&quot;router_version&quot;, (int?)rDoc[&quot;router_version&quot;] ?? 1),
+                          new JProperty(&quot;description&quot;, (string)rDoc[&quot;description&quot;] ?? &quot;&quot;),
+                          new JProperty(&quot;strategy_types&quot;, rDoc[&quot;strategy_types&quot;] ?? new JArray()),
+                          new JProperty(&quot;condition_fields&quot;, rDoc[&quot;condition_fields&quot;] ?? new JArray()),
+                          new JProperty(&quot;candidate_models&quot;, rDoc[&quot;candidate_models&quot;] ?? new JArray())
+                        );
+                        routerItems.Add(item);
+                      }
                     }
                     foreach (var rItem in routerItems.OrderBy(x =&gt; (string)x[&quot;id&quot;], StringComparer.OrdinalIgnoreCase)) {
                       merged.Add(rItem);
@@ -689,30 +744,45 @@ _INBOUND_ROUTER_ENGINE_XML = r"""<inbound>
                   string rawSubId = context.Subscription != null ? (context.Subscription.Id ?? &quot;&quot;) : &quot;&quot;;
                   int subSlash = rawSubId.LastIndexOf('/');
                   string subKeyId = (subSlash &gt;= 0 ? rawSubId.Substring(subSlash + 1) : rawSubId).Trim().ToLowerInvariant();
-                  if (hasPersonAuth) {
-                    if (string.IsNullOrEmpty(callerEmail)) {
-                      return new JObject(new JProperty(&quot;access_denied&quot;, true)).ToString(Newtonsoft.Json.Formatting.None);
-                    }
-                    if (routerDoc[&quot;assigned_user_ids&quot;] is JArray assignedArr) {
-                      string ownerEmail = ((string)routerDoc[&quot;owner_email&quot;] ?? &quot;&quot;).Trim().ToLowerInvariant();
+                  var candidateRouterDocs = new List&lt;JObject&gt;() { routerDoc };
+                  var altDocsStr = (string)entity[&quot;AlternateDocuments&quot;];
+                  if (!string.IsNullOrEmpty(altDocsStr)) {
+                    try {
+                      var altArr = JArray.Parse(altDocsStr);
+                      foreach (var altTok in altArr) {
+                        var altObj = altTok as JObject;
+                        if (altObj != null) { candidateRouterDocs.Add(altObj); }
+                        else if (altTok != null &amp;&amp; altTok.Type == JTokenType.String &amp;&amp; !string.IsNullOrEmpty((string)altTok)) {
+                          candidateRouterDocs.Add(JObject.Parse((string)altTok));
+                        }
+                      }
+                    } catch {}
+                  }
+                  JObject authorizedDoc = null;
+                  foreach (var candDoc in candidateRouterDocs) {
+                    if (hasPersonAuth) {
+                      if (string.IsNullOrEmpty(callerEmail)) { continue; }
+                      var assignedArr = candDoc[&quot;assigned_user_ids&quot;] as JArray;
+                      string ownerEmail = ((string)candDoc[&quot;owner_email&quot;] ?? &quot;&quot;).Trim().ToLowerInvariant();
                       bool userAllowed = (!string.IsNullOrEmpty(ownerEmail) &amp;&amp; string.Equals(ownerEmail, callerEmail, StringComparison.OrdinalIgnoreCase))
-                        || assignedArr.Values&lt;string&gt;().Any(u =&gt; string.Equals((u ?? &quot;&quot;).Trim(), callerEmail, StringComparison.OrdinalIgnoreCase));
-                      if (!userAllowed) {
-                        return new JObject(new JProperty(&quot;access_denied&quot;, true)).ToString(Newtonsoft.Json.Formatting.None);
+                        || (assignedArr != null &amp;&amp; assignedArr.Values&lt;string&gt;().Any(u =&gt; string.Equals((u ?? &quot;&quot;).Trim(), callerEmail, StringComparison.OrdinalIgnoreCase)));
+                      if (userAllowed) {
+                        authorizedDoc = candDoc;
+                        break;
                       }
-                    }
-                  } else {
-                    if (string.IsNullOrEmpty(subKeyId)) {
-                      return new JObject(new JProperty(&quot;access_denied&quot;, true)).ToString(Newtonsoft.Json.Formatting.None);
-                    }
-                    if (routerDoc[&quot;allowed_subscription_ids&quot;] is JArray allowedSubs) {
-                      if (!allowedSubs.Values&lt;string&gt;().Any(s =&gt; string.Equals((s ?? &quot;&quot;).Trim(), subKeyId, StringComparison.OrdinalIgnoreCase))) {
-                        return new JObject(new JProperty(&quot;access_denied&quot;, true)).ToString(Newtonsoft.Json.Formatting.None);
+                    } else {
+                      if (string.IsNullOrEmpty(subKeyId)) { continue; }
+                      var allowedSubs = candDoc[&quot;allowed_subscription_ids&quot;] as JArray;
+                      if (allowedSubs != null &amp;&amp; allowedSubs.Values&lt;string&gt;().Any(s =&gt; string.Equals((s ?? &quot;&quot;).Trim(), subKeyId, StringComparison.OrdinalIgnoreCase))) {
+                        authorizedDoc = candDoc;
+                        break;
                       }
-                    } else if (subKeyId == &quot;master&quot; || subKeyId.EndsWith(&quot;dashboard&quot;, StringComparison.OrdinalIgnoreCase) || subKeyId.EndsWith(&quot;-publisher-probe&quot;, StringComparison.OrdinalIgnoreCase)) {
-                      return new JObject(new JProperty(&quot;access_denied&quot;, true)).ToString(Newtonsoft.Json.Formatting.None);
                     }
                   }
+                  if (authorizedDoc == null) {
+                    return new JObject(new JProperty(&quot;access_denied&quot;, true)).ToString(Newtonsoft.Json.Formatting.None);
+                  }
+                  routerDoc = authorizedDoc;
                   string consumerKey = (!string.IsNullOrEmpty(callerEmail)
                     ? callerEmail
                     : (!string.IsNullOrEmpty(subKeyId) ? subKeyId : &quot;anonymous&quot;)).ToLowerInvariant();

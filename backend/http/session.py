@@ -335,11 +335,9 @@ def _authenticate_subscription_key(
         app_id_str
         or uuid5(NAMESPACE_URL, f"turnstile-subscription:{apim_sub_id or 'default'}")
     )
-    owner_email = str(
-        (app_row or {}).get("owner_id")
-        or (app_row or {}).get("created_by")
-        or ""
-    ).strip()
+    raw_owner = str((app_row or {}).get("owner_id") or "").strip()
+    raw_creator = str((app_row or {}).get("created_by") or "").strip()
+    owner_email = raw_owner or (raw_creator if "@" in raw_creator else "")
     effective_email = (
         owner_email
         or f"{apim_sub_id or 'application'}@applications.turnstile.local"

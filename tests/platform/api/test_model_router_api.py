@@ -3595,3 +3595,389 @@ def test_audit_fixes_start_node_partial_candidates_sub_key_bounds_and_trace_pagi
     assert dec_usage is not None
     assert dec_usage["price_context_tier"] == "short"
 
+
+def test_router_security_audit_spoofing_failclosed_and_same_name_isolation(
+    router_repository: tuple[InMemoryRepository, dict[str, SessionIdentity]],
+) -> None:
+    import json as json_mod
+
+    import httpx
+
+    from backend.http.dependencies import get_repository
+    from backend.http.session import get_auth_store
+    from tests.platform.api.api_support import StubAuthStore
+    from turnstile_core.domain.model_router import ModelRouter
+    from turnstile_core.integrations.apim_router_global_policy import (
+        build_router_global_service_policy,
+    )
+    from turnstile_core.integrations.router_table_projection import (
+        RouterTableProjector,
+        _resolve_allowed_subscription_ids_for_router,
+        build_router_table_document,
+        router_row_key,
+    )
+
+    repository, _ = router_repository
+    enabled_models = [row for row in repository.models if row["enabled"]]
+    first_model = UUID(str(enabled_models[0]["id"]))
+    second_model = UUID(str(enabled_models[1]["id"]))
+    third_model = UUID(str(enabled_models[2]["id"]))
+
+    definition = {
+        "schema_version": 2,
+        "default_model_id": str(first_model),
+        "nodes": [
+            {
+                "id": "start",
+                "type": "start",
+                "label": "Start",
+                "position": {"x": 40, "y": 160},
+            },
+            {
+                "id": "pool",
+                "type": "candidate_models",
+                "label": "Pool",
+                "position": {"x": 240, "y": 160},
+                "candidates": [{"model_id": str(first_model)}],
+            },
+            {
+                "id": "strat",
+                "type": "strategy",
+                "label": "Priority",
+                "position": {"x": 460, "y": 160},
+                "strategy_type": "priority",
+                "model_configs": [
+                    {"model_id": str(first_model), "priority": 1, "weight": 100}
+                ],
+            },
+            {
+                "id": "out",
+                "type": "output",
+                "label": "Output",
+                "position": {"x": 680, "y": 160},
+            },
+        ],
+        "edges": [
+            {"id": "e1", "source": "start", "target": "pool"},
+            {"id": "e2", "source": "pool", "target": "strat"},
+            {"id": "e3", "source": "strat", "target": "out"},
+        ],
+    }
+
+    created_resp = client.post(
+        "/api/v1/model-routers",
+        json={"name": "Shared Team Router", "definition": definition},
+    )
+    assert created_resp.status_code == 201
+    owner_router_id = UUID(created_resp.json()["id"])
+    pub_resp = client.post(f"/api/v1/model-routers/{owner_router_id}/publish")
+    assert pub_resp.status_code == 200
+    owner_router = ModelRouter.model_validate(pub_resp.json())
+
+    # 1. Audit #1: Client-supplied _router_authorized_id cannot bypass model policy
+    repository.user_model_policies["restricted@contoso.com"] = {
+        "user_id": "restricted@contoso.com",
+        "model_ids": [third_model],
+        "updated_at": datetime.now(UTC),
+        "updated_by": "owner@contoso.com",
+    }
+    app.dependency_overrides[require_authenticated_session] = lambda: identity(
+        MEMBER_ID, "restricted@contoso.com", role="member"
+    )
+    try:
+        spoof_chat = client.post(
+            "/api/v1/model-gateway/chat/completions",
+            json={
+                "model": str(enabled_models[0]["model_key"]),
+                "messages": [{"role": "user", "content": "Spoof attempt"}],
+                "router_context": {
+                    "_router_authorized_id": str(owner_router_id),
+                    "subscription_key_authenticated": True,
+                },
+            },
+        )
+        assert spoof_chat.status_code == 403
+
+        spoof_invoke = client.post(
+            "/api/v1/model-gateway/invoke",
+            json={
+                "runtime_id": str(enabled_models[0]["runtime_id"]),
+                "model_id": str(first_model),
+                "messages": [{"role": "user", "content": "Spoof invoke attempt"}],
+                "router_context": {
+                    "_router_authorized_id": str(owner_router_id),
+                    "subscription_key_authenticated": True,
+                },
+                "metadata": {
+                    "organization_id": "org-1",
+                    "organization": "Org 1",
+                    "department_id": "dept-1",
+                    "department": "Dept 1",
+                    "project_id": "proj-1",
+                    "project": "Proj 1",
+                    "user_id": "restricted@contoso.com",
+                    "user": "Restricted User",
+                    "agent_id": "agent-1",
+                    "agent": "Agent 1",
+                    "workflow": "test",
+                    "run_id": "run-spoof-1",
+                    "turn_index": 1,
+                    "model_id": str(first_model),
+                    "model": str(enabled_models[0]["model_key"]),
+                    "runtime": "foundry",
+                    "request_source": "sdk",
+                },
+            },
+        )
+        assert spoof_invoke.status_code == 403
+    finally:
+        app.dependency_overrides[require_authenticated_session] = lambda: identity(
+            OWNER_ID, "owner@contoso.com"
+        )
+
+    # 2. Audit #2: _resolve_allowed_subscription_ids_for_router fails closed on error,
+    #    and discovered shared APIM applications (no user email owner) are supported.
+    class BrokenAppsRepo:
+        def list_gateway_applications(self) -> list[dict[str, object]]:
+            raise RuntimeError("DB transient failure")
+
+        def list_gateway_application_subscriptions(
+            self, app_ids: object
+        ) -> list[dict[str, object]]:
+            del app_ids
+            return []
+
+    assert (
+        _resolve_allowed_subscription_ids_for_router(
+            owner_router, [], BrokenAppsRepo()
+        )
+        == []
+    )
+    built_doc = build_router_table_document(
+        owner_router, repository.registry(), allowed_subscription_ids=None
+    )
+    assert built_doc is not None
+    assert built_doc["allowed_subscription_ids"] == []
+
+    policy_xml = build_router_global_service_policy(
+        "<policies><inbound></inbound><backend><forward-request /></backend>"
+        "<outbound></outbound><on-error></on-error></policies>",
+        ledger_table_endpoint="https://example-storage.table.core.windows.net",
+        ledger_table_name="ExampleLedgerTable",
+        api_id="example-llm-api",
+    )
+    assert "allowedSubs == null" in policy_xml
+    assert "AlternateDocuments" in policy_xml
+    assert 'set-header name="Authorization" exists-action="delete"' in policy_xml
+
+    # Shared discovered APIM app (owner_id=None, created_by=64-hex service actor)
+    gateway_id = UUID(str(repository.gateways[0]["id"]))
+    shared_app_id = UUID("00000000-0000-4000-8000-000000000891")
+    shared_sub_id = UUID("00000000-0000-4000-8000-000000000892")
+    shared_key = "sub-key-outline-shared-891"
+    now = datetime.now(UTC)
+    repository.gateway_applications.append(
+        {
+            "id": shared_app_id,
+            "gateway_profile_id": gateway_id,
+            "slug": "outline-assistant",
+            "display_name": "Outline Assistant",
+            "description": None,
+            "owner_id": None,
+            "department_id": None,
+            "application_type": "agent",
+            "status": "active",
+            "system_managed": False,
+            "created_by": "7f42edb5530de70da9b89a8149416e8709b38354cbd42803cb88875c24122024",
+            "created_at": now,
+            "updated_by": "7f42edb5530de70da9b89a8149416e8709b38354cbd42803cb88875c24122024",
+            "updated_at": now,
+        }
+    )
+    repository.gateway_application_model_policies[shared_app_id] = {
+        "application_id": shared_app_id,
+        "updated_at": now,
+        "updated_by": "owner@contoso.com",
+    }
+    repository.gateway_application_model_access[shared_app_id] = {
+        first_model,
+        second_model,
+    }
+    repository.gateway_application_subscriptions.append(
+        {
+            "id": shared_sub_id,
+            "application_id": shared_app_id,
+            "gateway_profile_id": gateway_id,
+            "apim_subscription_id": "outline-assistant",
+            "display_name": "Outline Assistant",
+            "scope_type": "api",
+            "scope_id": "/apis/turnstile-llm",
+            "state": "active",
+            "scope_exists": True,
+            "source": "discovered",
+            "discovered_at": now,
+            "last_synced_at": now,
+            "primary_key": shared_key,
+        }
+    )
+    resolved_subs = _resolve_allowed_subscription_ids_for_router(
+        owner_router, [], repository
+    )
+    assert "outline-assistant" in resolved_subs
+
+    app.dependency_overrides[get_repository] = lambda: repository
+    app.dependency_overrides[get_auth_store] = StubAuthStore
+    app.dependency_overrides.pop(require_authenticated_session, None)
+    client.cookies.clear()
+    try:
+        shared_models = client.get(
+            "/v1/models",
+            headers={"Ocp-Apim-Subscription-Key": shared_key},
+        )
+        assert shared_models.status_code == 200
+        shared_router_ids = [
+            item["router_id"]
+            for item in shared_models.json()["data"]
+            if item["type"] == "model_router"
+        ]
+        assert str(owner_router_id) in shared_router_ids
+    finally:
+        app.dependency_overrides[require_authenticated_session] = lambda: identity(
+            OWNER_ID, "owner@contoso.com"
+        )
+
+    # 3. Audit #3: Cross-owner same-name routers preserve and isolate Table entities
+    second_owner_id = UUID("00000000-0000-4000-8000-000000000777")
+    app.dependency_overrides[require_authenticated_session] = lambda: identity(
+        second_owner_id, "second-owner@contoso.com"
+    )
+    try:
+        second_created = client.post(
+            "/api/v1/model-routers",
+            json={
+                "name": "Shared Team Router",
+                "definition": {
+                    **definition,
+                    "default_model_id": str(second_model),
+                    "nodes": [
+                        {
+                            "id": "start",
+                            "type": "start",
+                            "label": "Start",
+                            "position": {"x": 40, "y": 160},
+                        },
+                        {
+                            "id": "pool",
+                            "type": "candidate_models",
+                            "label": "Pool",
+                            "position": {"x": 240, "y": 160},
+                            "candidates": [{"model_id": str(second_model)}],
+                        },
+                        {
+                            "id": "strat",
+                            "type": "strategy",
+                            "label": "Priority",
+                            "position": {"x": 460, "y": 160},
+                            "strategy_type": "priority",
+                            "model_configs": [
+                                {
+                                    "model_id": str(second_model),
+                                    "priority": 1,
+                                    "weight": 100,
+                                }
+                            ],
+                        },
+                        {
+                            "id": "out",
+                            "type": "output",
+                            "label": "Output",
+                            "position": {"x": 680, "y": 160},
+                        },
+                    ],
+                },
+            },
+        )
+        assert second_created.status_code == 201
+        second_router_id = UUID(second_created.json()["id"])
+        second_pub = client.post(f"/api/v1/model-routers/{second_router_id}/publish")
+        assert second_pub.status_code == 200
+        second_router = ModelRouter.model_validate(second_pub.json())
+    finally:
+        app.dependency_overrides[require_authenticated_session] = lambda: identity(
+            OWNER_ID, "owner@contoso.com"
+        )
+
+    table_store: dict[str, dict[str, object]] = {}
+
+    class FakeTokenProvider:
+        def token(self, scope: str = "https://storage.azure.com/") -> str:
+            del scope
+            return "fake-token"
+
+    def table_handler(request: httpx.Request) -> httpx.Response:
+        from urllib.parse import unquote
+
+        url_str = unquote(str(request.url))
+        rk = ""
+        if "RowKey='" in url_str:
+            rk = url_str.split("RowKey='", 1)[1].split("'", 1)[0]
+        if request.method == "GET":
+            if rk:
+                ent = table_store.get(rk)
+                return (
+                    httpx.Response(200, json=ent)
+                    if ent is not None
+                    else httpx.Response(404)
+                )
+            return httpx.Response(200, json={"value": list(table_store.values())})
+        if request.method == "PUT" and rk:
+            table_store[rk] = json_mod.loads(request.content.decode("utf-8"))
+            return httpx.Response(204)
+        if request.method == "DELETE" and rk:
+            table_store.pop(rk, None)
+            return httpx.Response(204)
+        return httpx.Response(200)
+
+    projector = RouterTableProjector(
+        "https://example-storage.table.core.windows.net",
+        "ExampleLedgerTable",
+        token_provider=FakeTokenProvider(),  # type: ignore[arg-type]
+    )
+    orig_client = httpx.Client
+
+    def mock_table_client(*args: object, **kwargs: object) -> httpx.Client:
+        del args, kwargs
+        return orig_client(transport=httpx.MockTransport(table_handler))
+
+    httpx.Client = mock_table_client  # type: ignore[misc,assignment]
+    try:
+        assert projector.upsert_router(owner_router, repository.registry())
+        assert projector.upsert_router(second_router, repository.registry())
+        shared_rk = router_row_key("Shared Team Router")
+        assert shared_rk in table_store
+        shared_entity = table_store[shared_rk]
+        assert "AlternateDocuments" in shared_entity
+        alt_docs = json_mod.loads(str(shared_entity["AlternateDocuments"]))
+        assert len(alt_docs) == 1
+        assert alt_docs[0]["router_id"] == str(owner_router.id)
+
+        # Deleting a third owner's unpublished draft with the same name must not touch the entity
+        projector.delete_router(
+            UUID("00000000-0000-4000-8000-000000000999"), "Shared Team Router"
+        )
+        assert shared_rk in table_store
+        assert "AlternateDocuments" in table_store[shared_rk]
+
+        # Deleting second_router promotes owner_router back to primary Document
+        projector.delete_router(second_router.id, "Shared Team Router")
+        assert shared_rk in table_store
+        restored_entity = table_store[shared_rk]
+        assert restored_entity["RouterId"] == str(owner_router.id)
+        restored_doc = json_mod.loads(str(restored_entity["Document"]))
+        assert restored_doc["router_id"] == str(owner_router.id)
+        assert "AlternateDocuments" not in restored_entity
+        assert router_row_key(str(second_router.id)) not in table_store
+        assert router_row_key(str(owner_router.id)) in table_store
+    finally:
+        httpx.Client = orig_client  # type: ignore[misc,assignment]
+

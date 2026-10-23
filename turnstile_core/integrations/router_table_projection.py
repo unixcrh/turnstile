@@ -293,15 +293,14 @@ def build_router_table_document(
         "candidates_by_id": candidates_by_id,
         "routing_models_by_id": routing_models_by_id,
         "definition": router.definition.model_dump(mode="json"),
-    }
-    if allowed_subscription_ids is not None:
-        doc_payload["allowed_subscription_ids"] = sorted(
+        "allowed_subscription_ids": sorted(
             {
                 str(sid).strip().lower()
-                for sid in allowed_subscription_ids
+                for sid in (allowed_subscription_ids or ())
                 if str(sid).strip()
             }
-        )
+        ),
+    }
     return doc_payload
 
 
@@ -309,12 +308,12 @@ def _resolve_allowed_subscription_ids_for_router(
     router: ModelRouter,
     assigned_user_ids: Sequence[str],
     repository: Any,
-) -> list[str] | None:
+) -> list[str]:
     list_apps = getattr(repository, "list_gateway_applications", None)
     list_subs = getattr(repository, "list_gateway_application_subscriptions", None)
     list_access = getattr(repository, "list_gateway_application_model_access", None)
     if not (callable(list_apps) and callable(list_subs)):
-        return None
+        return []
     try:
         apps = list(list_apps())
         owner_email = (
@@ -352,12 +351,10 @@ def _resolve_allowed_subscription_ids_for_router(
         allowed_app_ids: set[str] = set()
         for app in active_apps:
             aid = str(app["id"]).lower()
-            app_owner = (
-                str(app.get("owner_id") or app.get("created_by") or "")
-                .strip()
-                .lower()
-            )
-            if not app_owner or app_owner not in authorized_users:
+            raw_owner = str(app.get("owner_id") or "").strip().lower()
+            raw_creator = str(app.get("created_by") or "").strip().lower()
+            app_owner = raw_owner or (raw_creator if "@" in raw_creator else "")
+            if app_owner and app_owner not in authorized_users:
                 continue
             if aid in configured_apps:
                 allowed_models = access_by_app.get(aid, set())
@@ -376,7 +373,12 @@ def _resolve_allowed_subscription_ids_for_router(
                     allowed_subs.append(apim_sub)
         return sorted(allowed_subs)
     except Exception:
-        return None
+        logger.warning(
+            "Failed to resolve allowed_subscription_ids for router %s; failing closed",
+            router.id,
+            exc_info=True,
+        )
+        return []
 
 
 class RouterTableProjector:
@@ -411,6 +413,40 @@ class RouterTableProjector:
         rk = quote(row_key.replace("'", "''"), safe="")
         return f"{self._endpoint}/{self._table}(PartitionKey='{pk}',RowKey='{rk}')"
 
+    @staticmethod
+    def _parse_entity_documents(entity: Mapping[str, Any]) -> list[dict[str, Any]]:
+        docs_by_id: dict[str, dict[str, Any]] = {}
+        raw_primary = entity.get("Document")
+        if isinstance(raw_primary, str) and raw_primary.strip():
+            try:
+                parsed = json.loads(raw_primary)
+                if isinstance(parsed, dict) and parsed.get("router_id"):
+                    docs_by_id[str(parsed["router_id"]).strip().lower()] = parsed
+            except Exception:
+                pass
+        raw_alt = entity.get("AlternateDocuments")
+        if isinstance(raw_alt, str) and raw_alt.strip():
+            try:
+                alt_list = json.loads(raw_alt)
+                if isinstance(alt_list, list):
+                    for item in alt_list:
+                        parsed_item = (
+                            json.loads(item)
+                            if isinstance(item, str)
+                            else item
+                            if isinstance(item, dict)
+                            else None
+                        )
+                        if (
+                            isinstance(parsed_item, dict)
+                            and parsed_item.get("router_id")
+                        ):
+                            rid = str(parsed_item["router_id"]).strip().lower()
+                            docs_by_id.setdefault(rid, parsed_item)
+            except Exception:
+                pass
+        return list(docs_by_id.values())
+
     def upsert_router(
         self,
         router: ModelRouter,
@@ -418,6 +454,7 @@ class RouterTableProjector:
         *,
         assigned_user_ids: Sequence[str] = (),
         allowed_subscription_ids: Sequence[str] | None = None,
+        active_router_ids: set[str] | None = None,
     ) -> bool:
         doc = build_router_table_document(
             router,
@@ -430,13 +467,36 @@ class RouterTableProjector:
             return False
         doc_json = json.dumps(doc, separators=(",", ":"), sort_keys=True)
         doc_sha = _sha256_hex(doc_json)
-        entries = (
-            (router_row_key(router.name), True),
-            (router_row_key(str(router.id)), False),
-        )
+        name_rk = router_row_key(router.name)
+        id_rk = router_row_key(str(router.id))
+        target_id = str(router.id).strip().lower()
         with httpx.Client(timeout=self._timeout) as client:
-            for rk, is_primary in entries:
-                payload = {
+            other_docs: list[dict[str, Any]] = []
+            try:
+                existing_resp = client.get(
+                    self._entity_url(ROUTER_CATALOG_PARTITION, name_rk),
+                    headers=self._headers(),
+                )
+                if existing_resp.status_code == 200:
+                    for existing_doc in self._parse_entity_documents(
+                        existing_resp.json()
+                    ):
+                        existing_id = (
+                            str(existing_doc.get("router_id") or "").strip().lower()
+                        )
+                        if not existing_id or existing_id == target_id:
+                            continue
+                        if (
+                            active_router_ids is not None
+                            and existing_id not in active_router_ids
+                        ):
+                            continue
+                        other_docs.append(existing_doc)
+            except Exception:
+                other_docs = []
+
+            for rk, is_primary in ((name_rk, True), (id_rk, False)):
+                payload: dict[str, Any] = {
                     "PartitionKey": ROUTER_CATALOG_PARTITION,
                     "RowKey": rk,
                     "SchemaVersion": 2,
@@ -448,6 +508,10 @@ class RouterTableProjector:
                     "Document": doc_json,
                     "Sha256": doc_sha,
                 }
+                if is_primary and other_docs:
+                    payload["AlternateDocuments"] = json.dumps(
+                        other_docs, separators=(",", ":"), sort_keys=True
+                    )
                 resp = client.put(
                     self._entity_url(ROUTER_CATALOG_PARTITION, rk),
                     headers=self._headers(write=True),
@@ -457,23 +521,89 @@ class RouterTableProjector:
         return True
 
     def delete_router(self, router_id: UUID | str, router_name: str | None = None) -> None:
-        row_keys = {router_row_key(str(router_id))}
-        if router_name:
-            row_keys.add(router_row_key(router_name))
+        target_id = str(router_id).strip().lower()
+        id_rk = router_row_key(str(router_id))
         with httpx.Client(timeout=self._timeout) as client:
-            for rk in row_keys:
-                headers = {**self._headers(), "If-Match": "*"}
-                resp = client.delete(
-                    self._entity_url(ROUTER_CATALOG_PARTITION, rk),
-                    headers=headers,
-                )
-                if resp.status_code not in {200, 204, 404}:
-                    resp.raise_for_status()
+            headers = {**self._headers(), "If-Match": "*"}
+            resp = client.delete(
+                self._entity_url(ROUTER_CATALOG_PARTITION, id_rk),
+                headers=headers,
+            )
+            if resp.status_code not in {200, 204, 404}:
+                resp.raise_for_status()
+            if not router_name:
+                return
+            name_rk = router_row_key(router_name)
+            get_resp = client.get(
+                self._entity_url(ROUTER_CATALOG_PARTITION, name_rk),
+                headers=self._headers(),
+            )
+            if get_resp.status_code == 404:
+                return
+            if get_resp.status_code == 200:
+                entity = get_resp.json()
+                existing_docs = self._parse_entity_documents(entity)
+                remaining_docs = [
+                    d
+                    for d in existing_docs
+                    if str(d.get("router_id") or "").strip().lower() != target_id
+                ]
+                entity_router_id = str(entity.get("RouterId") or "").strip().lower()
+                if remaining_docs:
+                    if (
+                        len(remaining_docs) != len(existing_docs)
+                        or entity_router_id == target_id
+                    ):
+                        primary_doc = remaining_docs[0]
+                        alt_docs = remaining_docs[1:]
+                        primary_json = json.dumps(
+                            primary_doc, separators=(",", ":"), sort_keys=True
+                        )
+                        replacement: dict[str, Any] = {
+                            "PartitionKey": ROUTER_CATALOG_PARTITION,
+                            "RowKey": name_rk,
+                            "SchemaVersion": 2,
+                            "PrimaryEntry": True,
+                            "RouterId": str(primary_doc["router_id"]),
+                            "RouterName": str(
+                                primary_doc.get("router_name") or router_name
+                            ),
+                            "RouterVersion": int(
+                                primary_doc.get("router_version") or 1
+                            ),
+                            "Status": "published",
+                            "Document": primary_json,
+                            "Sha256": _sha256_hex(primary_json),
+                        }
+                        if alt_docs:
+                            replacement["AlternateDocuments"] = json.dumps(
+                                alt_docs, separators=(",", ":"), sort_keys=True
+                            )
+                        put_resp = client.put(
+                            self._entity_url(ROUTER_CATALOG_PARTITION, name_rk),
+                            headers=self._headers(write=True),
+                            json=replacement,
+                        )
+                        put_resp.raise_for_status()
+                    return
+                if entity_router_id and entity_router_id != target_id:
+                    return
+            del_resp = client.delete(
+                self._entity_url(ROUTER_CATALOG_PARTITION, name_rk),
+                headers=headers,
+            )
+            if del_resp.status_code not in {200, 204, 404}:
+                del_resp.raise_for_status()
 
     def sync_all_published_routers(self, repository: Any) -> int:
         registry = repository.registry()
         published_rows = list(repository.list_published_model_routers())
         active_row_keys: set[str] = set()
+        active_router_ids = {
+            str(row["id"]).strip().lower()
+            for row in published_rows
+            if row.get("id") is not None
+        }
         projected = 0
         list_assignees = getattr(repository, "list_model_router_assignees", None)
         for row in published_rows:
@@ -491,6 +621,7 @@ class RouterTableProjector:
                 registry,
                 assigned_user_ids=assignees,
                 allowed_subscription_ids=allowed_subs,
+                active_router_ids=active_router_ids,
             ):
                 active_row_keys.add(router_row_key(router.name))
                 active_row_keys.add(router_row_key(str(router.id)))

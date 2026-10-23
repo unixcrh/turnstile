@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -9,6 +10,8 @@ from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal, localcontext
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
+
+from ..domain.model_router_v3 import RouterSpecV3
 
 
 def _managed_model_request_revision(
@@ -888,6 +891,17 @@ def model_router_v3_view(router: Mapping[str, Any]) -> dict[str, Any]:
     row["compiled_plan"] = deepcopy(plan)
     row["has_unpublished_changes"] = published is None or published != draft
     return row
+
+
+def router_v3_spec_sha256(spec: Mapping[str, Any]) -> str:
+    canonical = RouterSpecV3.model_validate(spec).model_dump(mode="json")
+    encoded = json.dumps(
+        canonical,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 ROUTER_ATTEMPT_PRICE_FIELDS = (

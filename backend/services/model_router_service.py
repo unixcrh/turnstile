@@ -642,7 +642,11 @@ class ModelRouterExecutionService:
             UUID(str(row["id"])): dict(row)
             for row in self._repository.list_assigned_model_routers(user_id)
         }
-        if include_published and not rows_by_id:
+        if (
+            include_published
+            and not rows_by_id
+            and user_id.strip().lower().endswith("@applications.turnstile.local")
+        ):
             for row in self._repository.list_published_model_routers():
                 rows_by_id.setdefault(UUID(str(row["id"])), dict(row))
         if allowed_model_ids is None:
@@ -664,7 +668,11 @@ class ModelRouterExecutionService:
         allowed_model_ids: set[UUID] | None = None,
     ) -> dict[str, Any] | None:
         row = self._repository.get_callable_model_router(router_id, user_id)
-        if row is None and include_published:
+        if (
+            row is None
+            and include_published
+            and user_id.strip().lower().endswith("@applications.turnstile.local")
+        ):
             row = self._repository.get_published_model_router(router_id)
         if row is None:
             return None

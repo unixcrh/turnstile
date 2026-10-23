@@ -1853,9 +1853,13 @@ def list_gateway_models(
         response.headers["x-apim-subscription-id"] = identity.apim_subscription_id
     if identity.application_id:
         response.headers["x-application-id"] = identity.application_id
+    include_published_routers = (
+        identity.method == "subscription_key"
+        and identity.email.lower().endswith("@applications.turnstile.local")
+    )
     return router_service.list_gateway_models(
         requested_user,
-        include_published_routers=False,
+        include_published_routers=include_published_routers,
         allowed_model_ids=allowed_models,
     )
 
@@ -2010,7 +2014,11 @@ def chat_completions(
         )
     except ValueError:
         turn_index = 1
-    router_context = dict(request.router_context)
+    router_context = {
+        key: value
+        for key, value in request.router_context.items()
+        if not key.startswith("_") and key != "subscription_key_authenticated"
+    }
     if interaction_id:
         router_context["interaction_id"] = interaction_id
     if session_id:
@@ -2305,6 +2313,20 @@ def _bind_invocation_identity(
                 "metadata": request.metadata.model_copy(
                     update={"user_id": effective_user_id, "user": effective_user_name}
                 )
+            }
+        )
+    if isinstance(request, ModelInvocationRequest) and any(
+        key.startswith("_") or key == "subscription_key_authenticated"
+        for key in request.router_context
+    ):
+        request = request.model_copy(
+            update={
+                "router_context": {
+                    key: value
+                    for key, value in request.router_context.items()
+                    if not key.startswith("_")
+                    and key != "subscription_key_authenticated"
+                }
             }
         )
     return request

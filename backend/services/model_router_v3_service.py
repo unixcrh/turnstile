@@ -132,7 +132,11 @@ class ModelRouterV3Service:
             validation.compiled_plan.model_dump(mode="json"),
         )
         if row is None:
-            raise ModelRouterNotFoundError("Model router v3 not found")
+            if self._repository.get_model_router_v3(router_id, owner_id) is None:
+                raise ModelRouterNotFoundError("Model router v3 not found")
+            raise ModelRouterConflictError(
+                "Model router v3 draft changed during compilation; retry publish"
+            )
         return ModelRouterV3.model_validate(row)
 
     def disable(

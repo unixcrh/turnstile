@@ -371,9 +371,6 @@ export const finopsQueries = {
     queryFn: () => dataSource.gatewayApplication(id!),
     enabled: Boolean(id),
     ...cachePolicies.aggregate,
-    staleTime: 0,
-    refetchOnMount: "always",
-    refetchOnWindowFocus: "always",
     refetchIntervalInBackground: true,
     refetchInterval: (query) => {
       const budget = query.state.data?.budget
