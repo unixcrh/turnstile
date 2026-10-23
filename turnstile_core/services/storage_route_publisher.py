@@ -2807,14 +2807,45 @@ class FixedRoutePublisherFactory:
                 raise PolicyCompilationError("Fixed route base head changed in Storage")
             if migration is not None and port.projection.read_writer() is not None:
                 raise PolicyCompilationError("Fixed route migration partition already has a writer")
-            proof = port._verifier.verify()
             from .route_publication import pool_member_bindings
 
-            if any(
+            has_deployment_override = any(
                 source.model.upstream_model_id != binding.model.upstream_model_id
                 for binding in publication.desired_spec.bindings
                 for source in pool_member_bindings(binding)
+            )
+            observed_proof = (
+                port.projection.read_program_proof(installation.program)
+                if migration is None
+                else None
+            )
+            now_epoch = self._clock()
+            if (
+                observed_proof is not None
+                and observed_proof[0].identity == installation.program
+                and observed_proof[0].issued_epoch <= now_epoch
+                and observed_proof[0].expires_epoch > now_epoch + 30
             ):
+                proof = observed_proof[0]
+            else:
+                proof = port._verifier.verify()
+                if migration is None:
+                    latest_proof = (
+                        observed_proof
+                        if observed_proof is not None
+                        else port.projection.read_program_proof(installation.program)
+                    )
+                    port.projection.publish_program_proof(
+                        proof,
+                        installation.program,
+                        latest_proof[1] if latest_proof is not None else None,
+                        self._clock(),
+                    )
+            if has_deployment_override:
+                if port._verifier._verified_parent is None:
+                    port._verifier._verified_parent = management.revision_api_policy(
+                        installation.program.api_revision,
+                    )
                 port._verifier.require_deployment_pool_reader()
                 from ..integrations.gateway_connection_probe import verify_pool_deployment_observer
 
@@ -2878,17 +2909,34 @@ class FixedRoutePublisherFactory:
                 raise PolicyCompilationError(
                     "Route dependency preparation changed after checkpoint",
                 )
-            budgets = self._budget_contracts(publication, previous)
+            registry = self._repository.registry()
+            budgets = self._budget_contracts(publication, previous, registry)
             heartbeat()
-            return build_route_publication_task(
+            task = build_route_publication_task(
                 publication, installation.program, proof, previous_head,
                 snapshot.routes if snapshot else (),
                 budgets, connections, installation.storage_endpoint, installation.storage_table,
                 installation.target_identity_sha256, self._clock(),
                 previous_members=snapshot.members if snapshot else (),
                 credential_bindings=credentials,
+                configuration_only=(
+                    migration is None and "route_rollback" not in publication.resource_manifest
+                ),
                 previous_program_sha256=previous_program_sha256,
             )
+            if migration is None:
+                runtime_ids = {binding.runtime_id for binding in publication.desired_spec.bindings}
+                self._verified_connections.add(task.context_sha256)
+                self._verified_connections.add(document_digest({
+                    "task": task.context_sha256, "installation": document_digest(installation),
+                    "source": str(dependency_source.id),
+                    "credentials": self._credential_bindings(dependency_source),
+                    "runtime_configurations": {
+                        str(row["id"]): row.get("config") or {}
+                        for row in registry["runtimes"] if row["id"] in runtime_ids
+                    },
+                }))
+            return task
 
     def remove_model(
         self, publication: GatewayPublication, worker_id: str, heartbeat: Callable[[], None],
@@ -3688,6 +3736,14 @@ class FixedRoutePublisherFactory:
         require_route_specification(publication, recorded)
         if task.credential_bindings != self._credential_bindings(publication):
             raise PolicyCompilationError("Route credential bindings changed after preparation")
+        if (
+            (
+                task.configuration_only
+                or "fixed_route_migration" not in publication.resource_manifest
+            )
+            and task.context_sha256 in self._verified_connections
+        ):
+            return
         previous_row = (
             self._repository.get_gateway_publication(publication.base_release_id)
             if publication.base_release_id is not None else None
@@ -3747,19 +3803,20 @@ class FixedRoutePublisherFactory:
             (task.configuration_only or migration is None)
             and verification_key in self._verified_connections
         )
+        if verified:
+            return
         changed_aliases = (
             frozenset(task.plan.changed_aliases)
             if migration is None and "route_rollback" not in publication.resource_manifest
             else None
         )
-        if not verified:
-            self._verify_credentials(
-                publication, dependency_source, installation, changed_aliases=changed_aliases,
-            )
+        self._verify_credentials(
+            publication, dependency_source, installation, changed_aliases=changed_aliases,
+        )
         approved = self.approved_connections(
             publication, installation, management, baseline=baseline,
             initial_migration=migration is not None,
-            verify_readback=not verified,
+            verify_readback=True,
             changed_aliases=changed_aliases,
             registry=registry,
         )
@@ -3768,6 +3825,7 @@ class FixedRoutePublisherFactory:
             raise PolicyCompilationError("Fixed route independent connection approval changed")
         if task.configuration_only or migration is None:
             self._verified_connections.add(verification_key)
+            self._verified_connections.add(task.context_sha256)
 
     def approved_connections(
         self, publication: GatewayPublication, installation: FixedProgramInstallation,
@@ -4187,10 +4245,19 @@ class FixedRoutePublisherPort:
         return proof
 
     def validate_configuration(self, task: RoutePublicationTask) -> ProgramCapabilityProof:
-        if not task.model_addition or not task.configuration_only:
+        if not task.configuration_only:
             raise PolicyCompilationError("Configuration validation requires a model addition")
         proof = self.check(task)
-        for route in task.plan.snapshot.routes:
+        routes = (
+            task.plan.snapshot.routes
+            if task.model_addition or not task.plan.changed_aliases
+            else tuple(
+                route
+                for route in task.plan.snapshot.routes
+                if route.alias in task.plan.changed_aliases
+            )
+        )
+        for route in routes:
             if type(self._prepare_availability(task, route)) is not bool:
                 raise PolicyCompilationError("Route publication availability is unverified")
         self.projection.require_verified_snapshot(task.plan.snapshot, self._clock())

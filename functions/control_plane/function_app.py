@@ -503,14 +503,26 @@ def publish_gateway_changes(timer: func.TimerRequest) -> None:
                 )
                 route_configuration = result.resource_manifest.get("route_configuration")
                 model_removal = "model_route_removal" in result.resource_manifest
+                has_route_progress = (
+                    isinstance(route_configuration, dict)
+                    or model_removal
+                    or any(
+                        field in result.resource_manifest
+                        for field in (
+                            "route_preparation",
+                            "route_credentials",
+                            "route_dependencies",
+                        )
+                    )
+                )
                 advancing = {"queued", "validating", "provisioning", "building_revision"}
                 if (
-                    isinstance(route_configuration, dict)
+                    has_route_progress
                     and "fixed_route_migration" not in result.resource_manifest
-                ) or model_removal:
+                ):
                     advancing |= {"verifying", "promoting"}
                 if (result.status.value not in advancing
-                    or (route_configuration is None and not model_removal)
+                    or not has_route_progress
                     or result.resource_manifest.get("route_last_progress_attempt")
                     != result.attempt_count or monotonic() >= preparation_deadline):
                     break

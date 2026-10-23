@@ -1239,8 +1239,8 @@ class RoutePublicationTask(RouteModel):
 
     @model_validator(mode="after")
     def validate_task(self) -> RoutePublicationTask:
-        if self.configuration_only and not self.model_addition:
-            raise ValueError("CONFIGURATION_PUBLICATION_REQUIRES_MODEL_ADDITION")
+        if self.configuration_only and self.program_migration_sha256 is not None:
+            raise ValueError("CONFIGURATION_PUBLICATION_FORBIDS_PROGRAM_MIGRATION")
         if self.additional_scope_tasks:
             if (not self.model_addition or not self.configuration_only
                     or len({task.plan.program.scope for task in self.scope_tasks})

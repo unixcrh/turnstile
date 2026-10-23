@@ -543,12 +543,16 @@ class TableRouteProjection(TableStorageLedger):
         entity, etag = observed
         return entity_document(entity, self.scope, partition, row, maximum), exact_etag(etag)
 
-    def _stage_entity(self, partition: str, row: str, document: str, maximum: int) -> None:
-        existing = self._read_document(partition, row, maximum)
-        if existing is not None:
-            if existing[0] != document:
-                raise RouteProjectionConflict("ROUTE_IMMUTABLE_ENTITY_CONFLICT")
-            return
+    def _stage_entity(
+        self, partition: str, row: str, document: str, maximum: int,
+        *, check_existing: bool = True,
+    ) -> None:
+        if check_existing:
+            existing = self._read_document(partition, row, maximum)
+            if existing is not None:
+                if existing[0] != document:
+                    raise RouteProjectionConflict("ROUTE_IMMUTABLE_ENTITY_CONFLICT")
+                return
         response = self._request(
             "POST",
             self._endpoint + "/" + self._table,
@@ -864,21 +868,54 @@ class TableRouteProjection(TableStorageLedger):
     def stage_slice(
         self, snapshot: RouteSnapshot, checked_at: int, cursor: int, *, maximum: int = 16,
     ) -> int:
+        from concurrent.futures import ThreadPoolExecutor
+
         entities = self._snapshot_entities(snapshot, checked_at)
         end = self._slice_end(cursor, maximum, len(entities))
-        for partition, row, document, limit in entities[cursor:end]:
-            self._stage_entity(partition, row, document, limit)
+        batch = entities[cursor:end]
+        if len(batch) <= 3:
+            for partition, row, document, limit in batch:
+                self._stage_entity(partition, row, document, limit)
+            return end
+        self._headers()
+
+        def stage_one(item: tuple[str, str, str, int]) -> None:
+            partition, row, document, limit = item
+            self._stage_entity(
+                partition, row, document, limit,
+                check_existing=partition.endswith(":content"),
+            )
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            for _ in pool.map(stage_one, batch):
+                pass
         return end
 
     def verify_slice(
         self, snapshot: RouteSnapshot, checked_at: int, cursor: int, *, maximum: int = 16,
     ) -> int:
+        from concurrent.futures import ThreadPoolExecutor
+
         entities = self._snapshot_entities(snapshot, checked_at)
         end = self._slice_end(cursor, maximum, len(entities))
-        for partition, row, document, limit in entities[cursor:end]:
+        batch = entities[cursor:end]
+        if len(batch) <= 3:
+            for partition, row, document, limit in batch:
+                observed = self._read_document(partition, row, limit)
+                if observed is None or observed[0] != document:
+                    raise RouteProjectionConflict("ROUTE_SNAPSHOT_READBACK_INCOMPLETE")
+            return end
+        self._headers()
+
+        def verify_one(item: tuple[str, str, str, int]) -> None:
+            partition, row, document, limit = item
             observed = self._read_document(partition, row, limit)
             if observed is None or observed[0] != document:
                 raise RouteProjectionConflict("ROUTE_SNAPSHOT_READBACK_INCOMPLETE")
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            for _ in pool.map(verify_one, batch):
+                pass
         return end
 
     @staticmethod

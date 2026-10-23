@@ -2,7 +2,10 @@ import { CircleAlert, ExternalLink, Network, X } from "lucide-react"
 import { useCallback, useEffect, useMemo, useState } from "react"
 
 import type { ManagedModel } from "../../data-sources/apim/types"
-import { DeploymentResilienceEditor } from "./deployment-resilience-editor"
+import {
+  DeploymentResilienceEditor,
+  type PendingBackendPoolSubmission,
+} from "./deployment-resilience-editor"
 import { Button } from "../ui/button"
 import {
   Dialog,
@@ -36,11 +39,13 @@ export function ApimNativeRouteCreateDialog({
   options,
   onClose,
   onCreated,
+  onSubmitted,
 }: {
   open: boolean
   options: NativeRouteModelOption[]
   onClose: () => void
   onCreated: (modelId: string) => void
+  onSubmitted?: (submission: PendingBackendPoolSubmission) => void
 }) {
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -69,6 +74,14 @@ export function ApimNativeRouteCreateDialog({
     if (selectedModelId) onCreated(selectedModelId)
   }, [onCreated, selectedModelId])
 
+  const handleSubmitted = useCallback((submission: PendingBackendPoolSubmission) => {
+    if (onSubmitted) {
+      onSubmitted(submission)
+    } else {
+      onCreated(submission.modelId)
+    }
+  }, [onCreated, onSubmitted])
+
   const modelPicker = <label className="registry-field apim-native-route-model-picker">
     <span className="registry-field-label">模型</span>
     <Select value={selectedModelId} items={modelItems} disabled={busy} onValueChange={value => setSelectedModelId(value)}>
@@ -85,7 +98,7 @@ export function ApimNativeRouteCreateDialog({
   </label>
   const cancel = <Button className="apim-native-route-create-cancel" type="button" variant="outline" disabled={busy} onClick={onClose}>取消</Button>
 
-  return <Dialog open={open} onOpenChange={(nextOpen) => { if (!nextOpen && !busy) onClose() }}>
+  return !open ? null : <Dialog open={open} onOpenChange={(nextOpen) => { if (!nextOpen && !busy) onClose() }}>
     <DialogContent className="registry-editor-dialog apim-native-route-create-dialog" finalFocus={false}>
       <div className="registry-editor">
         <DialogHeader className="registry-editor-header">
@@ -96,6 +109,7 @@ export function ApimNativeRouteCreateDialog({
         {selectedModel ? <DeploymentResilienceEditor
           key={selectedModel.id}
           model={selectedModel}
+          onSubmitted={handleSubmitted}
           onActivated={finishCreation}
           onBusyChange={setBusy}
           renderFrame={(editor, controls) => <>

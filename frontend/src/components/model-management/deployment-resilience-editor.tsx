@@ -19,6 +19,7 @@ import type {
   GatewayBackendPoolMember,
   GatewayBackendPoolSummary,
   GatewayBackendPoolWrite,
+  GatewayPublication,
   GatewayPublicationStatus,
   ManagedModel,
 } from "../../data-sources/apim/types"
@@ -50,6 +51,12 @@ import {
 
 export { deploymentMode } from "./pool-session-affinity"
 export type { DeploymentMode } from "./pool-session-affinity"
+
+export type PendingBackendPoolSubmission = {
+  modelId: string
+  publication: GatewayPublication
+  draft: GatewayBackendPoolWrite
+}
 
 const DEFAULT_RATE_LIMIT: GatewayBackendPoolWrite["rate_limit"] = {
   max_attempts_per_request: 2,
@@ -135,11 +142,17 @@ function draftSignature(value: GatewayBackendPoolWrite) {
 
 export function DeploymentResilienceEditor({
   model,
+  initialDraft: providedInitialDraft,
+  initialPublicationId,
+  onSubmitted,
   onActivated,
   onBusyChange,
   renderFrame,
 }: {
   model: ManagedModel
+  initialDraft?: GatewayBackendPoolWrite | null
+  initialPublicationId?: string | null
+  onSubmitted?: (submission: PendingBackendPoolSubmission) => void
   onActivated?: () => void
   onBusyChange?: (busy: boolean) => void
   renderFrame?: (editor: ReactNode, controls: ReactNode) => ReactNode
@@ -168,21 +181,35 @@ export function DeploymentResilienceEditor({
     poolDeploymentModelId(member, model, registry.data?.models ?? [])
   const primaryMember = pool.data?.members.find(member => memberModelId(member) === model.id)
   const primaryMemberId = primaryMember ? poolMemberIdentity(primaryMember) : model.id
-  const initialDraft = draftFromPool(null, model)
+  const initialDraft = providedInitialDraft
+    ? structuredClone(providedInitialDraft)
+    : draftFromPool(null, model)
   const baselineRef = useRef(initialDraft)
   const [baselineSignature, setBaselineSignature] = useState(() =>
     draftSignature(initialDraft),
   )
   const [draft, setDraft] = useState<GatewayBackendPoolWrite>(initialDraft)
   const [mode, setMode] = useState<DeploymentMode | null>(null)
-  const [publicationId, setPublicationId] = useState<string | null>(null)
-  const [publicationAction, setPublicationAction] = useState<PublicationAction | null>(null)
+  const [publicationId, setPublicationId] = useState<string | null>(initialPublicationId ?? null)
+  const [publicationAction, setPublicationAction] = useState<PublicationAction | null>(
+    initialPublicationId ? "configure" : null,
+  )
   const [notice, setNotice] = useState<PublicationNotice | null>(null)
   const [removeOpen, setRemoveOpen] = useState(false)
   const publication = useQuery(finopsQueries.gatewayPublication(publicationId))
 
   useEffect(() => {
+    if (!initialPublicationId) return
+    setPublicationId(initialPublicationId)
+    setPublicationAction("configure")
+  }, [initialPublicationId])
+
+  useEffect(() => {
     if (!pool.isSuccess) return
+    if (!pool.data && providedInitialDraft) {
+      setMode(deploymentMode(providedInitialDraft.members, primaryMemberId))
+      return
+    }
     const next = draftFromPool(pool.data, model, registry.data?.models ?? [])
     const previous = baselineRef.current
     baselineRef.current = next
@@ -191,7 +218,7 @@ export function DeploymentResilienceEditor({
     setDraft((current) => draftSignature(current) === draftSignature(previous)
       ? next
       : current)
-  }, [model, pool.data, pool.dataUpdatedAt, pool.isSuccess, primaryMemberId, registry.data?.models])
+  }, [model, pool.data, pool.dataUpdatedAt, pool.isSuccess, primaryMemberId, providedInitialDraft, registry.data?.models])
 
   useEffect(() => {
     const status = publication.data?.status
@@ -232,6 +259,11 @@ export function DeploymentResilienceEditor({
         finopsKeys.gatewayPublication(accepted.publication.id),
         accepted.publication,
       )
+      onSubmitted?.({
+        modelId: model.id,
+        publication: accepted.publication,
+        draft: structuredClone(draft),
+      })
     },
   })
   const remove = useMutation({
@@ -382,7 +414,8 @@ export function DeploymentResilienceEditor({
     ? <Button className="apim-native-route-disable" type="button" variant="destructive" size="sm" disabled={busy} onClick={() => setRemoveOpen(true)}><Trash2 size={13} />删除 Pool</Button>
     : null
   const externalControls = pool.isLoading || registry.isLoading || !primaryRuntime || primaryRuntime.config.control_plane_managed !== true ? null : <>
-    {hasEffectivePool && <span className="apim-native-route-status" data-active>{"已生效"}</span>}
+    {publishing && publicationStatus && <span className="apim-native-route-status" data-pending>{PUBLICATION_LABELS[publicationStatus]}</span>}
+    {!publishing && hasEffectivePool && <span className="apim-native-route-status" data-active>{"已生效"}</span>}
     {changeActions}
     {disableAction}
   </>
@@ -398,7 +431,6 @@ export function DeploymentResilienceEditor({
       <div className="router-resilience-runtime-list" role="list" data-pool={hasEffectivePool} aria-label={`${model.display_name} APIM Backend Pool Runtime`}>
         {showCandidates && candidates.isPending && !previewCandidates.length && <div className="router-resilience-state" role="status"><LoaderCircle className="spin" size={14} />加载部署列表</div>}
         {[...groups.entries()].map(([runtimeId, group]) => <div className="router-resilience-project" key={runtimeId}>
-          {!hasEffectivePool && <h4 data-no-localize>{group.name}</h4>}
           {group.deployments.map((deployment) => {
           const selected = selectedIds.has(deployment.model_id)
           const member = draft.members.find((candidate) => memberModelId(candidate) === deployment.model_id)
@@ -419,8 +451,8 @@ export function DeploymentResilienceEditor({
             : deployment.runtime_name).replace(/\s+via APIM$/i, "")
           return <div className="router-resilience-runtime" role="listitem" data-selected={shownSelected} data-unavailable={unavailable} key={deployment.model_id}>
             <label className="router-resilience-member-heading"><Checkbox checked={shownSelected} title={primary ? "主部署（必选）" : deployment.deployment_name} disabled={!canManage || busy || primary || (!selected && (!candidates.isPending && !verifiedIds.has(deployment.model_id) || draft.members.length >= 30))} onCheckedChange={(checked) => toggleDeployment(deployment, checked === true)} /><span><b data-no-localize title={deployment.deployment_name}>{deployment.deployment_name}</b>{hasEffectivePool && <small>{membershipState}</small>}</span></label>
-            {(hasEffectivePool || primary || (hasPendingPool && selected)) && <span className="router-resilience-member-role" data-primary={primary} data-selected={selected}>{role}</span>}
-            {hasEffectivePool && <span className="router-resilience-member-connection" data-no-localize title={deployment.runtime_name}><ProviderBrandLogo brand={connectionBrand} size={14} /><span>{connectionName}</span></span>}
+            <span className="router-resilience-member-role" data-primary={primary} data-selected={selected}>{role}</span>
+            <span className="router-resilience-member-connection" data-no-localize title={deployment.runtime_name}><ProviderBrandLogo brand={connectionBrand} size={14} /><span>{connectionName}</span></span>
             {(hasEffectivePool || hasPendingPool && member) && <div className="router-resilience-member-meta">
               <span className="router-resilience-member-priority"><small>APIM</small><b>{member ? `P${member.priority + 1}` : "--"}</b></span>
               {mode === "weighted" && member ? <label className="router-resilience-member-weight"><small>权重</small><Input aria-label={`${deployment.runtime_name} ${deployment.deployment_name} 权重`} type="number" min="1" max="100" value={member.weight} disabled={!canManage || busy} onChange={(event) => changeWeight(deployment.model_id, Number(event.target.value))} /></label> : <span className="router-resilience-member-weight-readonly"><small>权重</small><b>{member?.weight ?? "--"}</b></span>}

@@ -1528,7 +1528,6 @@ class RouteConfigurationExecutor:
                 active = projection.read_active()
                 if (active[0] if active is not None else None) != task.previous_head:
                     raise PolicyCompilationError("Route base configuration changed")
-                proof = port.check(task)
                 current = projection.read_writer()
                 owner_token = str(uuid4())
                 heartbeat()
@@ -1576,7 +1575,6 @@ class RouteConfigurationExecutor:
         current_head = projection.read_active()
         if current_head is None or current_head[0] != intent.head:
             raise PolicyCompilationError("Route activation was superseded before confirmation")
-        port.check(task)
         port.confirm(task, intent.head)
         if "fixed_route_migration" in publication.resource_manifest:
             if self._promote_program is None:

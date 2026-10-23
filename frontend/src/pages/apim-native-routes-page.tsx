@@ -1,13 +1,17 @@
 import { useCallback, useEffect, useMemo, useState, type CSSProperties } from "react"
-import { useQuery } from "@tanstack/react-query"
-import { Network, Plus, RefreshCw, Search, X } from "lucide-react"
+import { useQuery, useQueryClient } from "@tanstack/react-query"
+import { LoaderCircle, Network, Plus, RefreshCw, Search, X } from "lucide-react"
 
 import {
   ApimNativeRouteCreateDialog,
   type NativeRouteModelOption,
 } from "../components/model-management/apim-native-route-create-dialog"
-import { DeploymentResilienceEditor } from "../components/model-management/deployment-resilience-editor"
-import { finopsQueries } from "../data-sources/apim/queries"
+import {
+  DeploymentResilienceEditor,
+  type PendingBackendPoolSubmission,
+} from "../components/model-management/deployment-resilience-editor"
+import { finopsKeys, finopsQueries } from "../data-sources/apim/queries"
+import type { GatewayPublicationStatus } from "../data-sources/apim/types"
 import { useIsMobile } from "../hooks/use-mobile"
 import { Button } from "../components/ui/button"
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "../components/ui/dialog"
@@ -18,6 +22,14 @@ const NATIVE_ROUTE_PANE_WIDTH_KEY = "turnstile_apim_native_route_pane_width"
 const NATIVE_ROUTE_PANE_WIDTH_DEFAULT = 304
 const NATIVE_ROUTE_PANE_WIDTH_MIN = 240
 const NATIVE_ROUTE_PANE_WIDTH_MAX = 420
+
+const TERMINAL_PENDING_STATUSES = new Set<GatewayPublicationStatus>([
+  "active",
+  "failed",
+  "awaiting_authorization",
+  "rolled_back",
+  "superseded",
+])
 
 export function ApimNativeRoutesPage({
   routeDrawerOpen,
@@ -30,6 +42,7 @@ export function ApimNativeRoutesPage({
   addOpen: boolean
   onAddOpenChange: (open: boolean) => void
 }) {
+  const queryClient = useQueryClient()
   const { user } = useAuth()
   const isMobile = useIsMobile()
   const registry = useQuery(finopsQueries.registry())
@@ -37,6 +50,10 @@ export function ApimNativeRoutesPage({
   const [search, setSearch] = useState("")
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null)
   const [pendingCreatedModelId, setPendingCreatedModelId] = useState<string | null>(null)
+  const [pendingSubmission, setPendingSubmission] = useState<PendingBackendPoolSubmission | null>(null)
+  const pendingPublication = useQuery(
+    finopsQueries.gatewayPublication(pendingSubmission?.publication.id ?? null),
+  )
   const {
     width: paneWidth,
     minWidth: paneMinWidth,
@@ -61,10 +78,14 @@ export function ApimNativeRoutesPage({
       .sort((left, right) => left.model_key.localeCompare(right.model_key))
   }, [registry.data])
   const poolByModelId = new Map((pools.data ?? []).map(item => [item.model_id, item.pool] as const))
-  const activeRoutes = managedModels.filter(model => poolByModelId.has(model.id))
+  const pendingStatus = pendingPublication.data?.status ?? pendingSubmission?.publication.status ?? null
+  const pendingRunning = Boolean(pendingSubmission && pendingStatus && !TERMINAL_PENDING_STATUSES.has(pendingStatus))
+  const activeRoutes = managedModels.filter(
+    model => poolByModelId.has(model.id) || pendingSubmission?.modelId === model.id,
+  )
   const routeOptions: NativeRouteModelOption[] = managedModels.map(model => ({
     model,
-    state: poolByModelId.has(model.id) ? "active" : "available",
+    state: poolByModelId.has(model.id) || pendingSubmission?.modelId === model.id ? "active" : "available",
   }))
   const routeStateLoading = registry.isLoading || pools.isLoading
   const routeStateError = registry.error ?? pools.error
@@ -77,8 +98,33 @@ export function ApimNativeRoutesPage({
   const handleRouteCreated = useCallback((modelId: string) => {
     onAddOpenChange(false)
     setSearch("")
+    setSelectedModelId(modelId)
     setPendingCreatedModelId(modelId)
   }, [onAddOpenChange])
+
+  const handleRouteSubmitted = useCallback((submission: PendingBackendPoolSubmission) => {
+    onAddOpenChange(false)
+    setSearch("")
+    setPendingSubmission(submission)
+    setSelectedModelId(submission.modelId)
+    setPendingCreatedModelId(submission.modelId)
+  }, [onAddOpenChange])
+
+  useEffect(() => {
+    if (!pendingSubmission || !pendingStatus || !TERMINAL_PENDING_STATUSES.has(pendingStatus)) return
+    if (pendingStatus === "active") {
+      void queryClient.invalidateQueries({ queryKey: finopsKeys.modelBackendPool(pendingSubmission.modelId) })
+      void queryClient.invalidateQueries({ queryKey: finopsKeys.modelBackendPools })
+      void queryClient.invalidateQueries({ queryKey: finopsKeys.modelBackendPoolCandidates(pendingSubmission.modelId) })
+      void queryClient.invalidateQueries({ queryKey: finopsKeys.gatewayPublications })
+    }
+  }, [pendingStatus, pendingSubmission, queryClient])
+
+  useEffect(() => {
+    if (pendingSubmission && poolByModelId.has(pendingSubmission.modelId)) {
+      setPendingSubmission(null)
+    }
+  }, [pendingSubmission, poolByModelId])
 
   useEffect(() => {
     if (!pendingCreatedModelId || !activeRoutes.some((model) => model.id === pendingCreatedModelId)) return
@@ -99,7 +145,10 @@ export function ApimNativeRoutesPage({
   const selectedPool = selectedModel
     ? poolByModelId.get(selectedModel.id)
     : null
-  const memberCount = selectedPool?.members.length ?? 0
+  const selectedPending = selectedModel && pendingSubmission?.modelId === selectedModel.id
+    ? pendingSubmission
+    : null
+  const memberCount = selectedPool?.members.length ?? selectedPending?.draft.members.length ?? 0
 
   const routeListContent = (closeOnSelect: boolean) => <>
     <div className="router-list-controls apim-native-route-list-controls">
@@ -107,14 +156,15 @@ export function ApimNativeRoutesPage({
     </div>
     <div className="router-list-scroll" role="list" aria-label="APIM 后端池列表">
       {routeStateLoading ? <div className="apim-native-route-drawer-state"><RefreshCw className="spin" size={18} />加载 APIM 后端池列表</div> : routeStateError ? <div className="apim-native-route-drawer-state error">无法加载 APIM 后端池</div> : <>{routes.map((model) => {
-        const members = poolByModelId.get(model.id)?.members ?? []
+        const isPendingModel = !poolByModelId.has(model.id) && pendingSubmission?.modelId === model.id
+        const members = poolByModelId.get(model.id)?.members ?? (isPendingModel ? pendingSubmission.draft.members : [])
         return <div role="listitem" className={`router-list-row ${model.id === selectedModelId ? "active" : ""}`} key={model.id}>
           <button type="button" className="router-list-main" onClick={() => {
             setSelectedModelId(model.id)
             if (closeOnSelect) onRouteDrawerOpenChange(false)
           }}>
-            <span className="router-list-icon"><Network size={15} /></span>
-            <span className="router-list-copy"><b data-no-localize title={model.display_name}>{model.display_name}</b><small><code data-no-localize title={model.model_key}>{model.model_key}</code><i>·</i><span>{members.length}</span><span>个部署</span></small></span>
+            <span className="router-list-icon">{isPendingModel && pendingRunning ? <LoaderCircle className="spin" size={15} /> : <Network size={15} />}</span>
+            <span className="router-list-copy"><b data-no-localize title={model.display_name}>{model.display_name}</b><small><code data-no-localize title={model.model_key}>{model.model_key}</code><i>·</i><span>{members.length}</span><span>个部署</span>{isPendingModel && <><i>·</i><span>{pendingRunning ? "正在发布" : pendingStatus === "failed" || pendingStatus === "rolled_back" ? "发布失败" : "已生效"}</span></>}</small></span>
           </button>
         </div>
       })}
@@ -148,6 +198,9 @@ export function ApimNativeRoutesPage({
         {selectedModel ? <DeploymentResilienceEditor
           key={selectedModel.id}
           model={selectedModel}
+          initialDraft={selectedPending?.draft ?? null}
+          initialPublicationId={selectedPending?.publication.id ?? null}
+          onSubmitted={handleRouteSubmitted}
           renderFrame={(editor, controls) => <>
             <header className="apim-native-route-toolbar">
               <b>后端池</b>
@@ -183,6 +236,7 @@ export function ApimNativeRoutesPage({
       options={routeOptions}
       onClose={() => onAddOpenChange(false)}
       onCreated={handleRouteCreated}
+      onSubmitted={handleRouteSubmitted}
     />}
   </div>
 }

@@ -41,7 +41,24 @@ def test_pool_affinity_editor_is_capability_and_owner_gated() -> None:
     assert 'provisioning: "正在同步路由数据"' in editor
     assert 'building_revision: "正在校验路由快照"' in editor
     assert 'promoting: "正在切换生效路由"' in editor
-    assert "(hasEffectivePool || primary || (hasPendingPool && selected))" in editor
+    assert "<h4" not in editor
+    assert '<span className="router-resilience-member-role"' in editor
+    assert '<span className="router-resilience-member-connection"' in editor
+    assert "onSubmitted?.({" in editor
+    assert 'data-pending>{PUBLICATION_LABELS[publicationStatus]}' in editor
+    dialog = (
+        FRONTEND_SOURCE / "components/model-management/apim-native-route-create-dialog.tsx"
+    ).read_text(encoding="utf-8")
+    assert "onSubmitted={handleSubmitted}" in dialog
+    assert "return !open ? null :" in dialog
+    native_page = (
+        FRONTEND_SOURCE / "pages/apim-native-routes-page.tsx"
+    ).read_text(encoding="utf-8")
+    assert "const [pendingSubmission, setPendingSubmission] =" in native_page
+    assert "initialDraft={selectedPending?.draft ?? null}" in native_page
+    assert "initialPublicationId={selectedPending?.publication.id ?? null}" in native_page
+    assert "onSubmitted={handleRouteSubmitted}" in native_page
+    assert '<LoaderCircle className="spin" size={15} />' in native_page
     assert "registry.backend_pool_session_affinity_supported === true" in api
     styles = read_frontend_styles()
     assert ".router-resilience-affinity { min-width: 0;" in styles

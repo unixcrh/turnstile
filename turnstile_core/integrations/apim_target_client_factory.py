@@ -128,9 +128,19 @@ class AzureApimProbeAccessChecker:
 
 
 class AzureApimTargetProbeCredentialResolver:
+    def __init__(self) -> None:
+        self._cache: dict[tuple[str, str], tuple[float, SecretStr]] = {}
+
     def resolve(self, target: ApimTarget) -> SecretStr:
+        from time import monotonic
+
         if not target.probe_subscription_id:
             raise PolicyCompilationError("The APIM target has no probe subscription identity")
+        cache_key = (target.arm_resource_id.casefold(), target.probe_subscription_id)
+        cached = self._cache.get(cache_key)
+        now = monotonic()
+        if cached is not None and now < cached[0]:
+            return cached[1]
         access = AzureApimProbeAccessChecker().check(target)
         if access.status != "ready":
             raise PublisherPermissionError(
@@ -146,7 +156,9 @@ class AzureApimTargetProbeCredentialResolver:
         primary_key, _ = AzureApimSubscriptionKeyClient(settings).application_subscription_keys(
             target.probe_subscription_id
         )
-        return SecretStr(primary_key)
+        secret = SecretStr(primary_key)
+        self._cache[cache_key] = (now + 60.0, secret)
+        return secret
 
 
 class CompatibilityTargetProbeCredentialResolver:
