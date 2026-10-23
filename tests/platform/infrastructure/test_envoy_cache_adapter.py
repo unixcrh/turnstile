@@ -329,7 +329,7 @@ def test_only_exact_pool_runtime_metadata_is_authoritative(runtime: object) -> N
     )
     assert deployed_event is not None
     assert deployed_event["runtime_authoritative"] is True
-    assert deployed_event["runtime"] == "pool-member-runtime (gpt-5.6-luna-reg-2)"
+    assert deployed_event["runtime"] == "pool-member-runtime"
     assert load_shipper().normalize_access_row(access_row(
         response_code=503, pool_runtime=runtime,
     )) is None

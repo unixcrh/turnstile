@@ -253,7 +253,7 @@ class PostgreSqlPublicationRepositoryMixin:
                 and publication_kind == "route_reconcile"
                 and _route_reconcile_credential_read_denied(existing))
             preparation_failed = (existing is not None
-                and publication_kind == "route_reconcile"
+                and publication_kind in {"route_reconcile", "model_remove"}
                 and _route_reconcile_preparation_failed(existing))
             if (existing is not None
                     and (model_addition or model_removal or credential_read_denied
@@ -299,7 +299,7 @@ class PostgreSqlPublicationRepositoryMixin:
                     latest.get("auth_strategy")
                     in {"named_value_bearer", "named_value_api_key"}
                     and latest.get("key_vault_secret_id") is None
-                    and publication_kind != "route_reconcile"
+                    and publication_kind not in {"route_reconcile", "model_remove"}
                 )
                 if (
                     credential_ciphertext is None

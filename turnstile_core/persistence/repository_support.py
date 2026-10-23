@@ -335,7 +335,7 @@ def _route_reconcile_credential_read_denied(publication: Mapping[str, Any]) -> b
 
 def _route_reconcile_preparation_failed(publication: Mapping[str, Any]) -> bool:
     if (
-        publication.get("publication_kind") != "route_reconcile"
+        publication.get("publication_kind") not in {"route_reconcile", "model_remove"}
         or publication.get("status", "failed") != "failed"
         or publication.get("apim_revision") is not None
         or publication.get("policy_sha256") is not None

@@ -827,6 +827,28 @@ def test_route_reconcile_absorbs_model_add_and_resolves_legacy_member_project_en
     repository.gateway_publications[-1]["resource_manifest"] = {
         "fixed_route_program": {"version": 1}
     }
+    unpublished_model = repository.create_registry_item(
+        "model",
+        {
+            "provider_id": provider_id,
+            "runtime_id": binding.runtime_id,
+            "model_key": "unpublished-extra-model",
+            "display_name": "Unpublished Extra Model",
+            "family_key": binding.model.family_key.value,
+            "upstream_model_id": "unpublished-extra-model",
+            "assignment_required": False,
+            "enabled": True,
+            "is_default": False,
+            "capabilities": ["chat"],
+            "context_window": 128000,
+            "input_cost_per_million": 1.0,
+            "output_cost_per_million": 2.0,
+            "cached_cost_per_million": None,
+            "cache_write_cost_per_million": None,
+            "allowed_roles": ["owner", "admin", "member"],
+            "publication_id": None,
+        },
+    )
     service = GatewayControlPlaneService(repository)
     removal_pub = service.remove_model(absorbed_model["id"], "owner@example.com")
     assert removal_pub.publication_kind is PublicationKind.MODEL_REMOVE
@@ -835,3 +857,28 @@ def test_route_reconcile_absorbs_model_add_and_resolves_legacy_member_project_en
     assert [m.model_id for m in removal_pub.desired_spec.removed_models] == [
         absorbed_model["id"]
     ]
+    assert unpublished_model["model_key"] not in [
+        item.id for item in removal_pub.desired_spec.discovery_models
+    ]
+
+    # Verify zero-effect preparation failure on full-release model_remove can be retried cleanly
+    repository.gateway_publications[-1].update(
+        status="failed",
+        error_code="PolicyCompilationError",
+        error_message="Route credential verification was rejected",
+        resource_manifest={
+            "route_credentials": {},
+            "route_dependencies": {},
+            "route_configuration": {},
+            "route_last_progress_attempt": 1,
+        },
+    )
+    for outbox in repository.gateway_publication_outbox:
+        if outbox["publication_id"] == removal_pub.id:
+            outbox["status"] = "completed"
+            outbox["lease_owner"] = None
+            outbox["lease_expires_at"] = None
+    assert _route_reconcile_preparation_failed(repository.gateway_publications[-1]) is True
+    retried_removal = service.remove_model(absorbed_model["id"], "owner@example.com")
+    assert retried_removal.id != removal_pub.id
+    assert retried_removal.status.value == "queued"

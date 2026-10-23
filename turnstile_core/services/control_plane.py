@@ -3923,12 +3923,13 @@ class GatewayControlPlaneService:
                     "model_id": str(model["id"]), "alias": str(model["model_key"]),
                 }},
             )
+        is_fixed_route_release = previous is not None and any(
+            field in previous.resource_manifest
+            for field in ("fixed_route_program", "route_configuration")
+        )
         reconciled = (
             self._backend_pool_release_spec(previous, registry)
-            if previous is not None and any(
-                field in previous.resource_manifest
-                for field in ("fixed_route_program", "route_configuration")
-            )
+            if previous is not None and is_fixed_route_release
             else previous.desired_spec
             if previous is not None
             else None
@@ -3939,7 +3940,8 @@ class GatewayControlPlaneService:
             if binding.model.model_key.casefold() != alias
         ]
         discovery = list(reconciled.discovery_models) if reconciled else []
-        discovery.extend(self._existing_discovery(gateway_id, registry))
+        if not is_fixed_route_release:
+            discovery.extend(self._existing_discovery(gateway_id, registry))
         remaining = {
             item.id.casefold(): item
             for item in discovery
@@ -3964,10 +3966,7 @@ class GatewayControlPlaneService:
         spec = self._refresh_release_deployments(spec)
         expected_base_id = (
             previous.id
-            if previous is not None and any(
-                field in previous.resource_manifest
-                for field in ("fixed_route_program", "route_configuration")
-            )
+            if is_fixed_route_release and previous is not None
             else None
         )
         return self._queue_release(

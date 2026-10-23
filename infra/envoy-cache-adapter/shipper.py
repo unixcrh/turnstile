@@ -183,12 +183,6 @@ def normalize_access_row(row: dict[str, Any]) -> dict[str, Any] | None:
     if pool_deployment == "unattributed":
         pool_deployment = ""
     effective_runtime = pool_runtime or _text(row, "runtime")
-    if (
-        pool_deployment
-        and pool_deployment != _text(row, "model", "")
-        and pool_deployment not in effective_runtime
-    ):
-        effective_runtime = f"{effective_runtime} ({pool_deployment})"
     return {
         "id": request_id,
         "request_id": request_id,
