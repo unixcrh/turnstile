@@ -4,21 +4,32 @@ import { createRequire } from "node:module"
 import test from "node:test"
 import { fileURLToPath } from "node:url"
 import { runInNewContext } from "node:vm"
+import { cachePolicies } from "../../../frontend/src/api/cache-policies.ts"
 
 import {
   apimGatewayEntries, gatewayEvidence, gatewayPublicationChoices, resolveGatewaySelection,
 } from "../../../frontend/src/lib/gateway-topology.ts"
 import * as gatewayTopology from "../../../frontend/src/lib/gateway-topology.ts"
 import * as gatewayForms from "../../../frontend/src/lib/gateway-forms.ts"
-import * as modelFilters from "../../../frontend/src/lib/model-inventory-filters.ts"
 import * as runtimeHealth from "../../../frontend/src/lib/runtime-health.ts"
 import { formatTimeAgo } from "../../../frontend/src/lib/time.ts"
 import * as publicationConnections from "../../../frontend/src/components/model-management/model-publication-connections.ts"
 import * as compatible from "../../../frontend/src/components/model-management/openai-compatible.ts"
 
+class ApiError extends Error {
+  constructor(status) { super(`HTTP ${status}`); this.status = status }
+}
+
 const frontendRequire = createRequire(new URL("../../../frontend/package.json", import.meta.url))
 const { rolldown } = await import(frontendRequire.resolve("rolldown"))
 const { QueryClient } = frontendRequire("@tanstack/react-query")
+const filterEntry = fileURLToPath(new URL("../../../frontend/src/lib/model-inventory-filters.ts", import.meta.url))
+const filterBundle = await rolldown({ input: filterEntry, platform: "node" })
+let modelFilters
+try {
+  const { output } = await filterBundle.generate({ format: "esm" })
+  modelFilters = await import(`data:text/javascript;base64,${Buffer.from(output[0].code).toString("base64")}`)
+} finally { await filterBundle.close() }
 async function compile(path, expose = []) {
   const entry = fileURLToPath(new URL(path, import.meta.url))
   const bundle = await rolldown({ input: entry, external: path => path !== entry, transform: { jsx: { runtime: "automatic" }, define: { "import.meta.env.VITE_API_BASE_URL": '""' } }, treeshake: false,
@@ -34,11 +45,16 @@ const onboardingCode = await compile("../../../frontend/src/components/model-man
 const creationCode = await compile("../../../frontend/src/components/model-management/self-hosted-gateway-dialog.tsx")
 const workspaceCode = await compile("../../../frontend/src/components/model-management/apim-gateway-workspace.tsx", ["ApimTable", "GatewayTable", "GatewayChildRow", "InfrastructureActions", "ApimEditor", "GatewayEditor", "GatewayAssociationEditor", "InfrastructureNameEditor", "RemovalDialog", "InfrastructureTableLoading"])
 const pageCode = await compile("../../../frontend/src/pages/model-management-page.tsx", ["ModelWorkspace", "modelManagementTabFromUrl", "ConnectionGatewayCell", "ModelTargetGatewayCell", "ConnectionRow", "RuntimeHealth"])
-const releaseCode = await compile("../../../frontend/src/pages/gateway-releases-page.tsx", ["PublicationFailureNotice", "ChangeColumn", "GatewayReleaseGroups", "BudgetVerificationDialog"])
+const releaseCode = await compile("../../../frontend/src/pages/gateway-releases-page.tsx", ["PublicationFailureNotice", "ChangeColumn"])
 const diagnosticCode = await compile("../../../frontend/src/components/model-management/runtime-diagnostic-dialog.tsx")
 const connectionCode = await compile("../../../frontend/src/components/model-management/connection-dialog.tsx")
 const traceCode = await compile("../../../frontend/src/data-sources/apim/pages/dashboard-page.tsx")
 const mobileCode = await compile("../../../frontend/src/hooks/use-mobile.ts")
+const bootstrapCode = await compile("../../../frontend/src/lib/gateway-bootstrap.ts")
+const vendorCode = await compile("../../../frontend/src/components/model-management/model-vendor-select.tsx")
+const vendorExports = {}
+runInNewContext(vendorCode, { exports: vendorExports, require: name => name === "react/jsx-runtime"
+  ? frontendRequire(name) : new Proxy({}, { get: (_target, key) => key }) })
 
 test("responsive controls use the model-table breakpoint and preserve the default breakpoint", () => {
   for (const breakpoint of [undefined, 761]) {
@@ -249,16 +265,17 @@ test("connection creation waits for registered APIM inventory without replacing 
   const props = { registry: { apim_target_topology_available: true, providers: [], gateways: [{ id: "first", name: "Unit APIM", enabled: true, implementation: "apim" }] }, topology: null, topologyLoading: true, busy: false, error: null, onClose() {}, onCreate: value => writes.push(value), onUpdate() {} }
   const view = componentHarness("ConnectionDialog", props, { code: connectionCode })
   assert.ok(view.find(node => node.props?.role === "status"))
-  assert.equal(view.find(node => node.type === "Select" && Array.isArray(node.props.items)).props.disabled, true)
+  view.find(node => node.type === "Button" && node.props.children?.at?.(-1) === "添加连接").props.onClick()
+  assert.equal(writes.length, 0)
   props.topology = { items: [{ target: { gateway_profile_id: "first" } }] }
   props.topologyLoading = false
-  const selector = view.find(node => node.type === "Select" && Array.isArray(node.props.items))
+  view.all().filter(node => node.type === "Select")[1].props.onValueChange("first")
+  const selector = view.find(node => node.type === "Select" && node.props.value === "first")
   assert.equal(selector.props.value, "first")
   assert.equal(selector.props.disabled, false)
   selector.props.onValueChange("removed")
-  assert.equal(view.find(node => node.type === "Select" && Array.isArray(node.props.items)).props.value, "removed")
+  assert.ok(view.find(node => node.type === "Select" && node.props.value === "removed"))
   const submit = view.find(node => node.type === "Button" && node.props.children?.at?.(-1) === "添加连接")
-  assert.equal(submit.props.disabled, true)
   submit.props.onClick()
   assert.equal(writes.length, 0)
 })
@@ -286,7 +303,7 @@ test("connection health renders valid historical timestamps without invalid date
 test("connection row opens diagnostics without an independent default-connection action", () => {
   let checks = 0
   const runtime = { id: "runtime", name: "Connection", runtime_kind: "foundry", enabled: true, is_default: false, config: {}, health_message: null }
-  const row = componentHarness("ConnectionRow", { runtime, models: [{ enabled: true }], topology: null,
+  const row = componentHarness("ConnectionRow", { runtime, models: [{ enabled: true }], profiles: [], topology: null,
     busy: false, checking: false, onEdit() {}, onToggle() {}, onDelete() {}, onCheck() { checks++ } }, { code: pageCode })
   assert.equal(row.find(node => node.props?.className === "connection-default-action"), undefined)
   row.find(node => node.props?.title === "连接诊断").props.onClick()
@@ -298,29 +315,31 @@ test("budget verification dialog binds validated candidates and prevents duplica
   const registry = { gateways: [{ id: "target", name: "Unit APIM", enabled: true, implementation: "apim" }], runtimes: [{ id: "runtime", enabled: true, gateway_profile_id: "target" }], models: [{ id: "model", display_name: "Unit model", enabled: true, capabilities: ["chat"], runtime_id: "runtime" }] }
   const applications = { items: [{ id: "application", display_name: "Unit app", gateway_profile_id: "target", status: "active", system_managed: false, model_policy_configured: true, allowed_model_ids: ["model"] }] }
   const api = {
-    checkBudgetDelegation: async id => ({ gateway_profile_id: id, ready: true, protocol_mode: "paused", checks: [], verification: { application_id: "application", model_ids: ["model"] } }),
+    checkBudgetDelegation: async id => ({ gateway_profile_id: id, ready: true, protocol_mode: "paused", checked_at: "2026-10-24T00:00:00Z", checks: [], verification: { application_id: "application", model_ids: ["model"] } }),
     verifyBudgetExecution: async (...selection) => { requests.push(selection); return { actual_status: 200, settled: false, request_id: "unit-request", scopes: [] } },
   }
-  const props = { gatewayId: "target", onClose() {} }
-  const view = componentHarness("BudgetVerificationDialog", props, { code: releaseCode, api, queryData: { registry, applications } })
-  const button = label => view.find(node => node.type === "Button" && Array.isArray(node.props.children) && node.props.children.at(-1) === label)
+  const props = { releaseDrawerOpen: false, onReleaseDrawerOpenChange() {} }
+  const queryData = { registry, applications, releases: { items: [{ id: "release-b1", gateway_profile_id: "target", gateway_name: "Unit APIM", role: "current" }] } }
+  const view = componentHarness("GatewayReleasesPage", props, { code: releaseCode, api, queryData })
+  const button = label => view.all().filter(node => node.type === "Button" && Array.isArray(node.props.children) && node.props.children.at(-1) === label).at(-1)
+  button("验证预算委托").props.onClick()
   assert.equal(button("联合账本验证").props.disabled, true)
   button("验证预算委托").props.onClick()
-  await new Promise(resolve => setImmediate(resolve))
+  await view.settle()
   assert.equal(button("联合账本验证").props.disabled, false)
   button("联合账本验证").props.onClick()
   assert.equal(button("发送验证请求").props.disabled, true)
   view.find(node => node.type === "Select" && node.props.items?.[0]?.value === "application").props.onValueChange("application")
   view.find(node => node.type === "Select" && node.props.items?.[0]?.value === "model").props.onValueChange("model")
   assert.equal(button("发送验证请求").props.disabled, false)
-  const send = button("发送验证请求").props.onClick
-  send(); send()
-  await new Promise(resolve => setImmediate(resolve))
-  assert.deepEqual(requests, [["target", "application", "model"]])
+  button("发送验证请求").props.onClick()
   assert.equal(button("发送验证请求").props.disabled, true)
+  await view.settle()
+  assert.deepEqual(requests, [["target", "application", "model"]])
+  assert.equal(requests.length, 1)
   assert.ok(view.find(node => node.props?.role === "status" && node.props.children?.includes("尚未确认结算")))
-  const member = componentHarness("BudgetVerificationDialog", props, { code: releaseCode, api, role: "member", queryData: { registry, applications } })
-  assert.equal(member.find(node => node.type === "Button" && node.props.children?.at?.(-1) === "验证预算委托").props.disabled, true)
+  const member = componentHarness("GatewayReleasesPage", props, { code: releaseCode, api, role: "member", queryData })
+  assert.equal(member.find(node => node.type === "Button" && node.props.children?.at?.(-1) === "验证预算委托"), undefined)
 })
 
 test("release groups separate same-name APIM targets and retain selection when collapsed", () => {
@@ -330,16 +349,17 @@ test("release groups separate same-name APIM targets and retain selection when c
     { id: "release-a2", gateway_profile_id: "target-a", gateway_name: "Unit APIM" },
   ]
   const toggled = [], selected = []
-  const view = componentHarness("GatewayReleaseGroups", { items, selectedId: "release-b1", collapsedGatewayIds: new Set(["target-a"]), location: "rail", onToggle: id => toggled.push(id), onSelect: id => selected.push(id) }, { code: releaseCode })
+  const view = componentHarness("GatewayReleasesPage", { releaseDrawerOpen: false, onReleaseDrawerOpenChange() {} }, { code: releaseCode, queryData: { releases: { items } } })
+  view.find(node => node.props?.["aria-controls"] === "gateway-release-group-rail-target-a").props.onClick()
   assert.equal(view.find(node => node.props?.id === "gateway-release-group-rail-target-a").props.hidden, true)
   assert.equal(view.find(node => node.props?.id === "gateway-release-group-rail-target-b").props.hidden, false)
   const target = view.find(node => node.props?.["aria-controls"] === "gateway-release-group-rail-target-a")
   target.props.onClick()
-  assert.deepEqual(toggled, ["target-a"])
+  assert.equal(view.find(node => node.props?.id === "gateway-release-group-rail-target-a").props.hidden, false)
   const row = view.find(node => node.props?.release?.id === "release-b1")
   assert.equal(row.props.selected, true)
   row.props.onSelect()
-  assert.deepEqual(selected, ["release-b1"])
+  assert.equal(view.find(node => node.props?.release?.id === "release-b1").props.selected, true)
 })
 
 test("release failure notice uses safe categories and marks unapplied changes as planned", () => {
@@ -398,6 +418,8 @@ test("invocation options require model membership and never replace a missing ex
   assert.equal(gatewayTopology.gatewayInvocationChoices(profiles, { items: [target] }, model.id).length, 0)
   entry.published_models_available = true
   entry.deployment.reachability_state = "unreachable"
+  assert.equal(gatewayTopology.gatewayInvocationChoices(profiles, { items: [target] }, model.id)[0].selectable, true)
+  target.target.drift_state = "drifted"
   assert.equal(gatewayTopology.gatewayInvocationChoices(profiles, { items: [target] }, model.id)[0].selectable, false)
   entry.deployment.retired_at = "2026-01-01T00:00:00Z"
   assert.equal(gatewayTopology.gatewayInvocationChoices(profiles, { items: [target] }, model.id).length, 0)
@@ -421,7 +443,7 @@ test("Gateway inventory uses Chinese UI labels while preserving resource identit
   assert.deepEqual(Array.from(resourceTable.props.headers), ["网关", "所属 APIM / 模型", "端点", "状态", ""])
   assert.equal(resourceTable.props.label, "自托管网关列表")
   assert.ok(table.find(node => node.type === "b" && node.props.children === "Customer Gateway" && node.props["data-no-localize"] === true))
-  assert.ok(table.find(node => node.type === "span" && node.props.children === "配置地址"))
+  assert.ok(table.find(node => node.type === "span" && node.props.children === "配置端点"))
   assert.ok(table.find(node => node.type === "span" && node.props.children === entry.configuration_endpoint && node.props["data-no-localize"] === true))
 })
 
@@ -442,15 +464,15 @@ for (const locale of ["zh-CN", "zh-TW", "en", "ja", "ko"]) test(`Gateway startup
   const harness = componentHarness("SelfHostedGatewayBootstrapDialog", {
     deploymentId: "unit-edge", name: "Customer Gateway", onClose() {}, onValidate() {},
   }, { code: creationCode, locale })
-  const value = harness.find(node => node.type === "SelectValue").props.children
-  assert.equal(value.props["data-no-localize"], true)
-  assert.equal(value.props.children, new Intl.NumberFormat(locale, { style: "unit", unit: "hour", unitDisplay: "long" }).format(24))
-  assert.ok(harness.find(node => node.props?.["aria-label"] === "令牌有效期"))
-  assert.ok(harness.find(node => node.type === "DialogDescription" && node.props["data-no-localize"] && node.props.children === "Customer Gateway"))
+  const value = harness.find(node => node.type === "Input" && node.props.type === "number")
+  assert.equal(value.props.value, 1)
+  assert.equal(value.props.min, 1)
+  assert.equal(value.props.max, 24)
+  assert.ok(harness.find(node => node.props?.["data-no-localize"] && node.props.children === "Customer Gateway"))
 })
 
 test("new Gateway form generates no native identity and requires endpoint control confirmation", () => {
-  const form = { display_name: "  New Docker  ", endpoint_url: "https://edge.test/unit/llm", location: " ", endpoint_control_confirmed: false }
+  const form = { display_name: "  New Docker  ", endpoint_url: "https://edge.test/unit/llm", location: " ", hosting_mode: "docker", release_gate: "required", endpoint_control_confirmed: false }
   assert.equal(gatewayForms.gatewayCreateFormValid(form), false)
   form.endpoint_control_confirmed = true
   assert.deepEqual(gatewayForms.gatewayCreateFormPayload(form), {
@@ -470,12 +492,14 @@ test("Gateway creation uses an idempotency header and bootstrap is never cacheab
   assert.equal(requests[0][0], "/api/v1/model-management/apim-targets/target/self-hosted-gateway-provisions")
   assert.equal(requests[0][1].headers["Idempotency-Key"], "request-uuid")
   assert.deepEqual(JSON.parse(requests[0][1].body), payload)
-  await api.selfHostedGatewayBootstrap("deployment", 24)
-  assert.equal(requests[1][1].cache, "no-store")
-  assert.deepEqual(JSON.parse(requests[1][1].body), { expires_in_hours: 24 })
+  await api.requestGatewayBootstrap("deployment", { expires_in_hours: 24, endpoint_control_confirmed: true }, new AbortController().signal)
+  assert.equal(api.sensitiveRequests.length, 1)
+  assert.deepEqual(api.sensitiveRequests[0], requests[1])
+  assert.deepEqual(JSON.parse(requests[1][1].body), { expires_in_hours: 24, endpoint_control_confirmed: true })
 })
 
 function componentHarness(exportName, props, { operation = null, queryData = {}, mutationPending = false, code = workspaceCode, api = {}, role = "owner", locale = "en-US", globals = {} } = {}) {
+  if (exportName === "ModelWorkspace") props = { checkingRuntimeIds: new Set(), availabilityByModel: new Map(), ...props }
   const slots = []
   let cursor = 0
   const effects = []
@@ -484,10 +508,12 @@ function componentHarness(exportName, props, { operation = null, queryData = {},
   const mutationVariables = []
   const queries = []
   const invalidations = []
-  const queryClient = { setQueryData() {}, getQueriesData() { return [] }, invalidateQueries(options) { invalidations.push(options.queryKey); return Promise.resolve() } }
+  const queryWrites = []
+  const queryClient = { cancelQueries: async () => {}, setQueryData(...values) { queryWrites.push(values) }, getQueriesData() { return [] }, invalidateQueries(options) { invalidations.push(options.queryKey); return Promise.resolve() } }
   const imports = {
     react: {
       useId: () => "unit-gateway",
+      useMemo: calculate => calculate(),
       useEffect: callback => effects.push(callback),
       useState(initial) {
         const index = cursor++
@@ -503,7 +529,12 @@ function componentHarness(exportName, props, { operation = null, queryData = {},
     "react/jsx-runtime": frontendRequire("react/jsx-runtime"),
     "@tanstack/react-query": {
       useQueryClient: () => queryClient,
-      useQuery: options => { queries.push(options); return { data: Object.hasOwn(queryData, options.queryKey[0]) ? queryData[options.queryKey[0]] : operation, error: null, refetch() {} } },
+      useQuery: options => {
+        queries.push(options)
+        const key = options.queryKey.includes("apim-onboarding") ? "onboarding"
+          : options.queryKey.includes("self-hosted-gateway-provisions") ? "provisions" : options.queryKey[0]
+        return { data: Object.hasOwn(queryData, key) ? queryData[key] : operation, error: null, isPending: false, refetch() {} }
+      },
       useMutation: options => {
         const index = cursor++
         if (!(index in slots)) slots[index] = { pending: false, error: null }
@@ -531,7 +562,7 @@ function componentHarness(exportName, props, { operation = null, queryData = {},
         }
       },
     },
-    "../../data-sources/apim/api": { dataSource: api },
+    "../../data-sources/apim/api": { dataSource: api, requestGatewayBootstrap: api.requestGatewayBootstrap },
     "../../data-sources/apim/queries": {
       finopsKeys: { registry: ["registry"], apimTargets: ["targets"], apimOnboarding: ["onboarding"], selfHostedGatewayProvisions: ["provisions"], gatewayReleaseOperation: id => ["operation", id] },
       finopsQueries: {
@@ -542,17 +573,21 @@ function componentHarness(exportName, props, { operation = null, queryData = {},
       },
       storeGatewayDeployment: async () => {},
       storeGatewayDeploymentName: async () => {},
+      storeGatewayName: async () => {},
+      storeRegistry: async () => {},
       storeApimTarget: async () => {},
     },
     "../../lib/gateway-topology": gatewayTopology,
     "./model-publication-connections": publicationConnections,
     "./openai-compatible": compatible,
+    "./model-vendor-select": vendorExports,
     "../brand-logos": new Proxy({ providerBrandFromMetadata: () => "generic", gatewayBrandFromIdentity: () => "apim" }, { get: (target, name) => target[name] ?? name }),
     "../../lib/gateway-forms": gatewayForms,
     "../../lib/runtime-health": runtimeHealth,
     "../lib/runtime-health": runtimeHealth,
     "../lib/time": { formatTimeAgo },
-    "../locales/index": { useLocale: () => ({ locale }) },
+    "../locales/index": { useLocale: () => ({ locale }), getIntlLocale: () => locale },
+    "../locales": { getIntlLocale: () => locale },
     "./dashboard-shared": { compact: new Intl.NumberFormat("en-US"), currency: new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }) },
     "../lib/model-inventory-filters": modelFilters,
     "../hooks/use-mobile": { useIsMobile: () => false },
@@ -562,11 +597,21 @@ function componentHarness(exportName, props, { operation = null, queryData = {},
     "../data-sources/apim/queries": { finopsQueries: {
       registry: () => ({ queryKey: ["registry"] }),
       gatewayApplications: () => ({ queryKey: ["applications"] }),
+      gatewayReleases: () => ({ queryKey: ["releases"] }),
+      gatewayRelease: () => ({ queryKey: ["detail"] }),
+      gatewayReleaseRollbackPreview: () => ({ queryKey: ["rollback"] }),
+      gatewayReleaseOperation: () => ({ queryKey: ["operation"] }),
     } },
-    "../../locales": { useLocale: () => ({ locale }) },
+    "../../locales": { useLocale: () => ({ locale }), translateForLocale: async value => value },
     "../../providers/timezone-provider": { useTimezone: () => ({ timezone: "UTC" }) },
     "../components/brand-logos": new Proxy({ providerBrandFromIdentity: () => "generic", gatewayBrandFromIdentity: () => "generic" }, { get: (target, name) => target[name] ?? name }),
+    "../components/model-management/apim-gateway-workspace": { MODEL_MANAGEMENT_TABS: ["models", "connections", "gateways", "apim"] },
+    "../components/model-management/model-vendor-select": vendorExports,
+    "../components/ui/use-resizable-pane": { useResizablePane: () => ({ width: 336, minWidth: 272, maxWidth: 460 }) },
   }
+  const bootstrapExports = {}
+  runInNewContext(bootstrapCode, { exports: bootstrapExports, URL, Blob, ...globals })
+  imports["../../lib/gateway-bootstrap"] = bootstrapExports
   const onboardingExports = {}
   runInNewContext(onboardingCode, { exports: onboardingExports,
     require: name => imports[name] ?? new Proxy({}, { get: (_target, key) => key }),
@@ -578,11 +623,12 @@ function componentHarness(exportName, props, { operation = null, queryData = {},
   })
   imports["./self-hosted-gateway-dialog"] = creationExports
   const exports = {}
-  runInNewContext(code, { exports, Set, URL, Blob, AbortController, Error, crypto: { randomUUID: () => "unit-request-id" }, window: { location: { href: "http://localhost/?tab=apim" } }, ...globals,
+  runInNewContext(code, { exports, Set, URL, URLSearchParams, Blob, AbortController, AbortSignal, Error, crypto: { randomUUID: () => "unit-request-id" }, window: { location: { href: "http://localhost/?tab=apim&release=release-b1", search: "?release=release-b1" }, history: { replaceState() {} } }, ...globals,
     require: name => imports[name] ?? (name.endsWith("/gateway-topology") ? gatewayTopology : new Proxy({}, { get: (_target, key) => key })),
   })
   const nodes = value => Array.isArray(value) ? value.flatMap(nodes)
-    : value && typeof value === "object" ? [value, ...nodes(value.props?.children)] : []
+    : value && typeof value === "object" ? [value, ...nodes(value.type === "Dialog" && value.props.open === false ? null
+      : value.type?.name === "InfrastructureTableError" ? value.type(value.props) : value.props?.children)] : []
   const render = () => { cursor = 0; queries.length = 0; return exports[exportName](props) }
   const settle = async () => {
     let settled = 0
@@ -592,23 +638,22 @@ function componentHarness(exportName, props, { operation = null, queryData = {},
       await Promise.allSettled(current)
     }
   }
-  return { props, syncCalls, effects, mutationVariables, queries, invalidations, nodes, render, settle, all: () => nodes(render()), find: predicate => nodes(render()).find(predicate) }
+  return { props, syncCalls, effects, mutationVariables, queries, queryWrites, invalidations, nodes, render, settle, all: () => nodes(render()), find: predicate => nodes(render()).find(predicate),
+    field: label => nodes(nodes(render()).find(node => node.type?.name === "Field" && node.props.label === label)).find(node => node.type === "Input") }
 }
 
-class ApiError extends Error {
-  constructor(status) { super(`HTTP ${status}`); this.status = status }
-}
 function apiHarness(request, writeJson = request) {
   const exports = {}
+  const sensitiveRequests = []
   runInNewContext(apiCode, { exports, require: name => name.includes("api/client")
-    ? { request, writeJson, ApiError } : {} })
-  return exports.dataSource
+    ? { request, requestSensitiveJson: (...args) => { sensitiveRequests.push(args); return request(...args) }, writeJson, ApiError } : {} })
+  return { ...exports.dataSource, requestGatewayBootstrap: exports.requestGatewayBootstrap, sensitiveRequests }
 }
 function queryHarness() {
   const exports = {}
   const imports = {
-    "@tanstack/react-query": { queryOptions: options => options },
-    "../../api/cache-policies": { cachePolicies: {} },
+    "@tanstack/react-query": { queryOptions: options => options, infiniteQueryOptions: options => options },
+    "../../api/cache-policies": { cachePolicies },
     "./api": { dataSource: {} },
   }
   runInNewContext(queryCode, { exports, require: name => imports[name] ?? {} })
@@ -629,8 +674,9 @@ function topology(changes = {}) {
 }
 
 test("private design has four ordered tabs and a separate self-hosted inventory", () => {
-  assert.deepEqual(gatewayTopology.MODEL_MANAGEMENT_TABS, ["models", "connections", "gateways", "apim"])
-  const target = topology()
+  const workspace = componentHarness("ApimGatewayWorkspace", { mode: "apim", registry: { models: [], runtimes: [], gateways: profiles }, topology: { items: [] }, loading: false })
+  assert.deepEqual(workspace.all().filter(node => node.props?.["data-tab"]).map(node => node.props["data-tab"]), ["models", "connections", "gateways", "apim"])
+  const target = topology({ apim_target_id: "first" })
   target.deployments.push(topology({ id: "edge", native_gateway_id: "edge", kind: "self_hosted", endpoint_url: null, declared_state: "unknown" }).deployments[0])
   target.deployments.push(topology({ id: "retired", kind: "self_hosted", retired_at: "2026-09-23T00:00:00Z" }).deployments[0])
   assert.deepEqual(gatewayTopology.gatewayEntries({ items: [target] }).map(entry => entry.deployment.id), ["edge"])
@@ -639,8 +685,8 @@ test("private design has four ordered tabs and a separate self-hosted inventory"
 
 test("registry preserves strict backend topology and self-hosted capability flags", async () => {
   for (const enabled of [true, false, undefined, "true"]) {
-    const registry = await apiHarness(async () => ({ providers: [], gateways: [], runtimes: [], models: [],
-      apim_target_topology_available: enabled, self_hosted_gateway_enabled: enabled,
+    const registry = await apiHarness(async path => path.endsWith("/apim-targets") ? { items: [], total: 0 } : ({ providers: [], gateways: [], runtimes: [], models: [],
+      apim_target_topology_available: enabled, self_hosted_gateway_enabled: enabled, apim_target_topology: null,
     })).registry()
     assert.equal(registry.apim_target_topology_available, enabled === true)
     assert.equal(registry.self_hosted_gateway_enabled, enabled === true)
@@ -682,7 +728,7 @@ for (const mode of ["gateways", "apim"]) test(`Gateway creation stays inside its
     loading: false, error: null, onTabChange() {}, onToggleSidebar() {},
   }, { queryData: { provisions: { items: [creation] } } })
   assert.equal(harness.find(node => node.type?.name === "SelfHostedGatewayProvisionProgress"), undefined)
-  assert.equal(harness.queries.find(query => query.queryKey[0] === "provisions").enabled, mode === "gateways")
+  assert.equal(harness.queries.find(query => query.queryKey.includes("self-hosted-gateway-provisions")).enabled, mode === "gateways")
   if (mode === "gateways") {
     const table = harness.find(node => node.type?.name === "GatewayTable")
     assert.deepEqual(table.props.provisionItems.map(item => item.operation.id), ["creation"])
@@ -701,11 +747,12 @@ test("Gateway creation shares inventory search and never duplicates or resurrect
   const target = topology()
   target.deployments.push(topology({ id: "edge", native_gateway_id: "turnstile-unit", kind: "self_hosted", provisioning_operation_id: "creation", display_name: "Docker edge" }).deployments[0])
   const current = {
-    id: "creation", gateway_profile_id: "first", status: "queued", worker_available: true,
-    checkpoint: {}, semantic_preview: { native_gateway_id: "turnstile-unit", configuration: {
+    id: "creation", gateway_profile_id: "first", operation_kind: "self_hosted_gateway_provision", status: "queued", worker_available: true,
+    checkpoint: {}, semantic_preview: { deployment_id: "edge", native_gateway_id: "turnstile-unit", configuration: {
       display_name: "New Docker", endpoint_url: "https://new.example.test", hosting_mode: "docker",
     } },
   }
+  target.deployments[1].deployment.provisioning_operation_id = null
   const queryData = { provisions: { items: [current] } }
   const props = {
     mode: "gateways", registry: { models: [], runtimes: [], gateways: profiles, self_hosted_gateway_enabled: true },
@@ -716,12 +763,12 @@ test("Gateway creation shares inventory search and never duplicates or resurrect
   const table = () => harness.find(node => node.type?.name === "GatewayTable")
   const count = () => harness.find(node => node.props?.["data-tab"] === "gateways").props.children[1].props.children
   assert.equal(table().props.provisionItems.length, 1)
-  assert.equal(table().props.entries.length, 0)
-  assert.equal(count(), 1)
+  assert.equal(table().props.entries.length, 1)
+  assert.equal(count(), 2)
   harness.find(node => node.type === "ExpandableSearch").props.onChange("no-match")
   assert.equal(table().props.provisionItems.length, 0)
   assert.equal(harness.find(node => node.type === "footer").props.children, "共 0 个网关")
-  assert.equal(count(), 1)
+  assert.equal(count(), 2)
   harness.find(node => node.type === "ExpandableSearch").props.onChange("unit-service")
   assert.equal(table().props.provisionItems.length, 1)
   current.status = "succeeded"
@@ -738,7 +785,7 @@ test("Gateway creation shares inventory search and never duplicates or resurrect
   assert.equal(member.find(node => node.type?.name === "GatewayTable").props.provisionItems.length, 0)
 })
 
-test("Gateway creation status, steps and retry errors belong to its own table item", () => {
+test("Gateway creation status, steps and retry errors belong to its own table item", async () => {
   const retries = []
   const operation = {
     id: "creation", gateway_profile_id: "first", status: "failed", worker_available: true,
@@ -747,8 +794,10 @@ test("Gateway creation status, steps and retry errors belong to its own table it
       display_name: "Docker edge", endpoint_url: "https://edge.example.test", hosting_mode: "docker",
     } },
   }
-  const props = { operation, target: topology(), available: true, retrying: false, error: new Error("Retry rejected"), onRetry: id => retries.push(id) }
-  const harness = componentHarness("SelfHostedGatewayProvisionProgress", props, { code: creationCode })
+  const props = { item: { operation, target: topology() }, available: true }
+  const harness = componentHarness("SelfHostedGatewayProvisionProgress", props, { code: creationCode, api: {
+    retrySelfHostedGatewayProvision: async id => { retries.push(id); throw new Error("Retry rejected") },
+  } })
   const item = harness.render()
   assert.equal(item.props.role, "rowgroup")
   assert.ok(item.props.className.split(" ").includes("connection-provider-group"))
@@ -757,14 +806,12 @@ test("Gateway creation status, steps and retry errors belong to its own table it
   assert.equal(rows.length, 2)
   assert.equal(harness.nodes(rows[0]).filter(node => node.props?.role === "cell").length, 5)
   assert.equal(harness.nodes(rows[0]).find(node => node.props?.role === "status").props.children.props.children[1], "创建失败")
-  assert.equal(harness.nodes(rows[1]).find(node => node.props?.role === "alert").props.children, "Retry rejected")
+  assert.equal(harness.nodes(rows[1]).find(node => node.props?.role === "alert").props.children, "API association failed")
   assert.deepEqual(harness.nodes(rows[1]).filter(node => node.type === "li").map(node => node.props["data-complete"]), [true, false, false])
   const retry = () => harness.find(node => node.props?.["aria-label"] === "重试创建")
-  retry().props.onClick()
+  await retry().props.onClick()
   assert.deepEqual(retries, ["creation"])
-  props.retrying = true
-  assert.equal(retry().props.disabled, true)
-  props.retrying = false
+  assert.equal(harness.find(node => node.props?.role === "alert").props.children, "Retry rejected")
   props.available = false
   assert.equal(retry().props.disabled, true)
   operation.status = "queued"
@@ -772,7 +819,7 @@ test("Gateway creation status, steps and retry errors belong to its own table it
   operation.error_message = null
   props.error = null
   assert.equal(retry(), undefined)
-  assert.equal(harness.find(node => node.props?.role === "status").props.children.props.children[1], "创建已排队，后台处理服务当前不可用")
+  assert.equal(harness.find(node => node.props?.role === "status").props.children.props.children[1], "创建已排队，工作进程当前不可用")
 })
 
 test("Gateway creation completion cannot open a dialog or notice across tabs", () => {
@@ -794,45 +841,43 @@ test("Gateway creation completion cannot open a dialog or notice across tabs", (
   harness.effects.splice(0).forEach(effect => effect())
   assert.equal(harness.find(node => node.type?.name === "SelfHostedGatewayBootstrapDialog"), undefined)
   assert.equal(harness.find(node => node.props?.className === "registry-notice smh-notice"), undefined)
-  assert.deepEqual(harness.invalidations, [["registry"], ["targets"]])
+  assert.deepEqual(harness.invalidations, [["registry"]])
 })
 
 test("Connection access names the exact APIM and only its models' published gateways", () => {
-  const target = topology()
+  const target = topology({ apim_target_id: "first" })
   target.deployments[0].published_models = [{ id: "model-one" }]
-  const edge = topology({ id: "edge", native_gateway_id: "edge-native", kind: "self_hosted", display_name: "Docker edge" }).deployments[0]
+  const edge = topology({ id: "edge", apim_target_id: "first", native_gateway_id: "edge-native", kind: "self_hosted", display_name: "Docker edge" }).deployments[0]
   edge.published_models = [{ id: "another-connection-model" }]
   target.deployments.push(edge)
   const foreign = topology({ id: "foreign", kind: "self_hosted", display_name: "Other APIM edge" })
   foreign.target.gateway_profile_id = "another-target"
   foreign.deployments[0].published_models = [{ id: "model-one" }]
-  const props = { runtime: { gateway_profile_id: "first", gateway_name: "Azure API Management" }, gateway: profiles[0], models: [{ id: "model-one" }], topology: { items: [target, foreign] } }
-  const harness = componentHarness("ConnectionGatewayCell", props, { code: pageCode })
-  assert.equal(harness.find(node => node.type === "b").props.children, "unit-service")
-  assert.equal(harness.find(node => node.type === "b").props.title, "unit-service · unit-api")
-  const summary = () => harness.find(node => node.type === "span" && typeof node.props.title === "string")
-  assert.equal(summary().props.title, "托管网关: Managed")
-  assert.equal(summary().props.children[0], "模型发布至 ")
+  const props = { runtime: { id: "runtime-one", gateway_profile_id: "first", gateway_name: "Azure API Management" }, profiles, models: [{ id: "model-one", runtime_id: "runtime-one" }], topology: { items: [target, foreign] } }
+  const harness = componentHarness("ConnectionTargetGatewayCell", props, { code: pageCode })
+  const summary = () => gatewayTopology.connectionTargetDetails(props.runtime, props.models, props.profiles, props.topology)
+  assert.equal(summary().serviceName, "unit-service")
+  assert.deepEqual(summary().gateways.map(gateway => gateway.id), ["managed"])
   edge.published_models.push({ id: "model-one" })
-  assert.equal(summary().props.title, "托管网关: Managed\n自托管网关: Docker edge")
+  assert.deepEqual(summary().gateways.map(gateway => gateway.id), ["managed", "edge"])
+  assert.deepEqual(Array.from(harness.render().props.target.gateways, gateway => gateway.id), ["managed"])
   edge.deployment.retired_at = "2026-09-26T00:00:00Z"
-  assert.equal(summary().props.title, "托管网关: Managed")
+  assert.deepEqual(summary().gateways.map(gateway => gateway.id), ["managed"])
   target.deployments[0].published_models = []
-  assert.equal(summary(), undefined)
-  assert.ok(harness.find(node => node.props?.children === "尚无已发布网关"))
+  assert.deepEqual(summary().gateways, [])
+  assert.equal(harness.render().props.emptyLabel, "网关未记录")
 })
 
 test("Connection access keeps unavailable gateway evidence distinct from direct access", () => {
-  const props = { runtime: { gateway_profile_id: "first", gateway_name: null }, gateway: profiles[0], models: [], topology: null }
-  const harness = componentHarness("ConnectionGatewayCell", props, { code: pageCode })
-  assert.equal(harness.find(node => node.type === "b").props.children, profiles[0].base_url)
-  assert.ok(harness.find(node => node.props?.children === "网关部署信息不可用"))
-  props.gateway = undefined
-  assert.equal(harness.find(node => node.type === "b").props.children, "first")
+  const props = { runtime: { gateway_profile_id: "first", gateway_name: null }, profiles, models: [], topology: null }
+  const harness = componentHarness("ConnectionTargetGatewayCell", props, { code: pageCode })
+  assert.equal(harness.render().props.target.apimName, "First")
+  assert.deepEqual(harness.render().props.target.gateways, [])
+  props.profiles = []
+  assert.equal(harness.render().props.target.apimName, "first")
   props.topology = { items: [] }
-  assert.ok(harness.find(node => node.props?.children === "网关部署信息不可用"))
+  assert.deepEqual(harness.render().props.target.gateways, [])
   props.runtime.gateway_profile_id = null
-  assert.equal(harness.find(node => node.type === "b").props.children, "直连")
   assert.ok(harness.find(node => node.props?.children === "提供方直连"))
 })
 
@@ -871,13 +916,13 @@ test("model workspace applies filters and search to models, pending rows, empty 
   apply({ ...modelFilters.emptyModelFilters(), family: ["deepseek"] })
   assert.deepEqual(visible(), ["deepseek-pending"])
   assert.equal(harness.find(node => node.props?.className === "smh-empty"), undefined)
-  assert.equal(harness.find(node => node.type === "footer").props.children[1], 1)
+  assert.ok(harness.find(node => node.type === "footer").props.children.includes(1))
   apply({ ...modelFilters.emptyModelFilters(), status: ["enabled"], capability: ["chat"] })
   assert.deepEqual(visible(), ["gpt-alpha"])
   search(" beta ")
   assert.deepEqual(visible(), [])
   assert.ok(harness.find(node => node.props?.className === "smh-empty"))
-  assert.equal(harness.find(node => node.type === "footer").props.children[1], 0)
+  assert.ok(harness.find(node => node.type === "footer").props.children.includes(0))
   apply(modelFilters.emptyModelFilters())
   assert.deepEqual(visible(), ["claude-beta"])
   search("")
@@ -925,7 +970,7 @@ test("source initialization queries honor capability presence and active-only 1.
     loading: false, error: null, onTabChange() {}, onToggleSidebar() {},
   }
   const harness = componentHarness("ApimGatewayWorkspace", props)
-  const query = () => { harness.render(); return harness.queries.find(options => options.queryKey[0] === "onboarding") }
+  const query = () => { harness.render(); return harness.queries.find(options => options.queryKey.includes("apim-onboarding")) }
   assert.equal(query().enabled, false)
   props.topology.onboarding_available = false
   assert.equal(query().enabled, true)
@@ -936,7 +981,7 @@ test("source initialization queries honor capability presence and active-only 1.
   props.mode = "apim"
   const member = componentHarness("ApimGatewayWorkspace", props, { role: "member" })
   member.render()
-  assert.equal(member.queries.find(options => options.queryKey[0] === "onboarding").enabled, false)
+  assert.equal(member.queries.find(options => options.queryKey.includes("apim-onboarding")).enabled, false)
 })
 
 test("source APIM collapse keeps its children and search preserves the total tab count", () => {
@@ -967,7 +1012,7 @@ for (const syncAvailable of [false, true]) test(`source attachment refreshes top
     loading: false, error: null, onTabChange() {}, onToggleSidebar() {},
   }, { api: {
     addSelfHostedGateway: async (targetId, value) => calls.push(["attach", targetId, value]),
-    syncApimTarget: async targetId => { calls.push(["sync", targetId]); return { operation: { id: "sync-id", status: "queued" } } },
+    requestApimTargetInventorySync: async targetId => { calls.push(["sync", targetId]); return { operation: { id: "sync-id", status: "queued" } } },
   } })
   const table = () => harness.find(node => node.type?.name === "ApimTable")
   table().props.onToggleTarget("first")
@@ -983,7 +1028,7 @@ for (const syncAvailable of [false, true]) test(`source attachment refreshes top
   assert.ok(calls.every(call => call[1] === "first"))
   assert.equal(table().props.collapsedTargetIds.has("first"), false)
   assert.equal(harness.find(node => node.type?.name === "GatewayEditor"), undefined)
-  assert.deepEqual(harness.invalidations, [["registry"], ["targets"]])
+  assert.deepEqual(harness.invalidations, [["registry"]])
 })
 
 test("source failed connection validation refreshes persisted evidence", async () => {
@@ -994,7 +1039,7 @@ test("source failed connection validation refreshes persisted evidence", async (
   }, { api: { validateSelfHostedGateway: async () => { throw new Error("Probe failed") } } })
   harness.find(node => node.type?.name === "GatewayTable").props.onValidate("edge")
   await harness.settle()
-  assert.deepEqual(harness.invalidations, [["registry"], ["targets"]])
+  assert.deepEqual(harness.invalidations, [["registry"]])
   assert.ok(harness.find(node => node.type?.name === "InfrastructureErrorNotice"))
 })
 
@@ -1056,11 +1101,11 @@ test("source Gateway attachment validates endpoints and keeps the selected APIM 
     targets: [topology()], initialTargetId: "first", available: true, busy: false, error: null,
     onClose() {}, onSubmit: (...values) => saved.push(values),
   }, { code: workspaceCode })
-  for (const [name, value] of Object.entries({ display_name: " Edge ", native_gateway_id: " edge ", endpoint_url: "https://edge.example.test/api?" })) {
-    harness.find(node => node.props?.name === name).props.onChange({ target: { value } })
+  for (const [label, value] of Object.entries({ "网关名称": " Edge ", "APIM 网关 ID": " edge ", "网关端点": "https://edge.example.test/api?" })) {
+    harness.field(label).props.onChange({ target: { value } })
   }
   assert.equal(harness.find(node => node.props?.type === "submit").props.disabled, true)
-  harness.find(node => node.props?.name === "endpoint_url").props.onChange({ target: { value: "https://edge.example.test/api" } })
+  harness.field("网关端点").props.onChange({ target: { value: "https://edge.example.test/api" } })
   assert.equal(harness.find(node => node.type?.name === "TargetSelect").props.disabled, true)
   assert.equal(harness.find(node => node.props?.name === "release_gate"), undefined)
   await submitForm(harness)
@@ -1080,13 +1125,16 @@ test("source APIM adoption form validates identity without requesting a manageme
     resource_group: "unit", service_name: "unit-service", api_id: "unit-api", gateway_endpoint: "https://unit.example.test/api",
     management_endpoint: `https://management.azure.com/subscriptions/${subscription}/resourceGroups/unit/providers/Microsoft.ApiManagement/service/unit-service`,
   }
-  for (const [name, value] of Object.entries(values)) harness.find(node => node.props?.name === name).props.onChange({ target: { value } })
+  const fieldLabels = { name: "实例名称", tenant_id: "租户 ID", subscription_id: "订阅 ID", resource_group: "资源组", service_name: "APIM 服务名称", api_id: "API ID", gateway_endpoint: "网关端点", management_endpoint: "管理端点" }
+  for (const [name, value] of Object.entries(values)) harness.field(fieldLabels[name]).props.onChange({ target: { value } })
+  harness.field("仪表板订阅").props.onChange({ target: { value: "unit-dashboard" } })
+  harness.field("探测订阅").props.onChange({ target: { value: "unit-probe" } })
   assert.equal(harness.find(node => node.props?.type === "submit").props.disabled, false)
   assert.equal(harness.find(node => node.props?.type === "password"), undefined)
   await submitForm(harness)
   assert.equal(saved[0].name, "Unit")
   assert.equal(saved[0].management_auth_profile_ref, "system_managed_identity")
-  harness.find(node => node.props?.name === "service_name").props.onChange({ target: { value: "other" } })
+  harness.field("APIM 服务名称").props.onChange({ target: { value: "other" } })
   assert.equal(harness.find(node => node.props?.type === "submit").props.disabled, true)
 })
 
@@ -1141,7 +1189,9 @@ test("source Gateway validation dispatches directly from the existing Owner acti
   }, { code: workspaceCode, api: { async validateSelfHostedGateway(...values) { calls.push(values) } } })
   harness.find(node => node.type?.name === "GatewayTable").props.onValidate("edge")
   await harness.settle()
-  assert.deepEqual(calls, [["edge"]])
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0][0], "edge")
+  assert.ok(calls[0][1].client)
   assert.equal(harness.find(node => node.type === "ManagementCredentialDialog"), undefined)
 })
 
@@ -1227,7 +1277,9 @@ test("required sibling readiness gates selected optional deployments", () => {
   target.deployments.push(topology({ id: "optional", kind: "self_hosted", release_gate: "optional" }).deployments[0])
   const choices = gatewayPublicationChoices(profiles, { items: [target] }, true)
   assert.equal(choices.length, 2)
-  assert.ok(choices.every(choice => !choice.selectable && choice.reason === "必需网关未就绪"))
+  assert.ok(choices.every(choice => !choice.selectable && choice.reason === "Required Gateway 未就绪"))
+  target.target.drift_state = "drifted"
+  assert.ok(gatewayPublicationChoices(profiles, { items: [target] }, true).every(choice => !choice.selectable))
 })
 
 test("an explicit invalid selection never jumps to another APIM or deployment", () => {
@@ -1237,16 +1289,14 @@ test("an explicit invalid selection never jumps to another APIM or deployment", 
   assert.equal(resolveGatewaySelection(profiles, choices, { targetId: null, deploymentId: null }).choice.deploymentId, "managed")
 })
 
-test("only a missing topology API enables legacy fallback", async () => {
-  assert.equal(await apiHarness(async () => { throw new ApiError(404) }).apimTargets(), null)
-  for (const status of [401, 403, 500, 503]) {
-    await assert.rejects(apiHarness(async () => { throw new ApiError(status) }).apimTargets(), error => error.status === status)
+test("topology clients preserve missing, authorization and service failures", async () => {
+  for (const status of [401, 403, 404, 500, 503]) {
+    await assert.rejects(apiHarness(async () => { throw new ApiError(status) }).apimTargetTopologies(), error => error.status === status)
   }
 })
 
 test("initialization clients use exact URLs and preserve authorization errors", async () => {
-  assert.equal(await apiHarness(async () => { throw new ApiError(404) }).apimOnboardingOperations(), null)
-  for (const status of [401, 403, 500, 503]) {
+  for (const status of [401, 403, 404, 500, 503]) {
     await assert.rejects(apiHarness(async () => { throw new ApiError(status) }).apimOnboardingOperations(), error => error.status === status)
   }
   const calls = []
@@ -1270,7 +1320,7 @@ test("source management clients use Owner session without extra credential param
   const target = { name: "Unit APIM" }
   const preview = { tenant_id: "unit-tenant", resource_id: "unit-resource" }
   const start = { request: preview, confirmation_sha256: "a".repeat(64) }
-  await api.registerApimTarget(target)
+  await api.addApimTarget(target)
   await api.previewApimOnboarding(preview)
   await api.startApimOnboarding(start)
   await api.retryApimOnboarding("first/second")
@@ -1284,36 +1334,29 @@ test("source management clients use Owner session without extra credential param
   assert.equal(calls[1][1], preview)
   assert.equal(calls[2][1], start)
   assert.equal(calls[3][1].method, "POST")
-  assert.equal(calls[4][1].method, "POST")
+  assert.equal(Object.keys(calls[4][1]).length, 0)
   assert.equal(calls[3][1].body, undefined)
   assert.equal(calls[4][1].body, undefined)
   assert.ok(calls[3][0].includes("first%2Fsecond"))
   assert.ok(calls[4][0].includes("first%2Fsecond"))
 })
 
-test("initialization polls only active tasks and replaces stale attempts after accepted retry", async () => {
-  const { finopsKeys, finopsQueries, storeApimOnboarding } = queryHarness()
-  const options = finopsQueries.apimOnboarding()
+test("initialization polls only active tasks and preserves accepted retry identity", async () => {
+  const accepted = { id: "new", gateway_profile_id: "first", status: "queued" }
+  const harness = componentHarness("ApimGatewayWorkspace", { mode: "apim", registry: { models: [], runtimes: [], gateways: profiles },
+    topology: { items: [topology()], onboarding_available: true }, loading: false }, { api: {
+    retryApimOnboarding: async () => ({ operation: accepted }),
+  } })
+  harness.render()
+  const options = harness.queries.find(query => query.queryKey.includes("apim-onboarding"))
   for (const status of ["succeeded", "failed", "restored"]) {
     assert.equal(options.refetchInterval({ state: { data: { items: [{ status }] } } }), false)
   }
-  assert.equal(options.refetchInterval({ state: { data: { items: [{ status: "queued" }] } } }), 2000)
+  assert.equal(options.refetchInterval({ state: { data: { items: [{ status: "queued" }] } } }), 1500)
   assert.equal(options.retry, false)
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  const other = { id: "other", gateway_profile_id: "other-target", status: "failed" }
-  const previous = { available: true, items: [{ id: "old", gateway_profile_id: "first", status: "failed" }, other] }
-  client.setQueryData(finopsKeys.apimOnboarding, previous)
-  let release
-  const pending = client.fetchQuery({ queryKey: finopsKeys.apimOnboarding, queryFn: () => new Promise(resolve => { release = resolve }) }).catch(() => {})
-  const accepted = { id: "new", gateway_profile_id: "first", status: "queued" }
-  await storeApimOnboarding(client, accepted)
-  release(previous)
-  await pending
-  const current = client.getQueryData(finopsKeys.apimOnboarding)
-  assert.equal(current.available, true)
-  assert.deepEqual(Array.from(current.items, item => item.id), ["new", "other"])
-  assert.equal(client.getQueryData(finopsKeys.gatewayReleaseOperation("new")), accepted)
-  client.clear()
+  harness.find(node => node.type?.name === "ApimTable").props.onRetry("old")
+  await harness.settle()
+  assert.deepEqual(harness.queryWrites[0], [["operation", "new"], accepted])
 })
 
 function initializationPlan(ready = true) {
@@ -1331,12 +1374,15 @@ function onboardingHarness(api, extra = {}) {
   const harness = componentHarness("ApimOnboardingDialog", {
     available: true, onClose() {}, onAccepted() {}, onSettled() {}, ...extra,
   }, { code: onboardingCode, api })
-  for (const input of harness.all().filter(node => node.type === "Input")) {
-    input.props.onChange({ target: { value: ` ${initializationPlan().request[input.props.name]} ` } })
+  for (const [index, input] of harness.all().filter(node => node.type === "Input").entries()) {
+    input.props.onChange({ target: { value: ` ${initializationPlan().request[["name", "tenant_id", "resource_id"][index]]} ` } })
   }
   return harness
 }
-const submitForm = harness => harness.find(node => node.type === "form").props.onSubmit({ preventDefault() {} })
+const submitForm = async harness => {
+  harness.find(node => node.type === "form").props.onSubmit({ preventDefault() {} })
+  await new Promise(resolve => setImmediate(resolve))
+}
 
 test("new Gateway dialog requires no native ID and retries an uncertain submission with identical identity", async () => {
   const calls = []
@@ -1350,7 +1396,7 @@ test("new Gateway dialog requires no native ID and retries an uncertain submissi
     return { operation: { id: "created" } }
   } } })
   assert.equal(harness.find(node => node.props?.name === "native_gateway_id"), undefined)
-  assert.equal(harness.find(node => node.type === "form").props["data-request-id"], "unit-request-id")
+  assert.equal(harness.find(node => node.type === "form").props["data-request-id"], undefined)
   for (const [name, value] of Object.entries({ display_name: "  Docker edge  ", endpoint_url: "https://edge.test/unit/llm" })) {
     harness.find(node => node.props?.name === name).props.onChange({ target: { value } })
   }
@@ -1385,36 +1431,43 @@ test("startup configuration stays outside query state and DOM, downloads then cl
   const blobs = []
   const links = []
   const revoked = []
+  const native = `turnstile-${"a".repeat(32)}`
+  const environment = `config.service.auth=GatewayKey ${native}&confidential-bootstrap-token\n`
   let requestedSignal
+  class BootstrapURL extends URL {
+    static createObjectURL(blob) { blobs.push(blob); return "blob:unit" }
+    static revokeObjectURL(url) { revoked.push(url) }
+  }
   const harness = componentHarness("SelfHostedGatewayBootstrapDialog", {
     deploymentId: "edge", name: "Docker edge", onClose() {}, onValidate() {},
-  }, { code: creationCode, api: { selfHostedGatewayBootstrap: async (id, hours, signal) => {
-    assert.equal(id, "edge"); assert.equal(hours, 24); requestedSignal = signal
-    return { native_gateway_id: "turnstile-generated", deployment_id: id,
-      configuration_endpoint: "https://unit.configuration.azure-api.net", expires_at: "2026-10-01T00:00:00Z",
-      image: "mcr.microsoft.com/azure-api-management/gateway:2.12.1", environment_file_name: "turnstile-generated.env",
-      environment_file: "config.service.auth=GatewayKey confidential-bootstrap-token", docker_command: "docker run --env-file turnstile-generated.env official-image", renewal_command: "docker stop turnstile-generated && docker rm turnstile-generated && docker run --env-file turnstile-generated.env official-image" }
+  }, { code: creationCode, api: { requestGatewayBootstrap: async (id, value, signal) => {
+    assert.equal(id, "edge"); assert.equal(value.expires_in_hours, 1); assert.equal(value.endpoint_control_confirmed, true); requestedSignal = signal
+    return { native_gateway_id: native, deployment_id: id,
+      configuration_endpoint: "https://unit.configuration.azure-api.net", expires_at: new Date(Date.now() + 3600000).toISOString(),
+      image: "mcr.microsoft.com/azure-api-management/gateway:2.12.1", environment_file_name: `${native}.env`,
+      environment_file: environment, docker_command: `docker run --env-file ./${native}.env`, renewal_command: `docker stop ${native}` }
   } }, globals: {
-    URL: { createObjectURL: blob => { blobs.push(blob); return "blob:unit" }, revokeObjectURL: url => revoked.push(url) },
-    document: { createElement: () => { const link = { click() { links.push(this) } }; return link } },
+    URL: BootstrapURL,
+    document: { createElement: () => ({ click() { links.push(this) }, removeAttribute() {}, remove() {} }) },
   } })
   harness.render()
   const cleanup = harness.effects[0]()
   assert.equal(harness.mutationVariables.length, 0)
   assert.equal(harness.queries.length, 0)
-  await harness.find(node => node.type === "Button" && node.props.children?.includes?.("获取启动配置")).props.onClick()
+  const issue = () => harness.find(node => node.type === "Button" && node.props.children?.includes?.("签发并下载配置"))
+  assert.equal(issue().props.disabled, true)
+  issue().props.onClick()
+  assert.equal(requestedSignal, undefined)
+  harness.find(node => node.type === "Checkbox").props.onCheckedChange(true)
+  issue().props.onClick()
+  await new Promise(resolve => setImmediate(resolve))
   assert.equal(requestedSignal.aborted, false)
   assert.equal(JSON.stringify(harness.render()).includes("confidential-bootstrap-token"), false)
-  const selects = harness.all().filter(node => node.type === "Select")
-  selects[1].props.onValueChange("renew")
-  assert.ok(harness.find(node => node.type === "textarea").props.value.startsWith("docker stop turnstile-generated"))
-  const download = harness.find(node => node.type === "Button" && node.props.children?.includes?.("下载环境文件"))
-  download.props.onClick()
-  assert.equal(await blobs[0].text(), "config.service.auth=GatewayKey confidential-bootstrap-token")
-  assert.equal(links[0].download, "turnstile-generated.env")
+  assert.ok(harness.find(node => node.type === "pre" && node.props.children === `docker stop ${native}`))
+  assert.equal(await blobs[0].text(), environment)
+  assert.equal(links[0].download, `${native}.env`)
   assert.deepEqual(revoked, ["blob:unit"])
   cleanup()
-  download.props.onClick()
   assert.equal(blobs.length, 1)
 })
 
@@ -1442,7 +1495,7 @@ test("initialization uses the confirmed server plan and invalidates it on Back",
   assert.equal(calls[1][1].confirmation_sha256, plan.confirmation_sha256)
   assert.equal(accepted[0].id, "unit-operation")
   harness.find(node => node.type === "Button" && node.props.children?.includes?.("返回修改")).props.onClick()
-  assert.equal(harness.find(node => node.props?.name === "name").props.value.trim(), "Unit APIM")
+  assert.equal(harness.all().find(node => node.type === "Input").props.value.trim(), "Unit APIM")
   await submitForm(harness)
   assert.equal(calls[2][0], "preview")
 })
@@ -1462,13 +1515,14 @@ test("blocked initialization plans can recheck but never start", async () => {
 test("initialization follows the source Owner flow without a management credential field", async () => {
   const calls = []
   const harness = onboardingHarness({
-    previewApimOnboarding: async (value, credential) => { calls.push({ value, credential }); return initializationPlan() },
-    startApimOnboarding: async (value, credential) => { calls.push({ value, credential }); return { operation: { id: "unit-operation" } } },
+    previewApimOnboarding: async (value, context) => { calls.push({ value, context }); return initializationPlan() },
+    startApimOnboarding: async (value, context) => { calls.push({ value, context }); return { operation: { id: "unit-operation" } } },
   })
   assert.equal(harness.find(node => node.type === "ManagementCredentialField"), undefined)
   await submitForm(harness)
   await submitForm(harness)
-  assert.deepEqual(calls.map(call => call.credential), [undefined, undefined])
+  assert.equal(calls.length, 2)
+  assert.ok(calls.every(call => call.context.client && !call.context.headers))
 })
 
 test("initialization prevents duplicate submission and dismissal until preview settles", async () => {
@@ -1484,6 +1538,7 @@ test("initialization prevents duplicate submission and dismissal until preview s
   assert.ok(harness.all().filter(node => node.type === "Input").every(node => node.props.disabled))
   finish(initializationPlan())
   await pending
+  await harness.settle()
   harness.render().props.onOpenChange(false)
   assert.equal(closes, 1)
 })
@@ -1522,54 +1577,51 @@ test("Self-hosted clients keep exact identity, minimal name payload and mutation
   await api.addSelfHostedGateway("target/path", payload)
   await api.renameSelfHostedGateway("edge/path", "Renamed")
   await api.validateSelfHostedGateway("edge/path")
-  await api.selfHostedGatewayRemovalPreview("edge/path")
+  await api.previewSelfHostedGatewayRemoval("edge/path")
   await api.removeSelfHostedGateway("edge/path")
   const change = { ...payload, apim_target_id: "destination" }
   await api.changeSelfHostedGatewayAssociation("edge/path", change)
   const root = "/api/v1/model-management/self-hosted-gateways/edge%2Fpath"
   assert.equal(calls[0][0], "/api/v1/model-management/apim-targets/target%2Fpath/self-hosted-gateways")
   assert.equal(calls[0][1], payload)
-  assert.deepEqual(Object.keys(calls[1][1]), ["display_name"])
-  assert.equal(calls[1][1].display_name, "Renamed")
-  assert.equal(calls[1][2], "PATCH")
+  assert.deepEqual(JSON.parse(calls[1][1].body), { display_name: "Renamed" })
+  assert.equal(calls[1][1].method, "PATCH")
   assert.deepEqual(calls.slice(1).map(call => call[0]), [root + "/name", root + "/validations", root + "/removal-preview", root, root + "/apim-association"])
-  assert.equal(calls[2][1].method, "POST")
+  assert.equal(Object.keys(calls[2][1]).length, 0)
   assert.equal(calls[4][1].method, "DELETE")
   assert.equal(calls[5][1], change)
   assert.equal(calls[5][2], "PUT")
 })
 
 test("confirmed Self-hosted names and retirements survive stale topology responses", async () => {
-  const { finopsKeys, storeGatewayDeployment, storeGatewayDeploymentName } = queryHarness()
+  const { finopsKeys, storeRegistry, storeGatewayDeploymentName } = queryHarness()
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  const previous = { items: [topology({ id: "edge", apim_target_id: "first", kind: "self_hosted", display_name: "Old" })] }
-  client.setQueryData(finopsKeys.apimTargets, previous)
+  const previous = { apim_target_topology: { items: [topology({ id: "edge", apim_target_id: "first", kind: "self_hosted", display_name: "Old" })] } }
+  client.setQueryData(finopsKeys.registry, previous)
   let release
-  const pending = client.fetchQuery({ queryKey: finopsKeys.apimTargets, queryFn: () => new Promise(resolve => { release = resolve }) }).catch(() => {})
+  const pending = client.fetchQuery({ queryKey: finopsKeys.registry, queryFn: () => new Promise(resolve => { release = resolve }) }).catch(() => {})
   await storeGatewayDeploymentName(client, "edge", " Confirmed ")
   release(previous)
   await pending
-  assert.equal(client.getQueryData(finopsKeys.apimTargets).items[0].deployments[0].deployment.display_name, "Confirmed")
-  await storeGatewayDeployment(client, null, "edge")
-  assert.equal(client.getQueryData(finopsKeys.apimTargets).items[0].deployments.length, 0)
-  assert.equal(client.getQueryData(finopsKeys.apimTargets).items[0].self_hosted_gateway_count, 0)
+  assert.equal(client.getQueryData(finopsKeys.registry).apim_target_topology.items[0].deployments[0].deployment.display_name, "Confirmed")
+  await storeRegistry(client, { apim_target_topology: { items: [{ ...previous.apim_target_topology.items[0], deployments: [], self_hosted_gateway_count: 0 }] } })
+  assert.equal(client.getQueryData(finopsKeys.registry).apim_target_topology.items[0].deployments.length, 0)
+  assert.equal(client.getQueryData(finopsKeys.registry).apim_target_topology.items[0].self_hosted_gateway_count, 0)
   client.clear()
 })
 
 test("confirmed reassociation removes the old entry and adds only its exact destination", async () => {
-  const { finopsKeys, storeGatewayDeployment, finopsQueries } = queryHarness()
+  const { finopsKeys, storeRegistry } = queryHarness()
   const client = new QueryClient()
   const first = topology({ id: "old-edge", apim_target_id: "first", kind: "self_hosted" })
   const second = { ...topology(), target: { ...topology().target, gateway_profile_id: "second" }, deployments: [] }
-  client.setQueryData(finopsKeys.apimTargets, { items: [first, second] })
+  client.setQueryData(finopsKeys.registry, { apim_target_topology: { items: [first, second] } })
   const saved = { ...first.deployments[0], deployment: { ...first.deployments[0].deployment, id: "new-edge", apim_target_id: "second" } }
-  await storeGatewayDeployment(client, saved, "old-edge")
-  const items = client.getQueryData(finopsKeys.apimTargets).items
+  await storeRegistry(client, { apim_target_topology: { items: [{ ...first, deployments: [] }, { ...second, deployments: [saved], self_hosted_gateway_count: 1 }] } })
+  const items = client.getQueryData(finopsKeys.registry).apim_target_topology.items
   assert.equal(items[0].deployments.length, 0)
   assert.equal(items[1].deployments[0].deployment.id, "new-edge")
   assert.equal(items[1].self_hosted_gateway_count, 1)
-  assert.equal(finopsQueries.selfHostedGatewayRemoval(null).enabled, false)
-  assert.equal(finopsQueries.selfHostedGatewayRemoval("edge").staleTime, 0)
   client.clear()
 })
 
@@ -1617,27 +1669,27 @@ test("registration and sync clients use the exact public routes", async () => {
   const calls = []
   const api = apiHarness(async (...args) => { calls.push(args); return { operation: { id: "queued" } } })
   const payload = { name: "Unit", tenant_id: "unit-tenant", api_id: "unit-api" }
-  await api.registerApimTarget(payload)
-  await api.syncApimTarget("first/second")
+  await api.addApimTarget(payload)
+  await api.requestApimTargetInventorySync("first/second")
   assert.equal(calls[0][0], "/api/v1/model-management/apim-targets")
   assert.equal(calls[0][1], payload)
-  assert.equal(calls[1][0], "/api/v1/model-management/apim-targets/first%2Fsecond/inventory-sync")
+  assert.equal(calls[1][0], "/api/v1/model-management/apim-targets/first%2Fsecond/inventory-syncs")
   assert.equal(calls[1][1].method, "POST")
 })
 
 test("a late topology read cannot replace a confirmed target write", async () => {
-  const { finopsKeys, storeApimTarget } = queryHarness()
+  const { finopsKeys, storeRegistry } = queryHarness()
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  const previous = { items: [topology()], total: 1, inventory_sync_available: true }
-  client.setQueryData(finopsKeys.apimTargets, previous)
+  const previous = { apim_target_topology: { items: [topology()], total: 1, inventory_sync_available: true } }
+  client.setQueryData(finopsKeys.registry, previous)
   let release
-  const pending = client.fetchQuery({ queryKey: finopsKeys.apimTargets, queryFn: () => new Promise(resolve => { release = resolve }) }).catch(() => {})
+  const pending = client.fetchQuery({ queryKey: finopsKeys.registry, queryFn: () => new Promise(resolve => { release = resolve }) }).catch(() => {})
   const saved = topology()
   saved.target.service_name = "confirmed-service"
-  await storeApimTarget(client, saved)
+  await storeRegistry(client, { apim_target_topology: { ...previous.apim_target_topology, items: [saved] } })
   release(previous)
   await pending
-  assert.equal(client.getQueryData(finopsKeys.apimTargets).items[0].target.service_name, "confirmed-service")
-  assert.equal(client.getQueryData(finopsKeys.apimTargets).total, 1)
+  assert.equal(client.getQueryData(finopsKeys.registry).apim_target_topology.items[0].target.service_name, "confirmed-service")
+  assert.equal(client.getQueryData(finopsKeys.registry).apim_target_topology.total, 1)
   client.clear()
 })

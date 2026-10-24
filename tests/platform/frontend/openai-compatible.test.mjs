@@ -1,14 +1,36 @@
 import assert from "node:assert/strict"
+import { readFileSync } from "node:fs"
+import { createRequire } from "node:module"
 import test from "node:test"
+import { fileURLToPath } from "node:url"
+import { runInNewContext } from "node:vm"
 
-import {
-  displayNameFromProviderId,
-  isOpenAICompatibleBaseUrl,
-  isUnsupportedOpenAICompatibleDetails,
-  modelVendorFromMetadata,
-  modelVendorLabel,
-  publicModelKeyFromProviderId,
-} from "../../../frontend/src/components/model-management/openai-compatible.ts"
+import { isOpenAICompatibleBaseUrl } from "../../../frontend/src/components/model-management/openai-compatible.ts"
+
+const frontendRequire = createRequire(new URL("../../../frontend/package.json", import.meta.url))
+const { rolldown } = await import(frontendRequire.resolve("rolldown"))
+async function helpers(relativePath, expose = []) {
+  const entry = fileURLToPath(new URL(relativePath, import.meta.url))
+  const bundle = await rolldown({ input: entry, external: identity => identity !== entry,
+    transform: { jsx: { runtime: "automatic" } }, treeshake: false,
+    plugins: expose.length ? [{ name: "test-current-helper-exports", load(identity) {
+      if (identity === entry) return `${readFileSync(entry, "utf8")}\nexport { ${expose.join(", ")} }`
+    } }] : [],
+  })
+  try {
+    const exports = {}
+    const code = (await bundle.generate({ format: "cjs" })).output[0].code
+    runInNewContext(code, { exports, require: () => new Proxy({}, { get: (_target, key) => key }) })
+    return exports
+  } finally { await bundle.close() }
+}
+const { displayNameFromProviderId, publicModelKeyFromProviderId, publicationErrorMessage } = await helpers(
+  "../../../frontend/src/components/model-management/model-publication-dialog.tsx",
+  ["displayNameFromProviderId", "publicModelKeyFromProviderId", "publicationErrorMessage"],
+)
+const { modelVendorFromMetadata, modelVendorLabel } = await helpers(
+  "../../../frontend/src/components/model-management/model-vendor-select.tsx",
+)
 
 test("compatible endpoints accept HTTPS bases and full chat paths only without URL credentials", () => {
   for (const value of ["https://api.example.test/v1", " https://api.example.test/v1/chat/completions "]) {
@@ -44,14 +66,14 @@ test("explicit vendor metadata wins over a display-name guess", () => {
   assert.equal(modelVendorLabel("anthropic"), "Anthropic")
 })
 
-test("old schema detection requires both exact provider and endpoint rejections", () => {
-  const provider = { type: "literal_error", loc: ["body", "provider", "template"], input: "openai_compatible" }
-  const endpoint = { type: "extra_forbidden", loc: ["body", "openai_base_url"] }
-  assert.equal(isUnsupportedOpenAICompatibleDetails({ detail: [provider, endpoint] }), true)
-  for (const value of [null, {}, { detail: "invalid" }, { detail: [provider] }, { detail: [endpoint] },
-    { detail: [{ ...provider, input: "microsoft_foundry" }, endpoint] },
-    { detail: [{ ...provider, loc: ["body", "other", "template"] }, endpoint] },
-    { detail: [null, 1, "value"] }]) {
-    assert.equal(isUnsupportedOpenAICompatibleDetails(value), false)
-  }
+test("current publication validation reports provider fields without retaining raw input", () => {
+  const detail = [
+    { type: "literal_error", loc: ["body", "provider", "template"], msg: "Unsupported provider", input: "private-input" },
+    { type: "extra_forbidden", loc: ["body", "openai_base_url"], msg: "Extra field", input: "private-input" },
+  ]
+  const message = publicationErrorMessage(`API 422: ${JSON.stringify({ detail })}`)
+  assert.equal(message, "provider.template: Unsupported provider\nopenai_base_url: Extra field")
+  assert.equal(message.includes("private-input"), false)
+  assert.equal(publicationErrorMessage('API 409: {"detail":"Connection already exists"}'), "Connection already exists")
+  assert.equal(publicationErrorMessage("Network unavailable"), "Network unavailable")
 })

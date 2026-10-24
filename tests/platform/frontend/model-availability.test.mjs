@@ -39,6 +39,7 @@ function componentHarness(initial = readback(), send = async (_modelId, value) =
   const invalidated = []
   let cursor = 0
   let pending = 0
+  let pendingAction = null
   let error = null
   let completion = Promise.resolve()
   let sequence = 0
@@ -49,6 +50,7 @@ function componentHarness(initial = readback(), send = async (_modelId, value) =
   } })
   const client = {
     isMutating: () => pending,
+    cancelQueries: async () => {},
     setQueryData(_key, update) { cached = update(cached) },
     invalidateQueries({ queryKey }) { invalidated.push(queryKey); return Promise.resolve() },
   }
@@ -58,13 +60,15 @@ function componentHarness(initial = readback(), send = async (_modelId, value) =
     "@tanstack/react-query": {
       useQueryClient: () => client,
       useIsMutating: () => pending,
+      useMutationState: () => pending ? [pendingAction] : [],
       useMutation(options) {
         assert.equal(options.retry, false)
         return { error, mutate(action) {
           pending += 1
-          completion = Promise.resolve().then(() => options.mutationFn(action)).then(result => {
+          pendingAction = action
+          completion = Promise.resolve().then(() => options.mutationFn(action)).then(async result => {
             error = null
-            options.onSuccess?.(result)
+            await options.onSuccess?.(result)
           }, failure => {
             error = failure
             options.onError?.(failure)
@@ -80,6 +84,7 @@ function componentHarness(initial = readback(), send = async (_modelId, value) =
     "../../lib/model-availability": { availabilityPresentation },
     "../../lib/runtime-health": runtimeHealth,
     "../../locales": { getIntlLocale: () => "en-US" },
+    "../../providers/auth-provider": { useAuth: () => ({ user: { role: "owner" } }) },
     "../../providers/timezone-provider": { useTimezone: () => ({ timezone: "Asia/Shanghai" }) },
     "../assistant/queries": { assistantSettingsKey: ["assistant", "settings"] },
   }
@@ -90,7 +95,7 @@ function componentHarness(initial = readback(), send = async (_modelId, value) =
   const nodes = value => Array.isArray(value) ? value.flatMap(nodes)
     : value && typeof value === "object" ? [value, ...nodes(typeof value.type === "function" ? value.type(value.props) : value.props?.children)] : []
   return {
-    exports, calls, invalidated, nodes,
+    exports, calls, invalidated, nodes, keys,
     state: () => cached.items[0],
     sequence: () => sequence,
     settle: () => completion,
@@ -182,7 +187,7 @@ test("the actual command hook deduplicates clicks and never promotes accepted st
   assert.equal(harness.state().effective_enabled, true)
   assert.equal(harness.state().effective_revision, 2)
   assert.equal(harness.action().canChange, false)
-  assert.equal(harness.invalidated.length, 3)
+  assert.deepEqual(harness.invalidated, [harness.keys.registry, harness.keys.modelAvailability])
 })
 
 test("an uncertain command reuses its idempotency key while a version conflict clears it", async () => {

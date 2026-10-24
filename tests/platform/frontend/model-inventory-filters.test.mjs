@@ -4,11 +4,19 @@ import test from "node:test"
 import { fileURLToPath } from "node:url"
 import { runInNewContext } from "node:vm"
 
-import {
+const frontendRequire = createRequire(new URL("../../../frontend/package.json", import.meta.url))
+const { rolldown } = await import(frontendRequire.resolve("rolldown"))
+const filterEntry = fileURLToPath(new URL("../../../frontend/src/lib/model-inventory-filters.ts", import.meta.url))
+const filterBundle = await rolldown({ input: filterEntry, platform: "node" })
+let filterLogic
+try {
+  const { output } = await filterBundle.generate({ format: "esm" })
+  filterLogic = await import(`data:text/javascript;base64,${Buffer.from(output[0].code).toString("base64")}`)
+} finally { await filterBundle.close() }
+const {
   MODEL_FILTER_DIMENSIONS, emptyModelFilters, matchesModelFilters, modelFilterRecord,
   modelInventoryFamily, modelInventoryPlatform, publicationFilterRecord, toggleModelFilter,
-} from "../../../frontend/src/lib/model-inventory-filters.ts"
-import * as filterLogic from "../../../frontend/src/lib/model-inventory-filters.ts"
+} = filterLogic
 
 const model = (changes = {}) => ({
   id: "model-one", model_key: "chat-public", display_name: "Chat model", family_key: "generic",
@@ -17,9 +25,9 @@ const model = (changes = {}) => ({
 })
 const runtime = { id: "connection-one", brand_key: "microsoft_foundry", runtime_kind: "foundry" }
 
-test("the five filter dimensions match the model inventory menu", () => {
-  assert.deepEqual(MODEL_FILTER_DIMENSIONS, ["family", "platform", "capability", "connection", "status"])
-  assert.deepEqual(emptyModelFilters(), { family: [], platform: [], capability: [], connection: [], status: [] })
+test("the six filter dimensions match the model inventory menu", () => {
+  assert.deepEqual(MODEL_FILTER_DIMENSIONS, ["family", "platform", "capability", "connection", "apim", "status"])
+  assert.deepEqual(emptyModelFilters(), { family: [], platform: [], capability: [], connection: [], apim: [], status: [] })
   const first = emptyModelFilters()
   first.family.push("openai")
   assert.deepEqual(emptyModelFilters().family, [])
@@ -93,6 +101,28 @@ test("toggling never mutates prior state and clearing a category preserves other
   assert.deepEqual({ ...combined, family: [] }.status, ["enabled"])
 })
 
+test("APIM parent and Gateway selections remain mutually exclusive within each target", () => {
+  const original = { ...emptyModelFilters(), apim: ["apim-one", "apim-two:edge-two"], status: ["enabled"] }
+  const child = toggleModelFilter(original, "apim", "apim-one:edge-one")
+  assert.deepEqual(child.apim, ["apim-two:edge-two", "apim-one:edge-one"])
+  const parent = toggleModelFilter(child, "apim", "apim-one")
+  assert.deepEqual(parent.apim, ["apim-two:edge-two", "apim-one"])
+  assert.deepEqual(toggleModelFilter(parent, "apim", "apim-one").apim, ["apim-two:edge-two"])
+  assert.deepEqual(parent.status, ["enabled"])
+  assert.deepEqual(original.apim, ["apim-one", "apim-two:edge-two"])
+})
+
+test("model and pending publication records retain APIM identity without matching other targets", () => {
+  const record = modelFilterRecord(model(), { ...runtime, gateway_profile_id: "apim-one" }, undefined, null,
+    [{ id: "apim-one", implementation: "apim" }])
+  assert.deepEqual(record.apim, ["apim-one"])
+  assert.equal(matchesModelFilters(record, { ...emptyModelFilters(), apim: ["apim-one"] }), true)
+  assert.equal(matchesModelFilters(record, { ...emptyModelFilters(), apim: ["apim-two"] }), false)
+  const pending = publicationFilterRecord({ status: "queued", display_name: "GPT pending", model_key: "gpt-pending",
+    gateway_profile_id: "apim-one", target_deployments: [{ deployment_id: "edge-one" }] })
+  assert.deepEqual(pending.apim, ["apim-one", "apim-one:edge-one"])
+})
+
 test("pending and failed publications participate without inventing unavailable metadata", () => {
   for (const [status, expected] of [["queued", "pending"], ["verifying", "pending"], ["awaiting_authorization", "pending"], ["failed", "failed"]]) {
     const record = publicationFilterRecord({ status, display_name: "GPT pending", model_key: "gpt-pending" })
@@ -104,8 +134,6 @@ test("pending and failed publications participate without inventing unavailable 
   }
 })
 
-const frontendRequire = createRequire(new URL("../../../frontend/package.json", import.meta.url))
-const { rolldown } = await import(frontendRequire.resolve("rolldown"))
 const entry = fileURLToPath(new URL("../../../frontend/src/components/model-management/model-inventory-filter-menu.tsx", import.meta.url))
 const bundle = await rolldown({ input: entry, external: identity => identity !== entry, transform: { jsx: { runtime: "automatic" } } })
 let componentCode
@@ -135,18 +163,18 @@ const records = [
 ]
 function menu(filters = emptyModelFilters(), overrides = {}) {
   const changes = []
-  const tree = exports.ModelInventoryFilterMenu({ filters, connections: [{ ...runtime, name: "Primary connection" }], records, search: "", compact: false, onChange: next => changes.push(next), ...overrides })
+  const tree = exports.ModelInventoryFilterMenu({ filters, connections: [{ ...runtime, name: "Primary connection" }], gateways: [], apimInstances: [], records, search: "", compact: false, onChange: next => changes.push(next), ...overrides })
   const categories = nodes(tree).filter(node => node.type === "DropdownMenuSub")
   return { tree, changes, categories,
     options: dimension => nodes(categories.find(node => node.key === dimension)).filter(node => node.type === "DropdownMenuCheckboxItem"),
   }
 }
 
-test("menu exposes all five original categories in the original order", () => {
+test("menu exposes all six categories in the current order", () => {
   const current = menu()
   assert.deepEqual(current.categories.map(node => node.key), MODEL_FILTER_DIMENSIONS)
   const labels = nodes(current.tree).filter(node => node.props?.className === "model-filter-label").map(node => node.props.children)
-  assert.deepEqual(labels, ["模型家族", "接入平台", "模型类型", "连接", "状态"])
+  assert.deepEqual(labels, ["模型家族", "接入平台", "模型类型", "连接", "APIM 实例", "状态"])
   assert.equal(nodes(current.tree).find(node => node.type === "DropdownMenuTrigger").props.render.props["aria-label"], "筛选模型")
 })
 
@@ -191,7 +219,7 @@ test("mobile submenus open below and active chips remove one category or clear a
   const current = menu(filters, { compact: true })
   assert.ok(nodes(current.tree).filter(node => node.type === "DropdownMenuSubContent").every(node => node.props.side === "bottom" && node.props.align === "end"))
   const changes = []
-  const chips = exports.ModelInventoryFilterChips({ filters, connections: [], onChange: value => changes.push(value) })
+  const chips = exports.ModelInventoryFilterChips({ filters, connections: [], gateways: [], apimInstances: [], onChange: value => changes.push(value) })
   const chipNodes = nodes(chips)
   assert.equal(chipNodes.filter(node => node.props?.className === "model-filter-chip").length, 2)
   chipNodes.find(node => node.props?.["aria-label"] === "移除筛选：模型家族").props.onClick()

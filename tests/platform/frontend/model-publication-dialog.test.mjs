@@ -17,6 +17,15 @@ const bundle = await rolldown({ input: entry, external: id => id !== entry, tran
 let compiled
 try { compiled = (await bundle.generate({ format: "cjs" })).output[0].code }
 finally { await bundle.close() }
+const vendorEntry = fileURLToPath(new URL("../../../frontend/src/components/model-management/model-vendor-select.tsx", import.meta.url))
+const vendorBundle = await rolldown({ input: vendorEntry, external: identity => identity !== vendorEntry,
+  transform: { jsx: { runtime: "automatic" } }, treeshake: false })
+const vendors = {}
+try {
+  const vendorCode = (await vendorBundle.generate({ format: "cjs" })).output[0].code
+  runInNewContext(vendorCode, { exports: vendors, require: name => name === "react/jsx-runtime"
+    ? frontendRequire(name) : new Proxy({}, { get: (_target, key) => key }) })
+} finally { await vendorBundle.close() }
 const apiSource = readFileSync(new URL("../../../frontend/src/data-sources/apim/api.ts", import.meta.url), "utf8")
 const normalization = apiSource.slice(apiSource.indexOf("const LEGACY_CLOUD_CODE_PROVIDER_ID"), apiSource.indexOf("const normalizeGatewayPublication"))
 const normalizeRegistry = runInNewContext(`${stripTypeScriptTypes(normalization)}\nnormalizeRegistry`)
@@ -51,7 +60,10 @@ function harness(rawRegistry = registry(), publication, publishFailure, targets 
   const writes = []
   const queued = []
   const topology = { data: targets, isPending: false, error: null, refetch() {} }
+  const program = { data: { previous_publication_id: "installed-program", previous_installation_sha256: "a".repeat(64),
+    current_installation: { model_additions_enabled: true } }, isPending: false, isFetching: false, isError: false }
   const props = { registry: normalizeRegistry(rawRegistry), publicationId: publication?.id ?? null,
+    topology: targets, topologyAvailable: targets?.deployment_scoping_available === true,
     onPublicationQueued: id => queued.push(id), onManageConnections() {}, onClose() {} }
   const primitives = new Proxy({}, { get: (_target, name) => name })
   const hooks = {
@@ -67,19 +79,22 @@ function harness(rawRegistry = registry(), publication, publishFailure, targets 
   const exports = {}
   const imports = {
     react: hooks, "react/jsx-runtime": frontendRequire("react/jsx-runtime"),
-    "@tanstack/react-query": { useQuery: options => options.queryKey?.[0] === "targets" ? topology : ({ data: publication }), useQueryClient: () => queryClient },
+    "@tanstack/react-query": { useQuery: options => options.queryKey?.[0] === "program" ? program : ({ data: publication }), useQueryClient: () => queryClient },
     "../../data-sources/apim/api": { dataSource: {
-      publishModel: async request => { writes.push(request); if (publishFailure) throw publishFailure; return { publication: { id: "accepted" } } },
+      publishModel: async request => { writes.push(JSON.parse(JSON.stringify(request))); if (publishFailure) throw publishFailure; return { publication: { id: "accepted" } } },
       retryGatewayPublication: async (...args) => { writes.push(args); return { id: publication.id } },
     } },
-    "../../data-sources/apim/queries": { finopsKeys: { gatewayPublication: id => [id] }, finopsQueries: { gatewayPublication: () => ({}), apimTargets: () => ({ queryKey: ["targets"] }) } },
+    "../../data-sources/apim/queries": { finopsKeys: { gatewayPublication: id => [id] }, finopsQueries: {
+      gatewayPublication: () => ({}), gatewayProgramUpgradePreview: id => ({ queryKey: ["program", id] }),
+    } },
     "../../lib/gateway-topology": gatewayTopology,
     "../../locales/index": { useLocale: () => ({ locale: "zh-CN" }), translateForLocale: async value => value },
     "./model-publication-connections": connections, "./openai-compatible": compatible,
     "./model-edit-form": pricing,
-    "../brand-logos": { GatewayBrandLogo: "GatewayBrandLogo", ProviderBrandLogo: "ProviderBrandLogo", gatewayBrandFromIdentity: () => "generic", providerBrandFromMetadata: () => "generic" },
+    "./model-vendor-select": vendors,
+    "../brand-logos": { GatewayBrandLogo: "GatewayBrandLogo", ManagedGatewayLogo: "ManagedGatewayLogo", ProviderBrandLogo: "ProviderBrandLogo", gatewayBrandFromIdentity: () => "generic", providerBrandFromMetadata: () => "generic" },
   }
-  runInNewContext(compiled, { exports, require: name => imports[name] ?? primitives })
+  runInNewContext(compiled, { exports, Error, require: name => imports[name] ?? primitives })
   const render = () => { cursor = 0; return exports.ModelPublicationDialog(props) }
   const find = predicate => nodes(render()).find(predicate)
   const input = (id, value) => {
@@ -93,11 +108,28 @@ function harness(rawRegistry = registry(), publication, publishFailure, targets 
     control.props.onValueChange(next)
   }
   const submit = async () => {
-    find(node => node.type === "form").props.onSubmit({ preventDefault() {} })
-    await Promise.resolve()
+    find(node => node.type === "Button" && ["发布模型", "正在提交"].includes(text(node))).props.onClick()
+    await new Promise(resolve => setImmediate(resolve))
   }
-  return { props, topology, writes, queued, render, find, input, select, submit }
+  return { props, topology, program, writes, queued, render, find, input, select, submit }
 }
+
+test("publication requires current model-addition program evidence without dispatch", async () => {
+  for (const state of [
+    { data: null, isPending: true },
+    { data: null, isError: true },
+    { data: { current_installation: { model_additions_enabled: true } } },
+    { data: { previous_publication_id: "program", previous_installation_sha256: "a".repeat(64),
+      current_installation: { model_additions_enabled: false } } },
+  ]) {
+    const view = harness()
+    Object.assign(view.program, state)
+    view.input("foundry-deployment", "unit-model")
+    await view.submit()
+    assert.equal(view.writes.length, 0)
+    assert.equal(view.find(node => node.type === "Button" && text(node) === "发布模型").props.disabled, true)
+  }
+})
 
 function readyTopology() {
   return { deployment_scoping_available: true, items: [{
@@ -121,8 +153,8 @@ test("failed publication shows its recorded target and does not assert current s
   }
   const view = harness(registry(), publication, undefined, readyTopology())
   const rendered = text(view.render())
-  assert.ok(rendered.includes("目标网关"))
-  assert.ok(rendered.includes("自托管网关"))
+  assert.ok(rendered.includes("目标 Gateway"))
+  assert.ok(rendered.includes("Self-hosted"))
   assert.ok(rendered.includes("unit-apim"))
   assert.ok(rendered.includes("APIM 凭据资源尚未创建"))
   assert.ok(rendered.includes("生效状态未确认"))
@@ -133,12 +165,12 @@ test("failed publication shows its recorded target and does not assert current s
 test("scoped publication selectors show APIM and Gateway identities with labels and type icons", () => {
   const view = harness(registry(), undefined, undefined, readyTopology())
   assert.ok(view.find(node => node.type === "SelectTrigger" && node.props["aria-label"] === "APIM 实例"))
-  assert.ok(view.find(node => node.type === "SelectTrigger" && node.props["aria-label"] === "网关"))
+  assert.ok(view.find(node => node.type === "SelectTrigger" && node.props["aria-label"] === "Gateway API"))
   const selected = () => view.find(node => node.props?.className === "gateway-api-select-value")
-  assert.equal(text(selected()), "managedAzure API Management")
-  assert.equal(selected().props.children[0].type, "GatewayBrandLogo")
+  assert.equal(text(selected()), "managed")
+  assert.equal(selected().props.children[0].type, "ManagedGatewayLogo")
   view.select("gateway:managed", "gateway:edge")
-  assert.equal(text(selected()), "edge自托管网关")
+  assert.equal(text(selected()), "edgeSelf-hosted Gateway")
   assert.equal(selected().props.children[0].type, "Server")
   const control = view.find(node => node.type === "Select" && node.props.value === "gateway:edge")
   assert.deepEqual(Array.from(control.props.items, item => [item.value, item.label]), [
@@ -146,7 +178,7 @@ test("scoped publication selectors show APIM and Gateway identities with labels 
   ])
   const option = view.find(node => node.type === "SelectItem" && node.props.value === "gateway:edge")
   assert.equal(option.props.children.props.className, "gateway-api-select-option")
-  assert.equal(text(option), "edge自托管网关")
+  assert.equal(text(option), "edgeSelf-hosted Gateway")
 })
 
 test("self-hosted publication choices require an explicitly enabled capability", () => {
@@ -175,7 +207,7 @@ test("a removed explicit deployment blocks publication without choosing another"
   view.topology.data.items[0].deployments.pop()
   await view.submit()
   assert.equal(view.writes.length, 0)
-  assert.ok(text(view.render()).includes("请选择可用的网关。"))
+  assert.ok(text(view.render()).includes("请选择可用的 Gateway API。"))
 })
 
 test("disabled target scoping preserves the legacy publication payload", async () => {
@@ -197,12 +229,12 @@ test("publication errors use the existing notice layout without shrinking long m
   assert.equal(alert.props.children[0].type, "TriangleAlert")
   assert.equal(alert.props.children[1].type, "div")
   assert.equal(alert.props.children[1].props["data-no-localize"], true)
-  assert.equal(text(alert.props.children[1]), String(failure))
+  assert.equal(text(alert.props.children[1]), failure.message)
   assert.equal(view.queued.length, 0)
-  const form = view.find(node => node.type === "form")
-  assert.equal(form.props.children.at(-2).type.name, "PublicationErrorNotice")
-  assert.equal(form.props.children.at(-1).props.className, "registry-editor-footer")
-  assert.equal(form.props.children.at(-3).props.className, "registry-editor-body simple-model-body")
+  const editor = view.find(node => node.props?.className === "registry-editor simple-model-form")
+  assert.equal(editor.props.children.at(-2).type.name, "PublicationErrorNotice")
+  assert.equal(editor.props.children.at(-1).props.className, "registry-editor-footer")
+  assert.equal(editor.props.children.at(-3).props.className, "registry-editor-body simple-model-body")
   const stylesheet = frontendRequire("postcss").parse(readFileSync(new URL("../../../frontend/src/styles/model-platform.css", import.meta.url), "utf8"))
   const styles = new Map()
   stylesheet.walkRules(rule => styles.set(rule.selector, Object.fromEntries(rule.nodes.filter(node => node.type === "decl").map(node => [node.prop, node.value]))))
@@ -262,7 +294,7 @@ test("manual chat prices remain optional and do not send unused catalog fields",
 })
 
 test("normalized backend image capability controls the real component option", () => {
-  for (const [enabled, version, disabled] of [[true, 4, false], [false, 4, true], [undefined, 4, true], [true, 3, true]]) {
+  for (const [enabled, version, disabled] of [[true, 4, false], [false, 4, true], [undefined, 4, true], [true, 3, false]]) {
     const view = harness(registry({ image_generation_supported: enabled, image_configuration_schema_version: version }))
     assert.equal(view.find(node => node.type === "SelectItem" && node.props.value === "image_generation").props.disabled, disabled)
   }
@@ -277,7 +309,7 @@ test("single gateway uses summary, multiple gateways use a selector and empty st
   const multiple = harness(data)
   multiple.select("gateway", "other")
   assert.ok(text(multiple.render()).includes("此网关没有可用连接"))
-  assert.equal(multiple.find(node => node.type === "Button" && node.props.type === "submit").props.disabled, true)
+  assert.equal(multiple.find(node => node.type === "Button" && text(node) === "发布模型").props.disabled, true)
 })
 
 test("source dialog composition retains connection help, deployment help and credential section", () => {
@@ -299,7 +331,7 @@ test("connection type uses a neutral OpenAI-compatible icon and retains provider
       data.runtimes[0] = { ...data.runtimes[0], brand_key: "generic", name: "Unit connection", provider_name: "Unit provider", config: { control_plane_managed: true, api_format: "openai_chat", base_url: "https://unit.example/v1", auth_strategy: "named_value_bearer", credential_provisioned: true, model_vendor: "deepseek" } }
     }
     const view = harness(data)
-    const summary = view.find(node => node.props?.["aria-label"] === "连接信息")
+    const summary = view.find(node => node.props?.className === "publication-connection-summary")
     assert.ok(summary)
     const typeRow = nodes(summary).find(node => node.type === "div" && node.props.children?.[0]?.type === "dt" && text(node.props.children[0]) === "接入类型")
     assert.ok(typeRow)
@@ -308,7 +340,7 @@ test("connection type uses a neutral OpenAI-compatible icon and retains provider
     if (openaiCompatible) {
       assert.ok(text(typeRow).includes("OpenAI-compatible API"))
       assert.equal(nodes(typeRow).find(node => node.type === "Plug").props["aria-hidden"], "true")
-      assert.ok(nodes(summary).some(node => node.type === "ModelVendorLogo" && node.props.value === "deepseek"))
+      assert.ok(nodes(summary).some(node => node.type === vendors.ModelVendorLogo && node.props.value === "deepseek"))
     }
     assert.equal(view.writes.length, 0)
   }
@@ -345,11 +377,11 @@ test("connection changes clear credentials, model operation, prices and deployme
   data.runtimes.push({ ...data.runtimes[0], id: "second", name: "Second connection" })
   const view = harness(data)
   view.select("chat", "image_generation")
-  view.input("existing-provider-api-key", "unit-key")
+  view.input("existing-connection-api-key", "unit-key")
   view.input("foundry-deployment", "unit-model")
   view.input("publication-input-price", "5")
   view.select("connection", "second")
-  for (const id of ["existing-provider-api-key", "foundry-deployment", "publication-input-price"]) assert.equal(view.find(node => node.type === "Input" && node.props.id === id).props.value, "")
+  for (const id of ["existing-connection-api-key", "foundry-deployment", "publication-input-price"]) assert.equal(view.find(node => node.type === "Input" && node.props.id === id).props.value, "")
   assert.ok(view.find(node => node.type === "Select" && node.props.value === "chat"))
   assert.ok(text(view.render()).includes("价格未填写"))
 })
@@ -406,7 +438,7 @@ test("context pricing publishes complete references when the backend supports it
       option:{reference,input_per_million:2,output_per_million:8,cached_per_million:0.5,cache_write_per_million:1},
     })),
   }))
-  assert.equal(view.find(node => node.type === "Button" && node.props.type === "submit").props.disabled, false)
+  assert.equal(view.find(node => node.type === "Button" && text(node) === "发布模型").props.disabled, false)
   await view.submit()
   assert.equal(view.writes.length,1)
   assert.deepEqual(view.writes[0].model.context_price_references,references)
@@ -421,7 +453,7 @@ test("context pricing preview cannot publish a single-price payload", async () =
   view.find(node => node.type === "ModelPriceSourceFields").props.setDraft(current => ({
     ...current, priceSource: "azure_retail", contextPricingPreview: true, priceReference: "",
   }))
-  assert.equal(view.find(node => node.type === "Button" && node.props.type === "submit").props.disabled, true)
+  assert.equal(view.find(node => node.type === "Button" && text(node) === "发布模型").props.disabled, true)
   await view.submit()
   assert.equal(view.writes.length, 0)
   assert.ok(text(view.render()).includes("当前后端尚不支持分档计费，暂不可保存或发布。"))
@@ -447,7 +479,7 @@ test("switching connection or operation clears catalog references and discounts"
   data.runtimes.push({ ...data.runtimes[0], id: "second", name: "Second connection" })
   for (const change of [view => view.select("connection", "second"), view => {
     view.select("chat", "image_generation")
-    assert.equal(view.find(node => node.type === "ModelPriceSourceFields"), undefined)
+    assert.equal(view.find(node => node.type === "ModelPriceSourceFields").props.imageGeneration, true)
     view.select("image_generation", "chat")
   }]) {
     const view = harness(data)
@@ -460,26 +492,20 @@ test("switching connection or operation clears catalog references and discounts"
   }
 })
 
-test("paid image retry consent is opt-in, publication-bound and consumed by each retry", async () => {
+test("retry uses the current publication and credential kind without an implicit paid probe grant", async () => {
   const publication = { id: "failed-image", status: "failed", publication_kind: "model_add",
     retry_can_authorize_image_probes: true, retry_requires_credential: false }
   const view = harness(registry(), publication)
-  const consent = () => view.find(node => node.type === "Checkbox" && node.props.id === "authorize-image-probes")
   const retry = async () => {
     view.find(node => node.type === "Button" && text(node) === "重新发布").props.onClick()
     await Promise.resolve()
   }
-  assert.equal(consent().props.checked, false)
+  assert.equal(view.find(node => node.type === "Checkbox" && node.props.id === "authorize-image-probes"), undefined)
   await retry()
-  assert.equal(view.writes[0][2], false)
-  consent().props.onCheckedChange(true)
-  await retry()
-  assert.equal(view.writes[1][2], true)
-  assert.equal(consent().props.checked, false)
-  consent().props.onCheckedChange(true)
+  assert.deepEqual(view.writes[0], ["failed-image", undefined, "api_key"])
   view.props.publicationId = "another-publication"
   await retry()
-  assert.equal(view.writes[2][2], false)
+  assert.deepEqual(view.writes[1], ["another-publication", undefined, "api_key"])
   const oldBackend = harness(registry(), { ...publication, retry_can_authorize_image_probes: undefined })
   assert.equal(oldBackend.find(node => node.type === "Checkbox" && node.props.id === "authorize-image-probes"), undefined)
 })
