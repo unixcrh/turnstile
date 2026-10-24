@@ -938,6 +938,7 @@ _INBOUND_ROUTER_ENGINE_XML = r"""<inbound>
                     mInfo[&quot;priority&quot;] = (int?)mCfg[&quot;priority&quot;] ?? (int?)cObj[&quot;priority&quot;] ?? idx;
                     mInfo[&quot;weight&quot;] = (int?)mCfg[&quot;weight&quot;] ?? (int?)cObj[&quot;weight&quot;] ?? 100;
                     mInfo[&quot;max_cost_per_million&quot;] = mCfg[&quot;max_cost_per_million&quot;] ?? cObj[&quot;max_cost_per_million&quot;] ?? JValue.CreateNull();
+                    mInfo[&quot;max_latency_ms&quot;] = mCfg[&quot;max_latency_ms&quot;] ?? cObj[&quot;max_latency_ms&quot;] ?? JValue.CreateNull();
                     mInfo[&quot;description&quot;] = (string)mCfg[&quot;description&quot;] ?? (string)cObj[&quot;description&quot;] ?? &quot;&quot;;
                     mergedCands.Add(mInfo);
                   }
@@ -1588,7 +1589,7 @@ _INBOUND_ROUTER_ENGINE_XML = r"""<inbound>
                 }">
                   <retry condition="@((string)JObject.Parse((string)context.Variables[&quot;routerPlanState&quot;])[&quot;anthropic_status&quot;] == &quot;retry_anthropic&quot;)" count="3" interval="0" first-fast-retry="true">
                   <set-variable name="routerInferenceStarted" value="@(DateTime.UtcNow)" />
-                  <send-request mode="new" response-variable-name="routerAnthropicHttp" timeout="120" ignore-error="true">
+                  <send-request mode="new" response-variable-name="routerAnthropicHttp" timeout="@(Math.Max(1, Math.Min(120, (Math.Min((int?)JObject.Parse((string)context.Variables[&quot;routerPlanState&quot;])[&quot;selected_candidate&quot;]?[&quot;max_latency_ms&quot;] ?? 120000, (int?)JObject.Parse((string)context.Variables[&quot;routerPlanState&quot;])[&quot;timeout_ms&quot;] ?? 120000) + 999) / 1000)))" ignore-error="true">
                     <set-url>@{
                       return "https://" + context.Request.OriginalUrl.Host + "/" + context.Api.Path.Trim('/') + "/v1/messages";
                     }</set-url>
@@ -1674,7 +1675,8 @@ _INBOUND_ROUTER_ENGINE_XML = r"""<inbound>
                       var st = JObject.Parse((string)context.Variables[&quot;routerPlanState&quot;]);
                       var sel = (JObject)st[&quot;selected_candidate&quot;];
                       var reqBody = JObject.Parse((string)context.Variables[&quot;routerOriginalRequestBody&quot;]);
-                      int maxTok = Math.Max(1024, (int?)reqBody[&quot;max_completion_tokens&quot;] ?? (int?)reqBody[&quot;max_tokens&quot;] ?? 1024);
+                      int requestedMaxTok = (int?)reqBody[&quot;max_completion_tokens&quot;] ?? (int?)reqBody[&quot;max_tokens&quot;] ?? 1024;
+                      int maxTok = requestedMaxTok &gt; 0 ? requestedMaxTok : 1024;
                       var inMsgs = reqBody[&quot;messages&quot;] as JArray ?? new JArray();
                       var outMsgs = new JArray();
                       string sysText = &quot;&quot;;
@@ -1684,17 +1686,90 @@ _INBOUND_ROUTER_ENGINE_XML = r"""<inbound>
                         string role = (string)mObj[&quot;role&quot;] ?? &quot;user&quot;;
                         JToken rawC = mObj[&quot;content&quot;];
                         string textVal = &quot;&quot;;
+                        var partBlocks = new JArray();
+                        var cArrIn = rawC as JArray;
                         if (rawC == null || rawC.Type == JTokenType.Null) { textVal = &quot;&quot;; }
                         else if (rawC.Type == JTokenType.String) { textVal = (string)rawC; }
-                        else if (rawC is JArray cArrIn) {
+                        else if (cArrIn != null) {
                           textVal = string.Join(&quot;\n&quot;, cArrIn.OfType&lt;JObject&gt;().Select(p =&gt; (string)p[&quot;text&quot;] ?? (string)p[&quot;content&quot;] ?? &quot;&quot;).Where(s =&gt; !string.IsNullOrEmpty(s)));
+                          foreach (var p in cArrIn.OfType&lt;JObject&gt;()) {
+                            string pType = ((string)p[&quot;type&quot;] ?? &quot;text&quot;).Trim().ToLowerInvariant();
+                            if (pType == &quot;text&quot;) {
+                              string pText = (string)p[&quot;text&quot;] ?? (string)p[&quot;content&quot;] ?? &quot;&quot;;
+                              if (!string.IsNullOrEmpty(pText)) {
+                                partBlocks.Add(new JObject(new JProperty(&quot;type&quot;, &quot;text&quot;), new JProperty(&quot;text&quot;, pText)));
+                              }
+                            } else if (pType == &quot;image&quot; &amp;&amp; p[&quot;source&quot;] != null) {
+                              partBlocks.Add(p.DeepClone());
+                            } else if (pType == &quot;image_url&quot;) {
+                              string imgUrl = ((string)p[&quot;image_url&quot;]?[&quot;url&quot;] ?? (string)p[&quot;image_url&quot;] ?? (string)p[&quot;url&quot;] ?? &quot;&quot;).Trim();
+                              if (imgUrl.StartsWith(&quot;data:&quot;, StringComparison.OrdinalIgnoreCase) &amp;&amp; imgUrl.IndexOf(&quot;;base64,&quot;, StringComparison.OrdinalIgnoreCase) &gt; 5) {
+                                int commaIdx = imgUrl.IndexOf(&apos;,&apos;);
+                                int semiIdx = imgUrl.IndexOf(&apos;;&apos;);
+                                string mediaType = semiIdx &gt; 5 ? imgUrl.Substring(5, semiIdx - 5) : &quot;image/png&quot;;
+                                string base64Data = commaIdx &gt;= 0 ? imgUrl.Substring(commaIdx + 1) : &quot;&quot;;
+                                if (!string.IsNullOrEmpty(base64Data)) {
+                                  partBlocks.Add(new JObject(
+                                    new JProperty(&quot;type&quot;, &quot;image&quot;),
+                                    new JProperty(&quot;source&quot;, new JObject(
+                                      new JProperty(&quot;type&quot;, &quot;base64&quot;),
+                                      new JProperty(&quot;media_type&quot;, mediaType),
+                                      new JProperty(&quot;data&quot;, base64Data)
+                                    ))
+                                  ));
+                                }
+                              } else if (!string.IsNullOrEmpty(imgUrl)) {
+                                partBlocks.Add(new JObject(
+                                  new JProperty(&quot;type&quot;, &quot;image&quot;),
+                                  new JProperty(&quot;source&quot;, new JObject(
+                                    new JProperty(&quot;type&quot;, &quot;url&quot;),
+                                    new JProperty(&quot;url&quot;, imgUrl)
+                                  ))
+                                ));
+                              }
+                            }
+                          }
                         } else { textVal = rawC.ToString(); }
                         if (role == &quot;system&quot; || role == &quot;developer&quot;) {
                           sysText = string.IsNullOrEmpty(sysText) ? textVal : (sysText + &quot;\n\n&quot; + textVal);
+                        } else if (role == &quot;tool&quot;) {
+                          outMsgs.Add(new JObject(
+                            new JProperty(&quot;role&quot;, &quot;user&quot;),
+                            new JProperty(&quot;content&quot;, new JArray(new JObject(
+                              new JProperty(&quot;type&quot;, &quot;tool_result&quot;),
+                              new JProperty(&quot;tool_use_id&quot;, (string)mObj[&quot;tool_call_id&quot;] ?? &quot;&quot;),
+                              new JProperty(&quot;content&quot;, textVal)
+                            )))
+                          ));
+                        } else if (role == &quot;assistant&quot; &amp;&amp; (mObj[&quot;tool_calls&quot;] as JArray) != null &amp;&amp; ((JArray)mObj[&quot;tool_calls&quot;]).Count &gt; 0) {
+                          var contentBlocks = new JArray();
+                          if (partBlocks.Count &gt; 0) {
+                            foreach (var pb in partBlocks) { contentBlocks.Add(pb); }
+                          } else if (!string.IsNullOrEmpty(textVal)) {
+                            contentBlocks.Add(new JObject(new JProperty(&quot;type&quot;, &quot;text&quot;), new JProperty(&quot;text&quot;, textVal)));
+                          }
+                          foreach (var tcTok in (JArray)mObj[&quot;tool_calls&quot;]) {
+                            var tcObj = tcTok as JObject;
+                            if (tcObj == null) { continue; }
+                            JToken parsedInput = new JObject();
+                            string rawArgs = (string)tcObj[&quot;function&quot;]?[&quot;arguments&quot;] ?? &quot;{}&quot;;
+                            try { parsedInput = JToken.Parse(string.IsNullOrWhiteSpace(rawArgs) ? &quot;{}&quot; : rawArgs); } catch { parsedInput = new JObject(); }
+                            contentBlocks.Add(new JObject(
+                              new JProperty(&quot;type&quot;, &quot;tool_use&quot;),
+                              new JProperty(&quot;id&quot;, (string)tcObj[&quot;id&quot;] ?? (&quot;call_&quot; + Guid.NewGuid().ToString(&quot;N&quot;).Substring(0, 16))),
+                              new JProperty(&quot;name&quot;, (string)tcObj[&quot;function&quot;]?[&quot;name&quot;] ?? &quot;&quot;),
+                              new JProperty(&quot;input&quot;, parsedInput)
+                            ));
+                          }
+                          outMsgs.Add(new JObject(
+                            new JProperty(&quot;role&quot;, &quot;assistant&quot;),
+                            new JProperty(&quot;content&quot;, contentBlocks)
+                          ));
                         } else {
+                          bool hasImageBlocks = partBlocks.OfType&lt;JObject&gt;().Any(blk =&gt; (string)blk[&quot;type&quot;] == &quot;image&quot;);
                           outMsgs.Add(new JObject(
                             new JProperty(&quot;role&quot;, role == &quot;assistant&quot; ? &quot;assistant&quot; : &quot;user&quot;),
-                            new JProperty(&quot;content&quot;, textVal)
+                            new JProperty(&quot;content&quot;, hasImageBlocks ? (JToken)partBlocks : (JToken)textVal)
                           ));
                         }
                       }
@@ -1704,6 +1779,42 @@ _INBOUND_ROUTER_ENGINE_XML = r"""<inbound>
                         new JProperty(&quot;messages&quot;, outMsgs)
                       );
                       if (!string.IsNullOrEmpty(sysText)) { anth[&quot;system&quot;] = sysText; }
+                      var inTools = reqBody[&quot;tools&quot;] as JArray;
+                      if (inTools != null &amp;&amp; inTools.Count &gt; 0) {
+                        var anthTools = new JArray();
+                        foreach (var tTok in inTools) {
+                          var tObj = tTok as JObject;
+                          if (tObj == null) { continue; }
+                          var fn = tObj[&quot;function&quot;] as JObject;
+                          if (fn != null) {
+                            anthTools.Add(new JObject(
+                              new JProperty(&quot;name&quot;, (string)fn[&quot;name&quot;] ?? &quot;&quot;),
+                              new JProperty(&quot;description&quot;, (string)fn[&quot;description&quot;] ?? &quot;&quot;),
+                              new JProperty(&quot;input_schema&quot;, fn[&quot;parameters&quot;]?.DeepClone() ?? new JObject(new JProperty(&quot;type&quot;, &quot;object&quot;), new JProperty(&quot;properties&quot;, new JObject())))
+                            ));
+                          } else if (tObj[&quot;name&quot;] != null &amp;&amp; tObj[&quot;input_schema&quot;] != null) {
+                            anthTools.Add(tObj.DeepClone());
+                          }
+                        }
+                        if (anthTools.Count &gt; 0) { anth[&quot;tools&quot;] = anthTools; }
+                      }
+                      JToken tcChoice = reqBody[&quot;tool_choice&quot;];
+                      if (tcChoice != null &amp;&amp; tcChoice.Type != JTokenType.Null) {
+                        if (tcChoice.Type == JTokenType.String) {
+                          string tcMode = ((string)tcChoice ?? &quot;&quot;).Trim().ToLowerInvariant();
+                          if (tcMode == &quot;auto&quot;) { anth[&quot;tool_choice&quot;] = new JObject(new JProperty(&quot;type&quot;, &quot;auto&quot;)); }
+                          else if (tcMode == &quot;required&quot;) { anth[&quot;tool_choice&quot;] = new JObject(new JProperty(&quot;type&quot;, &quot;any&quot;)); }
+                          else if (tcMode == &quot;none&quot;) { anth.Remove(&quot;tools&quot;); anth.Remove(&quot;tool_choice&quot;); }
+                        } else {
+                          var tcChoiceObj = tcChoice as JObject;
+                          if (tcChoiceObj != null) {
+                            string fnName = (string)tcChoiceObj[&quot;function&quot;]?[&quot;name&quot;] ?? (string)tcChoiceObj[&quot;name&quot;] ?? &quot;&quot;;
+                            if (!string.IsNullOrEmpty(fnName)) {
+                              anth[&quot;tool_choice&quot;] = new JObject(new JProperty(&quot;type&quot;, &quot;tool&quot;), new JProperty(&quot;name&quot;, fnName));
+                            }
+                          }
+                        }
+                      }
                       return anth.ToString(Newtonsoft.Json.Formatting.None);
                     }</set-body>
                   </send-request>
@@ -1879,12 +1990,36 @@ _INBOUND_ROUTER_ENGINE_XML = r"""<inbound>
                         long infMs = Math.Max(1L, (long)(DateTime.UtcNow - context.Variables.GetValueOrDefault&lt;DateTime&gt;(&quot;routerInferenceStarted&quot;, DateTime.UtcNow)).TotalMilliseconds);
                         var aBody = JObject.Parse(resp.Body.As&lt;string&gt;(preserveContent: true));
                         string textContent = &quot;&quot;;
+                        var toolCalls = new JArray();
                         var cArr = aBody[&quot;content&quot;] as JArray;
                         if (cArr != null) {
                           textContent = string.Join(&quot;&quot;, cArr.OfType&lt;JObject&gt;().Where(x =&gt; (string)x[&quot;type&quot;] == &quot;text&quot;).Select(x =&gt; (string)x[&quot;text&quot;] ?? &quot;&quot;));
                           if (string.IsNullOrEmpty(textContent)) {
                             textContent = string.Join(&quot;&quot;, cArr.OfType&lt;JObject&gt;().Where(x =&gt; (string)x[&quot;type&quot;] == &quot;thinking&quot;).Select(x =&gt; (string)x[&quot;thinking&quot;] ?? &quot;&quot;));
                           }
+                          int tcIdx = 0;
+                          foreach (var bObj in cArr.OfType&lt;JObject&gt;().Where(x =&gt; (string)x[&quot;type&quot;] == &quot;tool_use&quot;)) {
+                            string argsJson = bObj[&quot;input&quot;] != null ? bObj[&quot;input&quot;].ToString(Newtonsoft.Json.Formatting.None) : &quot;{}&quot;;
+                            toolCalls.Add(new JObject(
+                              new JProperty(&quot;index&quot;, tcIdx),
+                              new JProperty(&quot;id&quot;, (string)bObj[&quot;id&quot;] ?? (&quot;call_&quot; + tcIdx.ToString())),
+                              new JProperty(&quot;type&quot;, &quot;function&quot;),
+                              new JProperty(&quot;function&quot;, new JObject(
+                                new JProperty(&quot;name&quot;, (string)bObj[&quot;name&quot;] ?? &quot;&quot;),
+                                new JProperty(&quot;arguments&quot;, argsJson)
+                              ))
+                            ));
+                            tcIdx++;
+                          }
+                        }
+                        string stopReason = (string)aBody[&quot;stop_reason&quot;] ?? &quot;&quot;;
+                        string finishReason = (stopReason == &quot;tool_use&quot; || toolCalls.Count &gt; 0) ? &quot;tool_calls&quot; : (stopReason == &quot;max_tokens&quot; ? &quot;length&quot; : &quot;stop&quot;);
+                        var outMsgObj = new JObject(
+                          new JProperty(&quot;role&quot;, &quot;assistant&quot;),
+                          new JProperty(&quot;content&quot;, (toolCalls.Count &gt; 0 &amp;&amp; string.IsNullOrEmpty(textContent)) ? JValue.CreateNull() : (JToken)textContent)
+                        );
+                        if (toolCalls.Count &gt; 0) {
+                          outMsgObj[&quot;tool_calls&quot;] = toolCalls;
                         }
                         var uObj = aBody[&quot;usage&quot;] as JObject ?? new JObject();
                         long inTok = (long?)uObj[&quot;input_tokens&quot;] ?? 0L;
@@ -2025,11 +2160,8 @@ _INBOUND_ROUTER_ENGINE_XML = r"""<inbound>
                           new JProperty(&quot;choices&quot;, new JArray(
                             new JObject(
                               new JProperty(&quot;index&quot;, 0),
-                              new JProperty(&quot;message&quot;, new JObject(
-                                new JProperty(&quot;role&quot;, &quot;assistant&quot;),
-                                new JProperty(&quot;content&quot;, textContent)
-                              )),
-                              new JProperty(&quot;finish_reason&quot;, &quot;stop&quot;)
+                              new JProperty(&quot;message&quot;, outMsgObj),
+                              new JProperty(&quot;finish_reason&quot;, finishReason)
                             )
                           )),
                           new JProperty(&quot;usage&quot;, new JObject(
@@ -2065,6 +2197,13 @@ _INBOUND_ROUTER_ENGINE_XML = r"""<inbound>
                           ))
                         );
                         long createdEpoch = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
+                        var sseDelta1 = new JObject(
+                          new JProperty(&quot;role&quot;, &quot;assistant&quot;),
+                          new JProperty(&quot;content&quot;, (toolCalls.Count &gt; 0 &amp;&amp; string.IsNullOrEmpty(textContent)) ? JValue.CreateNull() : (JToken)textContent)
+                        );
+                        if (toolCalls.Count &gt; 0) {
+                          sseDelta1[&quot;tool_calls&quot;] = toolCalls.DeepClone();
+                        }
                         var sseChunk1 = new JObject(
                           new JProperty(&quot;id&quot;, reqId),
                           new JProperty(&quot;object&quot;, &quot;chat.completion.chunk&quot;),
@@ -2073,10 +2212,7 @@ _INBOUND_ROUTER_ENGINE_XML = r"""<inbound>
                           new JProperty(&quot;choices&quot;, new JArray(
                             new JObject(
                               new JProperty(&quot;index&quot;, 0),
-                              new JProperty(&quot;delta&quot;, new JObject(
-                                new JProperty(&quot;role&quot;, &quot;assistant&quot;),
-                                new JProperty(&quot;content&quot;, textContent)
-                              )),
+                              new JProperty(&quot;delta&quot;, sseDelta1),
                               new JProperty(&quot;finish_reason&quot;, JValue.CreateNull())
                             )
                           ))
@@ -2090,7 +2226,7 @@ _INBOUND_ROUTER_ENGINE_XML = r"""<inbound>
                             new JObject(
                               new JProperty(&quot;index&quot;, 0),
                               new JProperty(&quot;delta&quot;, new JObject()),
-                              new JProperty(&quot;finish_reason&quot;, &quot;stop&quot;)
+                              new JProperty(&quot;finish_reason&quot;, finishReason)
                             )
                           )),
                           new JProperty(&quot;usage&quot;, chatResp[&quot;usage&quot;])
@@ -2375,7 +2511,7 @@ _OUTBOUND_ROUTER_ENGINE_XML = r"""<outbound>
                 <when condition="@((bool?)JObject.Parse((string)context.Variables[&quot;routerPlanState&quot;])[&quot;needs_outbound_fallback&quot;] == true)">
                   <retry condition="@((bool?)JObject.Parse((string)context.Variables[&quot;routerPlanState&quot;])[&quot;needs_outbound_fallback&quot;] == true)" count="3" interval="0" first-fast-retry="true">
                   <set-variable name="routerInferenceStarted" value="@(DateTime.UtcNow)" />
-                  <send-request mode="new" response-variable-name="routerFallbackHttp" timeout="120" ignore-error="true">
+                  <send-request mode="new" response-variable-name="routerFallbackHttp" timeout="@(Math.Max(1, Math.Min(120, (Math.Min((int?)JObject.Parse((string)context.Variables[&quot;routerPlanState&quot;])[&quot;selected_candidate&quot;]?[&quot;max_latency_ms&quot;] ?? 120000, (int?)JObject.Parse((string)context.Variables[&quot;routerPlanState&quot;])[&quot;timeout_ms&quot;] ?? 120000) + 999) / 1000)))" ignore-error="true">
                     <set-url>@{
                       var st = JObject.Parse((string)context.Variables[&quot;routerPlanState&quot;]);
                       if ((string)st[&quot;selected_candidate&quot;]?[&quot;profile&quot;] == &quot;anthropic-messages&quot;) {
@@ -2430,7 +2566,8 @@ _OUTBOUND_ROUTER_ENGINE_XML = r"""<outbound>
                       var sel = (JObject)st[&quot;selected_candidate&quot;];
                       var b = JObject.Parse((string)context.Variables[&quot;routerOriginalRequestBody&quot;]);
                       if ((string)sel[&quot;profile&quot;] == &quot;anthropic-messages&quot;) {
-                        int maxTok = Math.Max(1024, (int?)b[&quot;max_completion_tokens&quot;] ?? (int?)b[&quot;max_tokens&quot;] ?? 1024);
+                        int requestedMaxTok = (int?)b[&quot;max_completion_tokens&quot;] ?? (int?)b[&quot;max_tokens&quot;] ?? 1024;
+                        int maxTok = requestedMaxTok &gt; 0 ? requestedMaxTok : 1024;
                         var inMsgs = b[&quot;messages&quot;] as JArray ?? new JArray();
                         var outMsgs = new JArray();
                         string sysText = &quot;&quot;;
@@ -2440,17 +2577,90 @@ _OUTBOUND_ROUTER_ENGINE_XML = r"""<outbound>
                           string role = (string)mObj[&quot;role&quot;] ?? &quot;user&quot;;
                           JToken rawC = mObj[&quot;content&quot;];
                           string textVal = &quot;&quot;;
+                          var partBlocks = new JArray();
+                          var cArrIn = rawC as JArray;
                           if (rawC == null || rawC.Type == JTokenType.Null) { textVal = &quot;&quot;; }
                           else if (rawC.Type == JTokenType.String) { textVal = (string)rawC; }
-                          else if (rawC is JArray cArrIn) {
+                          else if (cArrIn != null) {
                             textVal = string.Join(&quot;\n&quot;, cArrIn.OfType&lt;JObject&gt;().Select(p =&gt; (string)p[&quot;text&quot;] ?? (string)p[&quot;content&quot;] ?? &quot;&quot;).Where(s =&gt; !string.IsNullOrEmpty(s)));
+                            foreach (var p in cArrIn.OfType&lt;JObject&gt;()) {
+                              string pType = ((string)p[&quot;type&quot;] ?? &quot;text&quot;).Trim().ToLowerInvariant();
+                              if (pType == &quot;text&quot;) {
+                                string pText = (string)p[&quot;text&quot;] ?? (string)p[&quot;content&quot;] ?? &quot;&quot;;
+                                if (!string.IsNullOrEmpty(pText)) {
+                                  partBlocks.Add(new JObject(new JProperty(&quot;type&quot;, &quot;text&quot;), new JProperty(&quot;text&quot;, pText)));
+                                }
+                              } else if (pType == &quot;image&quot; &amp;&amp; p[&quot;source&quot;] != null) {
+                                partBlocks.Add(p.DeepClone());
+                              } else if (pType == &quot;image_url&quot;) {
+                                string imgUrl = ((string)p[&quot;image_url&quot;]?[&quot;url&quot;] ?? (string)p[&quot;image_url&quot;] ?? (string)p[&quot;url&quot;] ?? &quot;&quot;).Trim();
+                                if (imgUrl.StartsWith(&quot;data:&quot;, StringComparison.OrdinalIgnoreCase) &amp;&amp; imgUrl.IndexOf(&quot;;base64,&quot;, StringComparison.OrdinalIgnoreCase) &gt; 5) {
+                                  int commaIdx = imgUrl.IndexOf(&apos;,&apos;);
+                                  int semiIdx = imgUrl.IndexOf(&apos;;&apos;);
+                                  string mediaType = semiIdx &gt; 5 ? imgUrl.Substring(5, semiIdx - 5) : &quot;image/png&quot;;
+                                  string base64Data = commaIdx &gt;= 0 ? imgUrl.Substring(commaIdx + 1) : &quot;&quot;;
+                                  if (!string.IsNullOrEmpty(base64Data)) {
+                                    partBlocks.Add(new JObject(
+                                      new JProperty(&quot;type&quot;, &quot;image&quot;),
+                                      new JProperty(&quot;source&quot;, new JObject(
+                                        new JProperty(&quot;type&quot;, &quot;base64&quot;),
+                                        new JProperty(&quot;media_type&quot;, mediaType),
+                                        new JProperty(&quot;data&quot;, base64Data)
+                                      ))
+                                    ));
+                                  }
+                                } else if (!string.IsNullOrEmpty(imgUrl)) {
+                                  partBlocks.Add(new JObject(
+                                    new JProperty(&quot;type&quot;, &quot;image&quot;),
+                                    new JProperty(&quot;source&quot;, new JObject(
+                                      new JProperty(&quot;type&quot;, &quot;url&quot;),
+                                      new JProperty(&quot;url&quot;, imgUrl)
+                                    ))
+                                  ));
+                                }
+                              }
+                            }
                           } else { textVal = rawC.ToString(); }
                           if (role == &quot;system&quot; || role == &quot;developer&quot;) {
                             sysText = string.IsNullOrEmpty(sysText) ? textVal : (sysText + &quot;\n\n&quot; + textVal);
+                          } else if (role == &quot;tool&quot;) {
+                            outMsgs.Add(new JObject(
+                              new JProperty(&quot;role&quot;, &quot;user&quot;),
+                              new JProperty(&quot;content&quot;, new JArray(new JObject(
+                                new JProperty(&quot;type&quot;, &quot;tool_result&quot;),
+                                new JProperty(&quot;tool_use_id&quot;, (string)mObj[&quot;tool_call_id&quot;] ?? &quot;&quot;),
+                                new JProperty(&quot;content&quot;, textVal)
+                              )))
+                            ));
+                          } else if (role == &quot;assistant&quot; &amp;&amp; (mObj[&quot;tool_calls&quot;] as JArray) != null &amp;&amp; ((JArray)mObj[&quot;tool_calls&quot;]).Count &gt; 0) {
+                            var contentBlocks = new JArray();
+                            if (partBlocks.Count &gt; 0) {
+                              foreach (var pb in partBlocks) { contentBlocks.Add(pb); }
+                            } else if (!string.IsNullOrEmpty(textVal)) {
+                              contentBlocks.Add(new JObject(new JProperty(&quot;type&quot;, &quot;text&quot;), new JProperty(&quot;text&quot;, textVal)));
+                            }
+                            foreach (var tcTok in (JArray)mObj[&quot;tool_calls&quot;]) {
+                              var tcObj = tcTok as JObject;
+                              if (tcObj == null) { continue; }
+                              JToken parsedInput = new JObject();
+                              string rawArgs = (string)tcObj[&quot;function&quot;]?[&quot;arguments&quot;] ?? &quot;{}&quot;;
+                              try { parsedInput = JToken.Parse(string.IsNullOrWhiteSpace(rawArgs) ? &quot;{}&quot; : rawArgs); } catch { parsedInput = new JObject(); }
+                              contentBlocks.Add(new JObject(
+                                new JProperty(&quot;type&quot;, &quot;tool_use&quot;),
+                                new JProperty(&quot;id&quot;, (string)tcObj[&quot;id&quot;] ?? (&quot;call_&quot; + Guid.NewGuid().ToString(&quot;N&quot;).Substring(0, 16))),
+                                new JProperty(&quot;name&quot;, (string)tcObj[&quot;function&quot;]?[&quot;name&quot;] ?? &quot;&quot;),
+                                new JProperty(&quot;input&quot;, parsedInput)
+                              ));
+                            }
+                            outMsgs.Add(new JObject(
+                              new JProperty(&quot;role&quot;, &quot;assistant&quot;),
+                              new JProperty(&quot;content&quot;, contentBlocks)
+                            ));
                           } else {
+                            bool hasImageBlocks = partBlocks.OfType&lt;JObject&gt;().Any(blk =&gt; (string)blk[&quot;type&quot;] == &quot;image&quot;);
                             outMsgs.Add(new JObject(
                               new JProperty(&quot;role&quot;, role == &quot;assistant&quot; ? &quot;assistant&quot; : &quot;user&quot;),
-                              new JProperty(&quot;content&quot;, textVal)
+                              new JProperty(&quot;content&quot;, hasImageBlocks ? (JToken)partBlocks : (JToken)textVal)
                             ));
                           }
                         }
@@ -2460,6 +2670,42 @@ _OUTBOUND_ROUTER_ENGINE_XML = r"""<outbound>
                           new JProperty(&quot;messages&quot;, outMsgs)
                         );
                         if (!string.IsNullOrEmpty(sysText)) { anth[&quot;system&quot;] = sysText; }
+                        var inTools = b[&quot;tools&quot;] as JArray;
+                        if (inTools != null &amp;&amp; inTools.Count &gt; 0) {
+                          var anthTools = new JArray();
+                          foreach (var tTok in inTools) {
+                            var tObj = tTok as JObject;
+                            if (tObj == null) { continue; }
+                            var fn = tObj[&quot;function&quot;] as JObject;
+                            if (fn != null) {
+                              anthTools.Add(new JObject(
+                                new JProperty(&quot;name&quot;, (string)fn[&quot;name&quot;] ?? &quot;&quot;),
+                                new JProperty(&quot;description&quot;, (string)fn[&quot;description&quot;] ?? &quot;&quot;),
+                                new JProperty(&quot;input_schema&quot;, fn[&quot;parameters&quot;]?.DeepClone() ?? new JObject(new JProperty(&quot;type&quot;, &quot;object&quot;), new JProperty(&quot;properties&quot;, new JObject())))
+                              ));
+                            } else if (tObj[&quot;name&quot;] != null &amp;&amp; tObj[&quot;input_schema&quot;] != null) {
+                              anthTools.Add(tObj.DeepClone());
+                            }
+                          }
+                          if (anthTools.Count &gt; 0) { anth[&quot;tools&quot;] = anthTools; }
+                        }
+                        JToken tcChoice = b[&quot;tool_choice&quot;];
+                        if (tcChoice != null &amp;&amp; tcChoice.Type != JTokenType.Null) {
+                          if (tcChoice.Type == JTokenType.String) {
+                            string tcMode = ((string)tcChoice ?? &quot;&quot;).Trim().ToLowerInvariant();
+                            if (tcMode == &quot;auto&quot;) { anth[&quot;tool_choice&quot;] = new JObject(new JProperty(&quot;type&quot;, &quot;auto&quot;)); }
+                            else if (tcMode == &quot;required&quot;) { anth[&quot;tool_choice&quot;] = new JObject(new JProperty(&quot;type&quot;, &quot;any&quot;)); }
+                            else if (tcMode == &quot;none&quot;) { anth.Remove(&quot;tools&quot;); anth.Remove(&quot;tool_choice&quot;); }
+                          } else {
+                            var tcChoiceObj = tcChoice as JObject;
+                            if (tcChoiceObj != null) {
+                              string fnName = (string)tcChoiceObj[&quot;function&quot;]?[&quot;name&quot;] ?? (string)tcChoiceObj[&quot;name&quot;] ?? &quot;&quot;;
+                              if (!string.IsNullOrEmpty(fnName)) {
+                                anth[&quot;tool_choice&quot;] = new JObject(new JProperty(&quot;type&quot;, &quot;tool&quot;), new JProperty(&quot;name&quot;, fnName));
+                              }
+                            }
+                          }
+                        }
                         return anth.ToString(Newtonsoft.Json.Formatting.None);
                       }
                       b[&quot;model&quot;] = (string)sel[&quot;apim_alias&quot;];
@@ -2537,12 +2783,36 @@ _OUTBOUND_ROUTER_ENGINE_XML = r"""<outbound>
                           try {
                             var aBody = JObject.Parse(rawFb);
                             string textContent = &quot;&quot;;
+                            var toolCalls = new JArray();
                             var cArr = aBody[&quot;content&quot;] as JArray;
                             if (cArr != null) {
                               textContent = string.Join(&quot;&quot;, cArr.OfType&lt;JObject&gt;().Where(x =&gt; (string)x[&quot;type&quot;] == &quot;text&quot;).Select(x =&gt; (string)x[&quot;text&quot;] ?? &quot;&quot;));
                               if (string.IsNullOrEmpty(textContent)) {
                                 textContent = string.Join(&quot;&quot;, cArr.OfType&lt;JObject&gt;().Where(x =&gt; (string)x[&quot;type&quot;] == &quot;thinking&quot;).Select(x =&gt; (string)x[&quot;thinking&quot;] ?? &quot;&quot;));
                               }
+                              int tcIdx = 0;
+                              foreach (var bObj in cArr.OfType&lt;JObject&gt;().Where(x =&gt; (string)x[&quot;type&quot;] == &quot;tool_use&quot;)) {
+                                string argsJson = bObj[&quot;input&quot;] != null ? bObj[&quot;input&quot;].ToString(Newtonsoft.Json.Formatting.None) : &quot;{}&quot;;
+                                toolCalls.Add(new JObject(
+                                  new JProperty(&quot;index&quot;, tcIdx),
+                                  new JProperty(&quot;id&quot;, (string)bObj[&quot;id&quot;] ?? (&quot;call_&quot; + tcIdx.ToString())),
+                                  new JProperty(&quot;type&quot;, &quot;function&quot;),
+                                  new JProperty(&quot;function&quot;, new JObject(
+                                    new JProperty(&quot;name&quot;, (string)bObj[&quot;name&quot;] ?? &quot;&quot;),
+                                    new JProperty(&quot;arguments&quot;, argsJson)
+                                  ))
+                                ));
+                                tcIdx++;
+                              }
+                            }
+                            string stopReason = (string)aBody[&quot;stop_reason&quot;] ?? &quot;&quot;;
+                            string finishReason = (stopReason == &quot;tool_use&quot; || toolCalls.Count &gt; 0) ? &quot;tool_calls&quot; : (stopReason == &quot;max_tokens&quot; ? &quot;length&quot; : &quot;stop&quot;);
+                            var outMsgObj = new JObject(
+                              new JProperty(&quot;role&quot;, &quot;assistant&quot;),
+                              new JProperty(&quot;content&quot;, (toolCalls.Count &gt; 0 &amp;&amp; string.IsNullOrEmpty(textContent)) ? JValue.CreateNull() : (JToken)textContent)
+                            );
+                            if (toolCalls.Count &gt; 0) {
+                              outMsgObj[&quot;tool_calls&quot;] = toolCalls;
                             }
                             var uObj = aBody[&quot;usage&quot;] as JObject ?? new JObject();
                             long inTok = (long?)uObj[&quot;input_tokens&quot;] ?? 0L;
@@ -2558,11 +2828,8 @@ _OUTBOUND_ROUTER_ENGINE_XML = r"""<outbound>
                               new JProperty(&quot;choices&quot;, new JArray(
                                 new JObject(
                                   new JProperty(&quot;index&quot;, 0),
-                                  new JProperty(&quot;message&quot;, new JObject(
-                                    new JProperty(&quot;role&quot;, &quot;assistant&quot;),
-                                    new JProperty(&quot;content&quot;, textContent)
-                                  )),
-                                  new JProperty(&quot;finish_reason&quot;, &quot;stop&quot;)
+                                  new JProperty(&quot;message&quot;, outMsgObj),
+                                  new JProperty(&quot;finish_reason&quot;, finishReason)
                                 )
                               )),
                               new JProperty(&quot;usage&quot;, new JObject(

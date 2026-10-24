@@ -1575,10 +1575,18 @@ class ModelRuntimeService:
 
     def _verified_router_authorization(
         self,
-        request: ModelInvocationRequest,
+        request: ModelInvocationRequest | DecisionInvocationRequest,
         route: Mapping[str, Any],
+        *,
+        authorized_router_id: UUID | str | None = None,
     ) -> str | None:
-        raw_router_id = request.router_context.get("_router_authorized_id")
+        raw_router_id = (
+            str(authorized_router_id)
+            if authorized_router_id is not None
+            else request.router_context.get("_router_authorized_id")
+            if isinstance(request, ModelInvocationRequest)
+            else None
+        )
         if not isinstance(raw_router_id, str) or not raw_router_id.strip():
             return None
         try:
@@ -1592,9 +1600,14 @@ class ModelRuntimeService:
         router_row = (
             get_callable(router_uuid, user_id) if callable(get_callable) else None
         )
+        is_sub_key_auth = (
+            bool(request.router_context.get("subscription_key_authenticated"))
+            if isinstance(request, ModelInvocationRequest)
+            else authorized_router_id is not None
+        )
         if (
             router_row is None
-            and request.router_context.get("subscription_key_authenticated")
+            and is_sub_key_auth
             and user_id.lower().endswith("@applications.turnstile.local")
         ):
             get_pub = getattr(self._repository, "get_published_model_router", None)
@@ -1626,6 +1639,9 @@ class ModelRuntimeService:
         request: ModelInvocationRequest | ImageInvocationRequest | DecisionInvocationRequest,
         route: dict[str, Any],
         request_id: str,
+        *,
+        authorized_router_id: UUID | str | None = None,
+        editor_trial_authorized: bool = False,
     ) -> None:
         """Enforce the person's model policy on the path where we are the caller.
 
@@ -1640,15 +1656,14 @@ class ModelRuntimeService:
         user_id = request.metadata.user_id
         if not user_id:
             return
-        if (
-            isinstance(request, DecisionInvocationRequest)
-            and request.metadata.workflow
-            in {"model-router-decision", "model-router-decision-trial"}
-        ):
+        if isinstance(request, DecisionInvocationRequest) and editor_trial_authorized:
             return
         if (
-            isinstance(request, ModelInvocationRequest)
-            and self._verified_router_authorization(request, route) is not None
+            isinstance(request, (ModelInvocationRequest, DecisionInvocationRequest))
+            and self._verified_router_authorization(
+                request, route, authorized_router_id=authorized_router_id
+            )
+            is not None
         ):
             return
         if self._model_policy_allows(route, self._person_model_policy(user_id)):
@@ -1719,14 +1734,19 @@ class ModelRuntimeService:
         )
 
     def _prepare_budget_delegation(
-        self, request: ModelInvocationRequest | ImageInvocationRequest | DecisionInvocationRequest,
+        self,
+        request: ModelInvocationRequest | ImageInvocationRequest | DecisionInvocationRequest,
         route: dict[str, Any],
+        *,
+        authorized_router_id: UUID | str | None = None,
+        editor_trial_authorized: bool = False,
     ) -> None:
         target = route.get("gateway_id")
         if target is None or not self._settings.budget_execution_enabled:
             return
-        target_id = UUID(str(target))
-        if target_id not in self._settings.budget_execution_target_ids:
+        try:
+            target_id = UUID(str(target))
+        except ValueError:
             return
         try:
             if not isinstance(self._repository, BudgetScopeRepository):
@@ -1760,19 +1780,19 @@ class ModelRuntimeService:
                 status_code=403, detail="Budget delegation requires a verified person",
             )
         auth_router_id = ""
-        if isinstance(request, ModelInvocationRequest):
+        if isinstance(request, (ModelInvocationRequest, DecisionInvocationRequest)):
             auth_router_id = (
-                self._verified_router_authorization(request, route) or ""
+                self._verified_router_authorization(
+                    request, route, authorized_router_id=authorized_router_id
+                )
+                or ""
             )
-        elif isinstance(request, DecisionInvocationRequest) and request.metadata.workflow in {
-            "model-router-decision",
-            "model-router-decision-trial",
-        }:
-            list_assigned = getattr(self._repository, "list_assigned_model_routers", None)
-            if callable(list_assigned):
-                assigned_rows = list(list_assigned(request.metadata.user_id))
-                if assigned_rows:
-                    auth_router_id = str(assigned_rows[0]["id"]).strip()
+            if not auth_router_id and editor_trial_authorized:
+                list_assigned = getattr(self._repository, "list_assigned_model_routers", None)
+                if callable(list_assigned):
+                    assigned_rows = list(list_assigned(request.metadata.user_id))
+                    if assigned_rows:
+                        auth_router_id = str(assigned_rows[0]["id"]).strip()
         if auth_router_id and not self._model_policy_allows(
             route, self._person_model_policy(request.metadata.user_id)
         ):
@@ -1997,6 +2017,8 @@ class ModelRuntimeService:
         *,
         request_id: str | None = None,
         timeout_ms: int | None = None,
+        authorized_router_id: UUID | str | None = None,
+        editor_trial_authorized: bool = False,
     ) -> DecisionInvocationResponse:
         request_id = request_id or str(uuid4())
         route = self._invocation_route(request)
@@ -2007,8 +2029,19 @@ class ModelRuntimeService:
             raise HTTPException(status_code=409, detail="This model does not support Decision")
         if route.get("gateway_implementation") != GatewayKind.APIM:
             raise HTTPException(status_code=409, detail="Decision invocation requires APIM")
-        self._assert_model_allowed(request, route, request_id)
-        self._prepare_budget_delegation(request, route)
+        self._assert_model_allowed(
+            request,
+            route,
+            request_id,
+            authorized_router_id=authorized_router_id,
+            editor_trial_authorized=editor_trial_authorized,
+        )
+        self._prepare_budget_delegation(
+            request,
+            route,
+            authorized_router_id=authorized_router_id,
+            editor_trial_authorized=editor_trial_authorized,
+        )
         self._assert_budget_available(request, route, request_id)
         return self._invoke_resolved(
             request,

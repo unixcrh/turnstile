@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -43,11 +44,11 @@ def _exact_counter(row: dict[str, Any], key: str, *, optional: bool = False) -> 
 def _execution_usage(row: dict[str, Any]) -> dict[str, Any]:
     from turnstile_core.domain.budget_completion import (
         exact_integer,
+        exact_usd_amount,
         normalized_identity,
+        usd_completion_charge,
         validate_completion,
     )
-    from turnstile_core.domain.gateway_targets import canonical_usage_id_v2
-    from turnstile_core.domain.ledger import LedgerAdmissionReceipt
 
     encoded = row.get("budget_execution")
     if not isinstance(encoded, str) or not 1 <= len(encoded) <= 16384:
@@ -55,14 +56,32 @@ def _execution_usage(row: dict[str, Any]) -> dict[str, Any]:
     receipts = json.loads(base64.b64decode(encoded, validate=True).decode("utf-8"))
     if not isinstance(receipts, list) or not 1 <= len(receipts) <= 2:
         raise ValueError("Execution requires bounded admission receipts")
-    receipts = [LedgerAdmissionReceipt.model_validate(item).model_dump(mode="json")
-                for item in receipts]
     seen: set[str] = set()
     for receipt in receipts:
+        if not isinstance(receipt, dict):
+            raise ValueError("Execution receipt must be an object")
+        mode = receipt.get("budget_mode", "tokens")
+        fields = {"identity", "epoch", "reserved_tokens"}
+        if mode == "usd":
+            fields.update({"budget_mode", "reserved_usd", "price_snapshot"})
+        elif "budget_mode" in receipt:
+            fields.add("budget_mode")
+        if mode not in {"tokens", "usd"} or set(receipt) != fields:
+            raise ValueError("Execution receipt fields do not match its budget mode")
         identity = normalized_identity(receipt["identity"])
         UUID(receipt["epoch"])
         if exact_integer(receipt["reserved_tokens"]) == 0:
             raise ValueError("Execution receipt must reserve tokens")
+        if mode == "usd":
+            exact_usd_amount(receipt["reserved_usd"])
+            projection = receipt["price_snapshot"]
+            if (not isinstance(projection, dict)
+                    or projection.get("model_id") != identity["model_id"]):
+                raise ValueError("USD receipt price belongs to another model")
+            usd_completion_charge(projection, {
+                "input_tokens": 0, "cached_tokens": 0,
+                "cache_write_tokens": 0, "output_tokens": 0,
+            })
         scope = identity["scope"]
         if (scope["scope_type"] in seen or any(identity[field] != row.get(field) for field in (
                 "gateway_profile_id", "native_gateway_id", "correlation_id", "model_id",
@@ -81,10 +100,15 @@ def _execution_usage(row: dict[str, Any]) -> dict[str, Any]:
     managed = _text(row, "gateway_is_managed", "").casefold()
     if managed not in {"true", "false"}:
         raise ValueError("Execution usage requires trusted Gateway management state")
-    usage_id = canonical_usage_id_v2(
-        gateway_profile_id, context_fields["apim_service_id"],
-        context_fields["native_gateway_id"], _text(row, "correlation_id", ""),
-    )
+    identity_parts = [
+        str(gateway_profile_id), context_fields["apim_service_id"].strip().casefold(),
+        context_fields["native_gateway_id"].strip().casefold(),
+        _text(row, "correlation_id", "").strip().casefold(),
+    ]
+    if not all(identity_parts):
+        raise ValueError("Execution usage identity requires complete APIM context")
+    canonical = ".".join(base64.b64encode(value.encode()).decode() for value in identity_parts)
+    usage_id = "turnstile-v2-" + hashlib.sha256(canonical.encode()).hexdigest()
     if row.get("usage_id") != usage_id:
         raise ValueError("Execution usage identity does not match its Gateway context")
     result: dict[str, Any] = {
@@ -140,7 +164,8 @@ def _execution_usage(row: dict[str, Any]) -> dict[str, Any]:
             input_tokens=evidence["input_tokens"], cached_tokens=evidence["cached_tokens"],
             cache_write_tokens=evidence["cache_write_tokens"],
             output_tokens=evidence["output_tokens"],
-            tokens_consumed=total, estimated=False, ingest_error=None, usage_complete=True,
+            tokens_consumed=evidence["total_tokens"], estimated=False,
+            ingest_error=None, usage_complete=True,
             runtime_authoritative=(
                 _text(row, "pool_runtime", "") not in {"", "unattributed"}
                 or _text(row, "pool_deployment", "") not in {"", "unattributed"}

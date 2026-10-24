@@ -1146,7 +1146,7 @@ export function App() {
       page === "model-router"
         ? "模型智能路由"
         : page === "apim-native-routes"
-        ? "APIM 后端池"
+        ? "模型负载均衡"
         : page === "gateway-releases"
           ? "发布历史"
         : page === "applications"
@@ -1191,7 +1191,7 @@ export function App() {
       label: "模型平台",
       items: [
         { label: "模型管理", icon: Cpu, page: "models" },
-        { label: "APIM 后端池", icon: Network, page: "apim-native-routes" },
+        { label: "模型负载均衡", icon: Network, page: "apim-native-routes" },
         { label: "模型智能路由", icon: Workflow, page: "model-router" },
         { label: "发布历史", icon: History, page: "gateway-releases" },
         { label: "订阅管理", icon: KeyRound, page: "applications" },
@@ -1502,7 +1502,7 @@ export function App() {
               >
                 <PanelLeft size={16} />
               </Button>
-              {selectedDataSource === "apim" && page === "apim-native-routes" && <Button type="button" variant="ghost" size="icon-sm" aria-label="打开 APIM 后端池列表" title="打开 APIM 后端池列表" onClick={() => setNativeRouteDrawerOpen(true)}><List size={16} /></Button>}
+              {selectedDataSource === "apim" && page === "apim-native-routes" && <Button type="button" variant="ghost" size="icon-sm" aria-label="打开模型负载均衡列表" title="打开模型负载均衡列表" onClick={() => setNativeRouteDrawerOpen(true)}><List size={16} /></Button>}
               {selectedDataSource === "apim" && page === "model-router" && <Button type="button" variant="ghost" size="icon-sm" aria-label="模型路由器" title="模型路由器" onClick={() => setModelRouterDrawerOpen(true)}><List size={16} /></Button>}
               {selectedDataSource === "apim" && page === "gateway-releases" && <Button type="button" variant="ghost" size="icon-sm" aria-label="打开发布列表" title="打开发布列表" onClick={() => setGatewayReleaseDrawerOpen(true)}><List size={16} /></Button>}
             </div>

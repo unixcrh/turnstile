@@ -399,7 +399,7 @@ class RouterTableProjector:
         token = self._tokens.token("https://storage.azure.com/")
         headers = {
             "Authorization": f"Bearer {token}",
-            "Accept": "application/json;odata=nometadata",
+            "Accept": "application/json;odata=minimalmetadata",
             "x-ms-version": "2020-12-06",
             "DataServiceVersion": "3.0;",
             "MaxDataServiceVersion": "3.0;NetFx",
@@ -412,6 +412,18 @@ class RouterTableProjector:
         pk = quote(partition_key.replace("'", "''"), safe="")
         rk = quote(row_key.replace("'", "''"), safe="")
         return f"{self._endpoint}/{self._table}(PartitionKey='{pk}',RowKey='{rk}')"
+
+    @staticmethod
+    def _extract_etag(
+        response: httpx.Response, entity: Mapping[str, Any] | None = None
+    ) -> str:
+        etag = (
+            response.headers.get("etag")
+            or response.headers.get("ETag")
+            or (entity.get("odata.etag") if isinstance(entity, Mapping) else None)
+            or "*"
+        )
+        return str(etag).strip() or "*"
 
     @staticmethod
     def _parse_entity_documents(entity: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -470,17 +482,40 @@ class RouterTableProjector:
         name_rk = router_row_key(router.name)
         id_rk = router_row_key(str(router.id))
         target_id = str(router.id).strip().lower()
-        with httpx.Client(timeout=self._timeout) as client:
-            other_docs: list[dict[str, Any]] = []
-            try:
+        with _SYNC_LOCK, httpx.Client(timeout=self._timeout) as client:
+            id_payload: dict[str, Any] = {
+                "PartitionKey": ROUTER_CATALOG_PARTITION,
+                "RowKey": id_rk,
+                "SchemaVersion": 2,
+                "PrimaryEntry": False,
+                "RouterId": str(router.id),
+                "RouterName": router.name,
+                "RouterVersion": router.version,
+                "Status": "published",
+                "Document": doc_json,
+                "Sha256": doc_sha,
+            }
+            id_resp = client.put(
+                self._entity_url(ROUTER_CATALOG_PARTITION, id_rk),
+                headers=self._headers(write=True),
+                json=id_payload,
+            )
+            id_resp.raise_for_status()
+
+            for attempt in range(3):
                 existing_resp = client.get(
                     self._entity_url(ROUTER_CATALOG_PARTITION, name_rk),
                     headers=self._headers(),
                 )
+                if existing_resp.status_code not in {200, 404}:
+                    existing_resp.raise_for_status()
+
+                other_docs: list[dict[str, Any]] = []
+                etag = "*"
                 if existing_resp.status_code == 200:
-                    for existing_doc in self._parse_entity_documents(
-                        existing_resp.json()
-                    ):
+                    entity = existing_resp.json()
+                    etag = self._extract_etag(existing_resp, entity)
+                    for existing_doc in self._parse_entity_documents(entity):
                         existing_id = (
                             str(existing_doc.get("router_id") or "").strip().lower()
                         )
@@ -492,15 +527,12 @@ class RouterTableProjector:
                         ):
                             continue
                         other_docs.append(existing_doc)
-            except Exception:
-                other_docs = []
 
-            for rk, is_primary in ((name_rk, True), (id_rk, False)):
-                payload: dict[str, Any] = {
+                name_payload: dict[str, Any] = {
                     "PartitionKey": ROUTER_CATALOG_PARTITION,
-                    "RowKey": rk,
+                    "RowKey": name_rk,
                     "SchemaVersion": 2,
-                    "PrimaryEntry": is_primary,
+                    "PrimaryEntry": True,
                     "RouterId": str(router.id),
                     "RouterName": router.name,
                     "RouterVersion": router.version,
@@ -508,40 +540,52 @@ class RouterTableProjector:
                     "Document": doc_json,
                     "Sha256": doc_sha,
                 }
-                if is_primary and other_docs:
-                    payload["AlternateDocuments"] = json.dumps(
+                if other_docs:
+                    name_payload["AlternateDocuments"] = json.dumps(
                         other_docs, separators=(",", ":"), sort_keys=True
                     )
-                resp = client.put(
-                    self._entity_url(ROUTER_CATALOG_PARTITION, rk),
-                    headers=self._headers(write=True),
-                    json=payload,
-                )
-                resp.raise_for_status()
+                if existing_resp.status_code == 200:
+                    name_resp = client.put(
+                        self._entity_url(ROUTER_CATALOG_PARTITION, name_rk),
+                        headers={**self._headers(write=True), "If-Match": etag},
+                        json=name_payload,
+                    )
+                else:
+                    name_resp = client.post(
+                        f"{self._endpoint}/{self._table}",
+                        headers=self._headers(write=True),
+                        json=name_payload,
+                    )
+                if name_resp.status_code in {409, 412} and attempt < 2:
+                    continue
+                name_resp.raise_for_status()
+                break
         return True
 
     def delete_router(self, router_id: UUID | str, router_name: str | None = None) -> None:
         target_id = str(router_id).strip().lower()
         id_rk = router_row_key(str(router_id))
-        with httpx.Client(timeout=self._timeout) as client:
-            headers = {**self._headers(), "If-Match": "*"}
+        with _SYNC_LOCK, httpx.Client(timeout=self._timeout) as client:
             resp = client.delete(
                 self._entity_url(ROUTER_CATALOG_PARTITION, id_rk),
-                headers=headers,
+                headers={**self._headers(), "If-Match": "*"},
             )
             if resp.status_code not in {200, 204, 404}:
                 resp.raise_for_status()
             if not router_name:
                 return
             name_rk = router_row_key(router_name)
-            get_resp = client.get(
-                self._entity_url(ROUTER_CATALOG_PARTITION, name_rk),
-                headers=self._headers(),
-            )
-            if get_resp.status_code == 404:
-                return
-            if get_resp.status_code == 200:
+            for attempt in range(3):
+                get_resp = client.get(
+                    self._entity_url(ROUTER_CATALOG_PARTITION, name_rk),
+                    headers=self._headers(),
+                )
+                if get_resp.status_code == 404:
+                    return
+                if get_resp.status_code != 200:
+                    get_resp.raise_for_status()
                 entity = get_resp.json()
+                etag = self._extract_etag(get_resp, entity)
                 existing_docs = self._parse_entity_documents(entity)
                 remaining_docs = [
                     d
@@ -581,19 +625,24 @@ class RouterTableProjector:
                             )
                         put_resp = client.put(
                             self._entity_url(ROUTER_CATALOG_PARTITION, name_rk),
-                            headers=self._headers(write=True),
+                            headers={**self._headers(write=True), "If-Match": etag},
                             json=replacement,
                         )
+                        if put_resp.status_code in {409, 412} and attempt < 2:
+                            continue
                         put_resp.raise_for_status()
                     return
                 if entity_router_id and entity_router_id != target_id:
                     return
-            del_resp = client.delete(
-                self._entity_url(ROUTER_CATALOG_PARTITION, name_rk),
-                headers=headers,
-            )
-            if del_resp.status_code not in {200, 204, 404}:
-                del_resp.raise_for_status()
+                del_resp = client.delete(
+                    self._entity_url(ROUTER_CATALOG_PARTITION, name_rk),
+                    headers={**self._headers(), "If-Match": etag},
+                )
+                if del_resp.status_code in {409, 412} and attempt < 2:
+                    continue
+                if del_resp.status_code not in {200, 204, 404}:
+                    del_resp.raise_for_status()
+                return
 
     def sync_all_published_routers(self, repository: Any) -> int:
         registry = repository.registry()
@@ -711,102 +760,99 @@ class RouterTableProjector:
             for usage_item in doc.get("usage_records") or []:
                 if str(usage_item.get("request_id") or "") == req_id:
                     continue
-                try:
-                    ts_val = (
-                        datetime.fromisoformat(str(usage_item["ts"]).replace("Z", "+00:00"))
-                        if usage_item.get("ts")
-                        else datetime.now(UTC)
+                ts_val = (
+                    datetime.fromisoformat(str(usage_item["ts"]).replace("Z", "+00:00"))
+                    if usage_item.get("ts")
+                    else datetime.now(UTC)
+                )
+                repository.write_token_usage(
+                    TokenUsageRecord(
+                        id=str(usage_item.get("id") or usage_item["request_id"]),
+                        request_id=str(usage_item["request_id"]),
+                        correlation_id=str(
+                            usage_item.get("correlation_id") or usage_item["request_id"]
+                        ),
+                        ts=ts_val,
+                        team=str(usage_item.get("team") or default_dept.name),
+                        organization=str(
+                            usage_item.get("organization") or default_org.name
+                        ),
+                        organization_id=str(
+                            usage_item.get("organization_id") or default_org.id
+                        ),
+                        department=str(
+                            usage_item.get("department") or default_dept.name
+                        ),
+                        department_id=str(
+                            usage_item.get("department_id") or default_dept.id
+                        ),
+                        project=str(usage_item.get("project") or default_proj.name),
+                        project_id=str(
+                            usage_item.get("project_id") or default_proj.id
+                        ),
+                        user=str(usage_item.get("user") or "unattributed"),
+                        user_id=str(usage_item.get("user_id") or "unattributed"),
+                        agent=str(
+                            usage_item.get("agent") or default_agent.name
+                        ),
+                        agent_id=str(
+                            usage_item.get("agent_id") or default_agent.id
+                        ),
+                        workflow=str(
+                            usage_item.get("workflow") or f"{default_proj.id}-interactive"
+                        ),
+                        run_id=str(
+                            usage_item.get("run_id") or usage_item["request_id"]
+                        ),
+                        turn_index=int(usage_item.get("turn_index") or 1),
+                        provider=str(
+                            usage_item.get("provider") or default_provider
+                        ),
+                        model=str(usage_item["model"]),
+                        model_id=str(usage_item["model_id"]),
+                        runtime=str(
+                            usage_item.get("runtime") or default_runtime
+                        ),
+                        request_source=str(
+                            usage_item.get("request_source") or "apim-gateway"
+                        ),
+                        usage_domain="apim",
+                        input_tokens=int(usage_item.get("input_tokens") or 0),
+                        cached_tokens=int(usage_item.get("cached_tokens") or 0),
+                        cache_write_tokens=int(
+                            usage_item.get("cache_write_tokens") or 0
+                        ),
+                        output_tokens=int(usage_item.get("output_tokens") or 0),
+                        et=float(usage_item.get("et") or 0.0001),
+                        et_coeff_m=1.0,
+                        latency_ms=int(usage_item.get("latency_ms") or 0),
+                        status=str(usage_item.get("status") or "200"),
+                        status_code=int(usage_item.get("status_code") or 200),
+                        estimated_cost=float(
+                            usage_item.get("estimated_cost") or 0.0
+                        ),
+                        usd_cost=usage_item.get("estimated_cost"),
+                        input_price_per_million=usage_item.get(
+                            "input_price_per_million"
+                        ),
+                        cached_price_per_million=usage_item.get(
+                            "cached_price_per_million"
+                        ),
+                        cache_write_price_per_million=usage_item.get(
+                            "cache_write_price_per_million"
+                        ),
+                        output_price_per_million=usage_item.get(
+                            "output_price_per_million"
+                        ),
+                        price_context_tier=(
+                            str(usage_item["price_context_tier"])
+                            if usage_item.get("price_context_tier") is not None
+                            else None
+                        ),
+                        estimated=False,
+                        ingest_source="gateway",
                     )
-                    repository.write_token_usage(
-                        TokenUsageRecord(
-                            id=str(usage_item.get("id") or usage_item["request_id"]),
-                            request_id=str(usage_item["request_id"]),
-                            correlation_id=str(
-                                usage_item.get("correlation_id") or usage_item["request_id"]
-                            ),
-                            ts=ts_val,
-                            team=str(usage_item.get("team") or default_dept.name),
-                            organization=str(
-                                usage_item.get("organization") or default_org.name
-                            ),
-                            organization_id=str(
-                                usage_item.get("organization_id") or default_org.id
-                            ),
-                            department=str(
-                                usage_item.get("department") or default_dept.name
-                            ),
-                            department_id=str(
-                                usage_item.get("department_id") or default_dept.id
-                            ),
-                            project=str(usage_item.get("project") or default_proj.name),
-                            project_id=str(
-                                usage_item.get("project_id") or default_proj.id
-                            ),
-                            user=str(usage_item.get("user") or "unattributed"),
-                            user_id=str(usage_item.get("user_id") or "unattributed"),
-                            agent=str(
-                                usage_item.get("agent") or default_agent.name
-                            ),
-                            agent_id=str(
-                                usage_item.get("agent_id") or default_agent.id
-                            ),
-                            workflow=str(
-                                usage_item.get("workflow") or f"{default_proj.id}-interactive"
-                            ),
-                            run_id=str(
-                                usage_item.get("run_id") or usage_item["request_id"]
-                            ),
-                            turn_index=int(usage_item.get("turn_index") or 1),
-                            provider=str(
-                                usage_item.get("provider") or default_provider
-                            ),
-                            model=str(usage_item["model"]),
-                            model_id=str(usage_item["model_id"]),
-                            runtime=str(
-                                usage_item.get("runtime") or default_runtime
-                            ),
-                            request_source=str(
-                                usage_item.get("request_source") or "apim-gateway"
-                            ),
-                            usage_domain="apim",
-                            input_tokens=int(usage_item.get("input_tokens") or 0),
-                            cached_tokens=int(usage_item.get("cached_tokens") or 0),
-                            cache_write_tokens=int(
-                                usage_item.get("cache_write_tokens") or 0
-                            ),
-                            output_tokens=int(usage_item.get("output_tokens") or 0),
-                            et=float(usage_item.get("et") or 0.0001),
-                            et_coeff_m=1.0,
-                            latency_ms=int(usage_item.get("latency_ms") or 0),
-                            status=str(usage_item.get("status") or "200"),
-                            status_code=int(usage_item.get("status_code") or 200),
-                            estimated_cost=float(
-                                usage_item.get("estimated_cost") or 0.0
-                            ),
-                            usd_cost=usage_item.get("estimated_cost"),
-                            input_price_per_million=usage_item.get(
-                                "input_price_per_million"
-                            ),
-                            cached_price_per_million=usage_item.get(
-                                "cached_price_per_million"
-                            ),
-                            cache_write_price_per_million=usage_item.get(
-                                "cache_write_price_per_million"
-                            ),
-                            output_price_per_million=usage_item.get(
-                                "output_price_per_million"
-                            ),
-                            price_context_tier=(
-                                str(usage_item["price_context_tier"])
-                                if usage_item.get("price_context_tier") is not None
-                                else None
-                            ),
-                            estimated=False,
-                            ingest_source="gateway",
-                        )
-                    )
-                except Exception:
-                    pass
+                )
             _SYNCED_TRACE_IDS.add(rk)
             return True
         except Exception:

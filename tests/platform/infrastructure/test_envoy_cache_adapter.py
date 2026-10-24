@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import importlib.util
 import json
+import subprocess
+import sys
 from decimal import Decimal
 from pathlib import Path
 from types import ModuleType
@@ -12,6 +14,7 @@ from uuid import UUID
 import pytest
 import yaml  # type: ignore[import-untyped]
 
+from scripts.deploy import observer_build_context
 from tests.backend.telemetry.test_atomic_ledger import EPOCH, identity
 from turnstile_core.domain.gateway_targets import canonical_usage_id_v2
 from turnstile_core.domain.ledger import BudgetPriceProjection, LedgerAdmissionReceipt
@@ -163,6 +166,96 @@ def test_observer_execution_requires_complete_protocol_usage(protocol: str) -> N
     UsageEvent.model_validate(event)
     assert event["usage_event_source"] == "observer"
     assert event["tokens_consumed"] == (2358 if protocol == "anthropic_messages" else 1230)
+
+
+@pytest.mark.parametrize("protocol", ["openai_chat", "openai_responses", "anthropic_messages"])
+def test_observer_packaged_runtime_normalizes_execution_without_repository_dependencies(
+    protocol: str,
+) -> None:
+    row = execution_row(
+        api_format=protocol, response_status="completed",
+        last_event_type="message_stop" if protocol == "anthropic_messages"
+        else "response.completed",
+    )
+    with observer_build_context(ROOT) as context:
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", "-c",
+             "import json,sys; sys.path.insert(0,sys.argv[1]); import shipper; "
+             "print(json.dumps(shipper.normalize_access_row(json.load(sys.stdin))))",
+             str(context)],
+            input=json.dumps(row), capture_output=True, text=True, check=True, timeout=10,
+        )
+    event = json.loads(result.stdout)
+    assert event["usage_complete"] is True
+    assert event["cached_tokens"] == 1128
+    assert event["cache_write_tokens"] == 128
+
+
+@pytest.mark.parametrize("service,native,correlation", [
+    ("unit-service", "managed", "unit-attempt"),
+    (" /Subscriptions/UNIT/Service/Example ", " Managed ", " CORRELATION-ID "),
+    ("STRASSE-\u00df", "managed", "CORRELATION-\u00df"),
+])
+def test_observer_canonical_usage_identity_matches_shared_contract(
+    service: str, native: str, correlation: str,
+) -> None:
+    row = execution_row()
+    receipts = json.loads(base64.b64decode(str(row["budget_execution"])))
+    receipts[0]["identity"].update(native_gateway_id=native, correlation_id=correlation)
+    expected = canonical_usage_id_v2(
+        UUID(str(row["gateway_profile_id"])), service, native, correlation,
+    )
+    row.update(
+        apim_service_id=service, native_gateway_id=native, correlation_id=correlation,
+        usage_id=expected,
+        budget_execution=base64.b64encode(json.dumps(receipts).encode()).decode(),
+    )
+    event = load_shipper().normalize_access_row(row)
+    assert event is not None and event["usage_complete"] is True
+    assert event["id"] == event["usage_id"] == expected
+
+
+@pytest.mark.parametrize("protocol", ["openai_chat", "openai_responses", "anthropic_messages"])
+def test_observer_nonbudget_scalar_rows_do_not_require_protocol_terminal_metadata(
+    protocol: str,
+) -> None:
+    row = access_row(api_format=protocol)
+    assert not {"response_flags", "response_status", "last_event_type"}.intersection(row)
+    event = load_shipper().normalize_access_row(row)
+    assert event is not None and event["estimated"] is False
+    assert event["cached_tokens"] == 1128
+    assert event["input_tokens"] == (1200 if protocol == "anthropic_messages" else 72)
+
+
+@pytest.mark.parametrize("streamed,path,key", [
+    (True, ["usage", "input_tokens_details", "cache_write_tokens"], "cache_write_tokens"),
+    (True, ["response", "usage", "input_tokens_details", "cache_write_tokens"],
+     "cache_write_tokens"),
+    (True, ["response", "usage", "prompt_tokens_details", "cached_tokens"], "cache_read_tokens"),
+    (True, ["response", "usage", "prompt_tokens_details", "cache_write_tokens"],
+     "cache_write_tokens"),
+    (False, ["usage", "input_tokens_details", "cache_write_tokens"], "cache_write_tokens"),
+])
+def test_observer_responses_scalar_selectors_preserve_cache_read_and_write(
+    streamed: bool, path: list[str], key: str,
+) -> None:
+    template = yaml.safe_load((ADAPTER / "envoy.yaml.template").read_text())
+    config = template["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0][
+        "typed_config"
+    ]
+    filters = {item["name"]: item["typed_config"] for item in config["http_filters"]}
+    if streamed:
+        rules = [entry["rule"] for entry in filters["envoy.filters.http.sse_to_metadata"][
+            "response_rules"
+        ]["content_parser"]["typed_config"]["rules"]]
+    else:
+        rules = filters["envoy.filters.http.json_to_metadata"]["response_rules"]["rules"]
+    selected = next(rule for rule in rules
+                    if rule["selectors"] == [{"key": part} for part in path])
+    assert selected["on_present"] == {
+        "metadata_namespace": "turnstile.usage", "key": key, "type": "NUMBER",
+    }
+    assert "PROTOBUF_VALUE" not in (ADAPTER / "envoy.yaml.template").read_text()
 
 
 @pytest.mark.parametrize("changes", [

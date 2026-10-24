@@ -346,10 +346,6 @@ def _route_reconcile_preparation_failed(publication: Mapping[str, Any]) -> bool:
     if not isinstance(manifest, Mapping):
         return False
     keys = set(manifest)
-    if publication.get("publication_kind") == "model_remove" and (
-        publication.get("base_release_id") is None or not keys
-    ):
-        return False
     if not keys <= {
         "route_credentials",
         "route_preparation",

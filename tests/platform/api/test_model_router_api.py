@@ -3908,6 +3908,12 @@ def test_router_security_audit_spoofing_failclosed_and_same_name_isolation(
         )
 
     table_store: dict[str, dict[str, object]] = {}
+    table_etags: dict[str, str] = {}
+    etag_seq = 0
+    simulate_503_on_name_get = False
+    stale_etag_remaining = 0
+    recorded_name_writes: list[tuple[str, str]] = []
+    shared_rk = router_row_key("Shared Team Router")
 
     class FakeTokenProvider:
         def token(self, scope: str = "https://storage.azure.com/") -> str:
@@ -3915,6 +3921,7 @@ def test_router_security_audit_spoofing_failclosed_and_same_name_isolation(
             return "fake-token"
 
     def table_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal etag_seq, stale_etag_remaining
         from urllib.parse import unquote
 
         url_str = unquote(str(request.url))
@@ -3922,19 +3929,62 @@ def test_router_security_audit_spoofing_failclosed_and_same_name_isolation(
         if "RowKey='" in url_str:
             rk = url_str.split("RowKey='", 1)[1].split("'", 1)[0]
         if request.method == "GET":
+            if rk == shared_rk and simulate_503_on_name_get:
+                return httpx.Response(503, json={"error": "ServiceUnavailable"})
             if rk:
                 ent = table_store.get(rk)
-                return (
-                    httpx.Response(200, json=ent)
-                    if ent is not None
-                    else httpx.Response(404)
+                if ent is None:
+                    return httpx.Response(404)
+                returned_etag = table_etags.get(rk, 'W/"1"')
+                if rk == shared_rk and stale_etag_remaining > 0:
+                    returned_etag = 'W/"stale-etag"'
+                    stale_etag_remaining -= 1
+                return httpx.Response(
+                    200,
+                    headers={"ETag": returned_etag},
+                    json={**ent, "odata.etag": returned_etag},
                 )
             return httpx.Response(200, json={"value": list(table_store.values())})
+        if request.method == "POST":
+            payload = json_mod.loads(request.content.decode("utf-8"))
+            post_rk = str(payload.get("RowKey") or "")
+            if post_rk == shared_rk:
+                recorded_name_writes.append(("POST", post_rk))
+            if post_rk in table_store:
+                return httpx.Response(409, json={"error": "EntityAlreadyExists"})
+            etag_seq += 1
+            table_store[post_rk] = payload
+            table_etags[post_rk] = f'W/"{etag_seq}"'
+            return httpx.Response(
+                201, headers={"ETag": table_etags[post_rk]}, json=payload
+            )
         if request.method == "PUT" and rk:
+            if rk == shared_rk:
+                recorded_name_writes.append(("PUT", rk))
+            if_match = request.headers.get("If-Match")
+            if (
+                if_match
+                and if_match != "*"
+                and table_etags.get(rk) != if_match
+            ):
+                return httpx.Response(412, json={"error": "UpdateConditionNotSatisfied"})
+            etag_seq += 1
             table_store[rk] = json_mod.loads(request.content.decode("utf-8"))
-            return httpx.Response(204)
+            table_etags[rk] = f'W/"{etag_seq}"'
+            return httpx.Response(204, headers={"ETag": table_etags[rk]})
         if request.method == "DELETE" and rk:
+            if rk == shared_rk:
+                recorded_name_writes.append(("DELETE", rk))
+            if_match = request.headers.get("If-Match")
+            if (
+                if_match
+                and if_match != "*"
+                and rk in table_store
+                and table_etags.get(rk) != if_match
+            ):
+                return httpx.Response(412, json={"error": "UpdateConditionNotSatisfied"})
             table_store.pop(rk, None)
+            table_etags.pop(rk, None)
             return httpx.Response(204)
         return httpx.Response(200)
 
@@ -3953,13 +4003,40 @@ def test_router_security_audit_spoofing_failclosed_and_same_name_isolation(
     try:
         assert projector.upsert_router(owner_router, repository.registry())
         assert projector.upsert_router(second_router, repository.registry())
-        shared_rk = router_row_key("Shared Team Router")
         assert shared_rk in table_store
         shared_entity = table_store[shared_rk]
         assert "AlternateDocuments" in shared_entity
         alt_docs = json_mod.loads(str(shared_entity["AlternateDocuments"]))
         assert len(alt_docs) == 1
         assert alt_docs[0]["router_id"] == str(owner_router.id)
+
+        # Concurrency / stale ETag check:
+        # 1) A single stale ETag (412) triggers a re-GET and merges cleanly on the 2nd attempt
+        stale_etag_remaining = 1
+        assert projector.upsert_router(second_router, repository.registry())
+        assert table_store[shared_rk]["RouterId"] == str(second_router.id)
+
+        # 2) If all 3 attempts hit stale ETag (412), PUT fails with 412 and does not overwrite
+        stale_etag_remaining = 3
+        with pytest.raises(httpx.HTTPStatusError) as stale_exc:
+            projector.upsert_router(owner_router, repository.registry())
+        assert stale_exc.value.response.status_code == 412
+        assert table_store[shared_rk]["RouterId"] == str(second_router.id)
+
+        # Transient 503 on name_rk GET: neither upsert_router nor delete_router may blind-PUT/DELETE
+        recorded_name_writes.clear()
+        simulate_503_on_name_get = True
+        try:
+            with pytest.raises(httpx.HTTPStatusError) as up_503_exc:
+                projector.upsert_router(owner_router, repository.registry())
+            assert up_503_exc.value.response.status_code == 503
+            with pytest.raises(httpx.HTTPStatusError) as del_503_exc:
+                projector.delete_router(second_router.id, "Shared Team Router")
+            assert del_503_exc.value.response.status_code == 503
+            assert recorded_name_writes == []
+            assert shared_rk in table_store
+        finally:
+            simulate_503_on_name_get = False
 
         # Deleting a third owner's unpublished draft with the same name must not touch the entity
         projector.delete_router(
@@ -3979,5 +4056,201 @@ def test_router_security_audit_spoofing_failclosed_and_same_name_isolation(
         assert router_row_key(str(second_router.id)) not in table_store
         assert router_row_key(str(owner_router.id)) in table_store
     finally:
+        httpx.Client = orig_client  # type: ignore[misc,assignment]
+
+    # 8. Restricted user calling POST /api/v1/model-gateway/decision with forged
+    #    metadata.workflow = "model-router-decision" is rejected with 403
+    decision_model = next(
+        row for row in repository.models if row["id"] == second_model
+    )
+    orig_caps = list(decision_model.get("capabilities") or [])
+    decision_model["capabilities"] = ["decision"]
+    restricted_decision_user = "restricted.decision@contoso.com"
+    repository.user_model_policies[restricted_decision_user] = {
+        "user_id": restricted_decision_user,
+        "model_ids": [first_model],
+        "updated_at": datetime.now(UTC),
+        "updated_by": "owner@contoso.com",
+    }
+    app.dependency_overrides[require_authenticated_session] = lambda: identity(
+        MEMBER_ID, restricted_decision_user, role="member"
+    )
+    try:
+        forged_decision = client.post(
+            "/api/v1/model-gateway/decision",
+            json={
+                "metadata": {
+                    "organization_id": "org-contoso-global",
+                    "organization": "Contoso Global",
+                    "department_id": "department-platform",
+                    "department": "AI Platform",
+                    "project_id": "project-finops",
+                    "project": "Model FinOps",
+                    "agent_id": "agent-console",
+                    "agent": "Invocation Console",
+                    "user_id": restricted_decision_user,
+                    "user": "restricted.decision",
+                    "workflow": "model-router-decision",
+                    "model_id": str(decision_model["id"]),
+                    "model": str(decision_model["model_key"]),
+                    "runtime": "Microsoft Foundry",
+                    "request_source": "forged-test",
+                    "run_id": "forged-decision-1",
+                    "turn_index": 1,
+                },
+                "model_id": str(decision_model["id"]),
+                "state": "test prompt",
+                "questions": {
+                    "route": {
+                        "type": "choice",
+                        "instructions": "Select one",
+                        "criteria": {"a": "Option A", "b": "Option B"},
+                    }
+                },
+            },
+        )
+        assert forged_decision.status_code == 403
+        assert forged_decision.json()["detail"] == "model_not_assigned"
+
+        # Meanwhile, in-process editor_trial_authorized=True passes _assert_model_allowed
+        # for the same user with user_model_policies when running decision-trial in the editor
+        from backend.services.runtime_service import ModelRuntimeService
+        from turnstile_core.config import get_settings
+        from turnstile_core.domain.runtime_models import (
+            ChoiceQuestion,
+            DecisionInvocationRequest,
+            InvocationMetadata,
+        )
+
+        rt_svc = ModelRuntimeService(repository, get_settings())
+        trial_req = DecisionInvocationRequest(
+            metadata=InvocationMetadata(
+                organization_id="unattributed",
+                organization="unattributed",
+                department_id="unattributed",
+                department="unattributed",
+                project_id="unattributed",
+                project="unattributed",
+                agent_id="model-router-editor",
+                agent="Model Router Editor",
+                user_id=restricted_decision_user,
+                user="restricted.decision",
+                workflow="model-router-decision-trial",
+                model_id=str(decision_model["id"]),
+                model=str(decision_model["model_key"]),
+                runtime="Microsoft Foundry",
+                request_source="model-router-trial",
+                run_id="trial-1",
+                turn_index=1,
+            ),
+            model_id=second_model,
+            state="test prompt",
+            questions={
+                "route": ChoiceQuestion(
+                    type="choice",
+                    instructions="Select one",
+                    criteria={str(first_model): "Option A", "__none__": "Option B"},
+                )
+            },
+        )
+        rt_svc._assert_model_allowed(
+            trial_req,
+            {"model_id": second_model, "model_key": decision_model["model_key"]},
+            "trial-req-1",
+            editor_trial_authorized=True,
+        )
+    finally:
+        decision_model["capabilities"] = orig_caps
+        app.dependency_overrides[require_authenticated_session] = lambda: identity(
+            OWNER_ID, "owner@contoso.com"
+        )
+
+    # 9. APIM policy preserves caller max_tokens, translates OpenAI <-> Anthropic
+    #    tools & images, and binds timeout_ms / max_latency_ms
+    assert "requestedMaxTok &gt; 0 ? requestedMaxTok : 1024" in policy_xml
+    assert "tool_result" in policy_xml
+    assert "tool_use" in policy_xml
+    assert "tool_calls" in policy_xml
+    assert "input_schema" in policy_xml
+    assert "image_url" in policy_xml
+    assert "hasImageBlocks" in policy_xml
+    assert "max_latency_ms" in policy_xml
+    assert (
+        'response-variable-name="routerAnthropicHttp" '
+        'timeout="@(Math.Max(1, Math.Min(120, (Math.Min(' in policy_xml
+    )
+    assert (
+        'response-variable-name="routerFallbackHttp" '
+        'timeout="@(Math.Max(1, Math.Min(120, (Math.Min(' in policy_xml
+    )
+
+    # 10. Trace sync does NOT delete Table trace entity if write_token_usage fails
+    trace_deletes: list[str] = []
+    trace_doc = json_mod.dumps(
+        {
+            "request_id": "req-fail-usage-1",
+            "router_id": str(owner_router.id),
+            "router_name": owner_router.name,
+            "router_version": 1,
+            "selected_model_id": str(first_model),
+            "selected_model_name": "gpt-5.6-luna",
+            "attempts": [],
+            "usage_records": [
+                {
+                    "request_id": "dec-sub-usage-1",
+                    "model": "gpt-5.6-luna",
+                    "model_id": str(first_model),
+                    "input_tokens": 12,
+                    "output_tokens": 4,
+                }
+            ],
+        }
+    )
+
+    def trace_fail_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            if "RowKey='req-fail-usage-1'" in str(request.url):
+                return httpx.Response(
+                    200,
+                    json={
+                        "PartitionKey": "model-router-trace|v1",
+                        "RowKey": "req-fail-usage-1",
+                        "Document": trace_doc,
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        {
+                            "PartitionKey": "model-router-trace|v1",
+                            "RowKey": "req-fail-usage-1",
+                            "Document": trace_doc,
+                        }
+                    ]
+                },
+            )
+        if request.method == "DELETE":
+            trace_deletes.append(str(request.url))
+            return httpx.Response(204)
+        return httpx.Response(200)
+
+    orig_write_usage = repository.write_token_usage
+
+    def failing_write_usage(_record: object) -> None:
+        raise RuntimeError("Simulated DB usage write failure")
+
+    repository.write_token_usage = failing_write_usage  # type: ignore[method-assign]
+    httpx.Client = lambda *a, **kw: orig_client(  # type: ignore[misc,assignment]
+        transport=httpx.MockTransport(trace_fail_handler)
+    )
+    try:
+        assert not projector.sync_single_trace_to_repository(
+            "req-fail-usage-1", repository
+        )
+        assert projector.sync_traces_to_repository(repository) == 0
+        assert trace_deletes == []
+    finally:
+        repository.write_token_usage = orig_write_usage  # type: ignore[method-assign]
         httpx.Client = orig_client  # type: ignore[misc,assignment]
 

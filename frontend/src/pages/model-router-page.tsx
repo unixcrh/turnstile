@@ -111,6 +111,19 @@ const STATUS_LABELS: Record<ModelRouterStatus, string> = {
   disabled: "已停用",
 }
 
+const ROUTER_VALIDATION_MESSAGES: Record<string, string> = {
+  "One or more candidate models are disabled or unavailable": "一个或多个候选模型已停用或不可用",
+  "One or more candidate models are disabled or not assigned to this user": "一个或多个候选模型已停用或未分配给当前用户",
+  "A model router with this name already exists": "同名模型路由器已存在",
+  "Only a published model router can be assigned": "仅已发布的模型路由器可分配权限",
+  "Only a published model router can be disabled": "仅已发布的模型路由器可停用",
+  "The Strategy has no callable candidate models": "该策略没有可调用的候选模型",
+}
+
+function formatRouterValidationMessage(message: string) {
+  return ROUTER_VALIDATION_MESSAGES[message] ?? message
+}
+
 function routerIdFromUrl() {
   return new URL(window.location.href).searchParams.get("router")
 }
@@ -691,9 +704,33 @@ function RouterEditor({
       </ButtonGroup>
     </div>}
     {validation && <div className={`router-validation-banner ${validation.valid ? "valid" : "invalid"}`}>
-      {validation.valid ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}
-      <span>{validation.valid ? "配置校验通过，可以发布。" : `发现 ${validation.issues.length} 个配置问题。`}</span>
-      {!validation.valid && ROUTER_CONFIG_MODE_ENABLED && <button type="button" onClick={() => onModeChange("config")}>查看问题</button>}
+      <div className="router-validation-banner-head">
+        {validation.valid ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}
+        <span>{validation.valid ? "配置校验通过，可以发布。" : `发现 ${validation.issues.length} 个配置问题。`}</span>
+        {!validation.valid && ROUTER_CONFIG_MODE_ENABLED && <button type="button" onClick={() => onModeChange("config")}>查看问题</button>}
+      </div>
+      {!validation.valid && validation.issues.length > 0 && <div className="router-validation-banner-issues">
+        {validation.issues.map((issue, index) => {
+          const targetNodeId = issue.node_id ?? (
+            issue.code === "candidate_unavailable"
+              ? value.definition.nodes.find((node) =>
+                node.candidates.some((cand) => !models.some((m) => m.id === cand.model_id))
+                || Boolean(node.routing_model_id && !models.some((m) => m.id === node.routing_model_id)),
+              )?.id ?? null
+              : null
+          )
+          return <button
+            type="button"
+            className="router-validation-banner-issue"
+            key={`${issue.code}-${targetNodeId ?? index}`}
+            disabled={!targetNodeId}
+            onClick={() => { if (targetNodeId) onSelectedNodeChange(targetNodeId) }}
+          >
+            <span>{formatRouterValidationMessage(issue.message)}</span>
+            {targetNodeId && <small>定位节点</small>}
+          </button>
+        })}
+      </div>}
     </div>}
     {effectiveMode === "canvas" ? <RouterCanvas key={router.id} definition={value.definition} models={models} displayModels={displayModels} routerName={value.name} routerDescription={value.description} selectedNodeId={selectedNodeId} onSelectedNodeChange={onSelectedNodeChange} onChange={(definition) => onChange({ ...value, definition })} onMetadataChange={(name, description) => onChange({ ...value, name, description })} /> : <RouterConfigForm value={value} models={models} displayModels={displayModels} validation={validation} onChange={onChange} onIssueSelect={(nodeId) => { onSelectedNodeChange(nodeId); onModeChange("canvas") }} />}
   </section>

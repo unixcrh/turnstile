@@ -1150,11 +1150,16 @@ button.model-availability-status { cursor: pointer; }
 .router-editor-actions > button:disabled { cursor: not-allowed; opacity: .45; }
 .router-editor-view-row { min-height: 44px; flex: 0 0 44px; display: flex; align-items: center; padding: 6px 12px; border-bottom: 1px solid var(--border); background: color-mix(in oklch, var(--muted) 20%, var(--background)); }
 .router-mode-switch button { display: inline-flex; align-items: center; gap: 5px; }
-.router-validation-banner { min-height: 34px; flex: 0 0 auto; display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 6px 12px; border-bottom: 1px solid var(--border); font-size: 11px; }
+.router-validation-banner { min-height: 34px; flex: 0 0 auto; display: grid; gap: 4px; padding: 6px 12px; border-bottom: 1px solid var(--border); font-size: 11px; }
 .router-validation-banner.valid { background: color-mix(in srgb, var(--success) 6%, var(--background)); color: var(--success); }
 .router-validation-banner.invalid { background: color-mix(in srgb, var(--destructive) 5%, var(--background)); color: var(--destructive); }
+.router-validation-banner-head { display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; align-items: center; gap: 8px; }
+.router-validation-banner-issues { display: grid; gap: 2px; padding-left: 24px; }
 .router-validation-banner button { height: 24px; border: 0; border-radius: 5px; padding: 0 7px; background: transparent; color: inherit; font-size: 11px; font-weight: 500; cursor: pointer; }
-.router-validation-banner button:hover { background: color-mix(in srgb, currentColor 8%, transparent); }
+.router-validation-banner button:hover:not(:disabled) { background: color-mix(in srgb, currentColor 8%, transparent); }
+.router-validation-banner button.router-validation-banner-issue { height: auto; min-height: 22px; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 2px 6px; margin-left: -6px; color: var(--foreground); font-weight: 400; text-align: left; }
+.router-validation-banner button.router-validation-banner-issue:disabled { cursor: default; }
+.router-validation-banner button.router-validation-banner-issue small { flex: 0 0 auto; color: var(--brand); font-size: 10px; font-weight: 500; }
 
 .router-canvas-layout { position: relative; min-height: 0; flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 1px var(--router-properties-width, 312px); overflow: hidden; }
 .router-properties-handle { position: relative; z-index: 2; width: 1px; padding: 0; border: 0; border-left: 1px solid var(--border); background: transparent; cursor: col-resize; touch-action: none; }

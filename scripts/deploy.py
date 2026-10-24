@@ -83,7 +83,9 @@ OBSERVER_SHARED_PATHS = (
     "turnstile_core/integrations/budget_completion.py",
     "turnstile_core/integrations/table_batch.py",
 )
-OBSERVER_RUNTIME_FILES = ("Dockerfile", "entrypoint.py", "shipper.py", "envoy.yaml.template")
+OBSERVER_RUNTIME_FILES = (
+    "Dockerfile", "entrypoint.py", "shipper.py", "envoy.yaml.template", "stream_heartbeat.lua",
+)
 
 
 class DeploymentError(RuntimeError):

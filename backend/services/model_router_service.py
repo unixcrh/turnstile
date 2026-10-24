@@ -1605,6 +1605,7 @@ class ModelRouterExecutionService:
                 decision_req,
                 request_id=trial_request_id,
                 timeout_ms=_DECISION_TIMEOUT_MS,
+                editor_trial_authorized=True,
             )
             usage_info = self._response_usage(decision_resp)
             latency_ms = decision_resp.latency_ms
@@ -1839,6 +1840,8 @@ class ModelRouterExecutionService:
         *,
         request_id: str,
         timeout_ms: int,
+        authorized_router_id: UUID | None = None,
+        editor_trial_authorized: bool = False,
     ) -> DecisionInvocationResponse:
         invoke_fn = self._runtime_service.invoke_decision
         try:
@@ -1846,9 +1849,18 @@ class ModelRouterExecutionService:
                 request,
                 request_id=request_id,
                 timeout_ms=timeout_ms,
+                authorized_router_id=authorized_router_id,
+                editor_trial_authorized=editor_trial_authorized,
             )
         except TypeError:
-            return invoke_fn(request, request_id=request_id)
+            try:
+                return invoke_fn(
+                    request,
+                    request_id=request_id,
+                    timeout_ms=timeout_ms,
+                )
+            except TypeError:
+                return invoke_fn(request, request_id=request_id)
 
     def _model_based_order(
         self,
@@ -1983,6 +1995,7 @@ class ModelRouterExecutionService:
                     decision_req,
                     request_id=decision_request_id,
                     timeout_ms=plan.decision_timeout_ms,
+                    authorized_router_id=router_id,
                 )
                 response = decision_resp
                 response_text = json.dumps(
@@ -2011,9 +2024,11 @@ class ModelRouterExecutionService:
                         "router_id": None,
                         "runtime_id": UUID(str(routing_model["runtime_id"])),
                         "model_id": routing_model_id,
-                        "router_context": {
-                            "_router_authorized_id": str(router_id or routing_model_id),
-                        },
+                        "router_context": (
+                            {**request.router_context, "_router_authorized_id": str(router_id)}
+                            if router_id is not None
+                            else dict(request.router_context)
+                        ),
                         "messages": [
                             ChatMessage(role="system", content=system_prompt),
                             ChatMessage(role="user", content=decision_input),
@@ -3207,9 +3222,19 @@ class ModelRouterService(_ModelRouterLifecycleService):
         if available_model_ids is not None:
             unavailable = selected_model_ids - available_model_ids
             if unavailable:
+                unavailable_node_id = next(
+                    (
+                        node.id
+                        for node in definition.nodes
+                        if any(c.model_id in unavailable for c in node.candidates)
+                        or (node.routing_model_id in unavailable)
+                    ),
+                    None,
+                )
                 issues.append(ModelRouterValidationIssue(
                     code="candidate_unavailable",
                     message="候选池包含已停用或当前用户无权访问的模型。",
+                    node_id=unavailable_node_id,
                 ))
 
         outgoing: dict[str, set[str]] = {node_id: set() for node_id in node_ids}

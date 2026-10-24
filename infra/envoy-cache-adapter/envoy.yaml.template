@@ -169,6 +169,7 @@ static_resources:
                   - name: envoy.filters.http.lua
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                      stat_prefix: pool_deployment
                       clear_route_cache: false
                       default_source_code:
                         inline_string: |
@@ -205,6 +206,13 @@ static_resources:
                             handle:body():setBytes(replacement)
                             handle:headers():replace("content-length", tostring(#replacement))
                           end
+                  - name: envoy.filters.http.lua
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                      stat_prefix: stream_heartbeat
+                      clear_route_cache: false
+                      default_source_code:
+                        filename: /app/stream_heartbeat.lua
                   - name: envoy.filters.http.dynamic_forward_proxy
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig
@@ -235,12 +243,16 @@ static_resources:
                               - rule: { selectors: [{ key: message }, { key: usage }, { key: cache_creation_input_tokens }], on_present: { metadata_namespace: turnstile.usage, key: cache_write_tokens, type: NUMBER } }
                               - rule: { selectors: [{ key: usage }, { key: input_tokens }], on_present: { metadata_namespace: turnstile.usage, key: prompt_tokens, type: NUMBER } }
                               - rule: { selectors: [{ key: usage }, { key: input_tokens_details }, { key: cached_tokens }], on_present: { metadata_namespace: turnstile.usage, key: cache_read_tokens, type: NUMBER } }
+                              - rule: { selectors: [{ key: usage }, { key: input_tokens_details }, { key: cache_write_tokens }], on_present: { metadata_namespace: turnstile.usage, key: cache_write_tokens, type: NUMBER } }
                               - rule: { selectors: [{ key: usage }, { key: cache_read_input_tokens }], on_present: { metadata_namespace: turnstile.usage, key: cache_read_tokens, type: NUMBER } }
                               - rule: { selectors: [{ key: usage }, { key: cache_creation_input_tokens }], on_present: { metadata_namespace: turnstile.usage, key: cache_write_tokens, type: NUMBER } }
                               - rule: { selectors: [{ key: usage }, { key: output_tokens }], on_present: { metadata_namespace: turnstile.usage, key: output_tokens, type: NUMBER } }
                               - rule: { selectors: [{ key: response }, { key: usage }, { key: input_tokens }], on_present: { metadata_namespace: turnstile.usage, key: prompt_tokens, type: NUMBER } }
                               - rule: { selectors: [{ key: response }, { key: usage }, { key: cached_tokens }], on_present: { metadata_namespace: turnstile.usage, key: cache_read_tokens_fallback, type: NUMBER } }
                               - rule: { selectors: [{ key: response }, { key: usage }, { key: input_tokens_details }, { key: cached_tokens }], on_present: { metadata_namespace: turnstile.usage, key: cache_read_tokens, type: NUMBER } }
+                              - rule: { selectors: [{ key: response }, { key: usage }, { key: input_tokens_details }, { key: cache_write_tokens }], on_present: { metadata_namespace: turnstile.usage, key: cache_write_tokens, type: NUMBER } }
+                              - rule: { selectors: [{ key: response }, { key: usage }, { key: prompt_tokens_details }, { key: cached_tokens }], on_present: { metadata_namespace: turnstile.usage, key: cache_read_tokens, type: NUMBER } }
+                              - rule: { selectors: [{ key: response }, { key: usage }, { key: prompt_tokens_details }, { key: cache_write_tokens }], on_present: { metadata_namespace: turnstile.usage, key: cache_write_tokens, type: NUMBER } }
                               - rule: { selectors: [{ key: response }, { key: usage }, { key: output_tokens }], on_present: { metadata_namespace: turnstile.usage, key: output_tokens, type: NUMBER } }
                   - name: envoy.filters.http.json_to_metadata
                     typed_config:
@@ -269,6 +281,8 @@ static_resources:
                             on_present: { metadata_namespace: turnstile.usage, key: prompt_tokens, type: NUMBER }
                           - selectors: [{ key: usage }, { key: input_tokens_details }, { key: cached_tokens }]
                             on_present: { metadata_namespace: turnstile.usage, key: cache_read_tokens, type: NUMBER }
+                          - selectors: [{ key: usage }, { key: input_tokens_details }, { key: cache_write_tokens }]
+                            on_present: { metadata_namespace: turnstile.usage, key: cache_write_tokens, type: NUMBER }
                           - selectors: [{ key: usage }, { key: cache_read_input_tokens }]
                             on_present: { metadata_namespace: turnstile.usage, key: cache_read_tokens, type: NUMBER }
                           - selectors: [{ key: usage }, { key: cache_creation_input_tokens }]
