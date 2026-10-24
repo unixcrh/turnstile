@@ -71,8 +71,14 @@ def test_pool_affinity_editor_is_capability_and_owner_gated() -> None:
     assert "initialPublicationAction={selectedPending?.action ?? null}" in native_page
     assert "onSubmitted={handleRouteSubmitted}" in native_page
     assert '<LoaderCircle className="spin" size={15} />' in native_page
+    assert "apim-native-route-quickstart-card" in native_page
+    assert "<ClientSampleCode" in native_page
+    assert "clientSampleFor(language, baseUrl, selectedModel.model_key, operation)" in native_page
+    assert "客户端调用零改动：继续请求原有的 APIM 网关地址并传入模型标识" in native_page
+    assert "已开启会话黏着时，客户端在多轮对话中保留并回传 APIM 下发的 Cookie" in native_page
     assert "registry.backend_pool_session_affinity_supported === true" in api
     styles = read_frontend_styles()
+    assert ".apim-native-route-quickstart-notes {" in styles
     assert ".router-resilience-affinity { min-width: 0;" in styles
     assert (
         '.router-resilience-runtime-list[data-pool="false"] '

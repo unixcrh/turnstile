@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
-import { LoaderCircle, Network, Plus, RefreshCw, Search, X } from "lucide-react"
+import { Code2, LoaderCircle, Network, Plus, RefreshCw, Search, X } from "lucide-react"
 
+import { ClientSampleCode } from "../components/finops/application-client-quickstart"
 import {
   ApimNativeRouteCreateDialog,
   type NativeRouteModelOption,
@@ -20,10 +21,18 @@ import type {
   GatewayBackendPoolSummary,
   GatewayPublication,
   GatewayPublicationStatus,
+  ManagedModel,
+  ModelRuntime,
 } from "../data-sources/apim/types"
 import { useIsMobile } from "../hooks/use-mobile"
+import {
+  clientSampleFor,
+  gatewayApiOperations,
+  type ClientSampleOperation,
+} from "../lib/application-client-samples"
 import { Button } from "../components/ui/button"
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "../components/ui/dialog"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../components/ui/select"
 import { useResizablePane } from "../components/ui/use-resizable-pane"
 import { useAuth } from "../providers/auth-provider"
 
@@ -60,6 +69,29 @@ function writeSelectedModelId(modelId: string | null) {
     else sessionStorage.removeItem(SELECTED_MODEL_STORAGE_KEY)
   } catch {
     // Ignore storage write failures
+  }
+}
+
+function modelSampleOperations(model: ManagedModel, runtime: ModelRuntime | undefined) {
+  const configuredFormat = String(runtime?.config.api_format ?? "")
+  const isAnthropic = (runtime?.brand_key === "microsoft_foundry" && model.family_key === "claude")
+    || configuredFormat === "anthropic_messages"
+    || (!configuredFormat && (
+      runtime?.brand_key === "amazon_bedrock"
+      || runtime?.brand_key === "anthropic"
+      || runtime?.brand_key === "azure_databricks"
+    ))
+  const allowedIds = new Set<ClientSampleOperation>(
+    isAnthropic
+      ? ["anthropic_messages", "anthropic_count_tokens", "models"]
+      : ["chat_completions", "responses", "responses_compact", "models"],
+  )
+  const defaultOperation: ClientSampleOperation = isAnthropic
+    ? "anthropic_messages"
+    : "chat_completions"
+  return {
+    defaultOperation,
+    operations: gatewayApiOperations().filter((operation) => allowedIds.has(operation.id)),
   }
 }
 
@@ -268,6 +300,29 @@ export function ApimNativeRoutesPage({
   const memberCount = (selectedPending && selectedPending.action !== "remove"
     ? selectedPending.draft.members.length
     : undefined) ?? selectedPool?.members.length ?? selectedPending?.draft.members.length ?? 0
+  const selectedRuntime = selectedModel
+    ? registry.data?.runtimes.find((runtime) => runtime.id === selectedModel.runtime_id)
+    : undefined
+  const selectedGateway = selectedRuntime
+    ? registry.data?.gateways.find((gateway) => gateway.id === selectedRuntime.gateway_profile_id)
+    : undefined
+  const selectedTarget = selectedGateway
+    ? registry.data?.apim_target_topology?.items.find(
+      (item) => item.target.gateway_profile_id === selectedGateway.id,
+    )
+    : undefined
+  const baseUrl = (selectedTarget?.gateway_endpoint ?? selectedGateway?.base_url ?? "").replace(/\/+$/, "")
+  const [selectedOperation, setSelectedOperation] = useState<ClientSampleOperation>("chat_completions")
+  const { defaultOperation, operations } = useMemo(
+    () => selectedModel
+      ? modelSampleOperations(selectedModel, selectedRuntime)
+      : { defaultOperation: "chat_completions" as const, operations: [] },
+    [selectedModel, selectedRuntime],
+  )
+  const operation = operations.find((item) => item.id === selectedOperation)?.id ?? defaultOperation
+  const sessionAffinityEnabled = Boolean(
+    selectedPool?.session_affinity || selectedPending?.draft.session_affinity,
+  )
 
   const routeListContent = (closeOnSelect: boolean) => <>
     <div className="router-list-controls apim-native-route-list-controls">
@@ -350,6 +405,28 @@ export function ApimNativeRoutesPage({
                     </dl>
                   </section>
                   <section className="runtime-detail-sidecard apim-native-route-config-card">{editor}</section>
+                  <section className="application-card application-quickstart-card apim-native-route-quickstart-card">
+                    <header className="application-card-head"><div><Code2 size={14} /><h2>客户端接入</h2></div><span>示例代码</span></header>
+                    <div className="apim-native-route-quickstart-notes">
+                      <p className="application-quickstart-contract-note apim-native-route-quickstart-note">
+                        <span>客户端调用零改动：继续请求原有的 APIM 网关地址并传入模型标识</span>{" "}
+                        <code data-no-localize>{selectedModel.model_key}</code>
+                        <span>，客户端无需感知后端池存在；APIM 网关会在数据面自动按当前后端池策略执行主备切换、均衡/加权分流与故障熔断重试（同时对直调与所有命中该模型的 Model Intelligent Router 生效）。</span>
+                      </p>
+                      {sessionAffinityEnabled && <p className="application-quickstart-contract-note apim-native-route-quickstart-note" data-affinity="true">
+                        <span>已开启会话黏着时，客户端在多轮对话中保留并回传 APIM 下发的 Cookie 即可维持同一后端成员绑定。</span>
+                      </p>}
+                    </div>
+                    {baseUrl ? <>
+                      <div className="application-quickstart-controls apim-native-route-quickstart-controls">
+                        <label><span>接口</span><Select value={operation} items={operations.map((item) => ({ value: item.id, label: `${item.label} · ${item.path}` }))} onValueChange={(value) => { if (value) setSelectedOperation(value) }}>
+                          <SelectTrigger className="application-quickstart-model-select" aria-label="示例接口"><SelectValue /></SelectTrigger>
+                          <SelectContent>{operations.map((item) => <SelectItem key={item.id} value={item.id}>{item.label} · {item.path}</SelectItem>)}</SelectContent>
+                        </Select></label>
+                      </div>
+                      <ClientSampleCode endpoint={baseUrl} sampleForLanguage={language => clientSampleFor(language, baseUrl, selectedModel.model_key, operation)} />
+                    </> : <div className="application-card-empty"><Code2 size={17} />该 APIM 尚未提供可用的 API Base URL。</div>}
+                  </section>
                 </div>
               </div>
             </div>
