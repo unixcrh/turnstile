@@ -931,10 +931,10 @@ def test_apim_native_routes_have_one_dedicated_qualified_surface() -> None:
     assert 'className="smh-search"' in native_page
     assert (
         ".apim-native-route-list.router-list-pane .apim-native-route-list-controls { "
-        "min-height: 54px; flex-basis: 54px; padding: 12px 12px 6px; border-bottom: 0; }"
+        "min-height: 48px; flex-basis: 48px; padding: 12px 12px 4px; border-bottom: 0; }"
     ) in styles
     assert ".apim-native-route-list .router-list-row::before { inset-inline: 8px; }" in styles
-    assert ".apim-native-route-list .router-list-scroll { padding-top: 6px; }" in styles
+    assert ".apim-native-route-list .router-list-scroll { padding-top: 4px; }" in styles
     assert '.apim-native-routes-workspace > .smh-page-header { display: none; }' in styles
     assert (
         "body:has(.apim-native-route-drawer) .search-dialog-overlay { "

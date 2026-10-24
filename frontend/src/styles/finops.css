@@ -88,10 +88,10 @@
 .search-command-list [cmdk-item][data-selected="true"] { background: var(--muted); }
 .search-command-list [cmdk-empty] { padding: 40px 12px; color: var(--muted-foreground); font-size: 14px; line-height: 20px; text-align: center; }
 .registry-editor-dialog { position: fixed; top: 50%; left: 50%; z-index: 61; width: min(620px, calc(100vw - 32px)); max-height: min(820px, calc(100vh - 32px)); overflow: hidden; transform: translate(-50%, -50%); border-radius: 12px; outline: 1px solid color-mix(in oklch, var(--foreground) 10%, transparent); background: var(--popover); color: var(--popover-foreground); box-shadow: 0 18px 50px oklch(0 0 0 / 24%); }
-.apim-native-route-list.router-list-pane .apim-native-route-list-controls { min-height: 54px; flex-basis: 54px; padding: 12px 12px 6px; border-bottom: 0; }
+.apim-native-route-list.router-list-pane .apim-native-route-list-controls { min-height: 48px; flex-basis: 48px; padding: 12px 12px 4px; border-bottom: 0; }
 .apim-native-route-list .router-list-main { grid-column: 1 / -1; }
 .apim-native-route-list .router-list-row::before { inset-inline: 8px; }
-.apim-native-route-list .router-list-scroll { padding-top: 6px; }
+.apim-native-route-list .router-list-scroll { padding-top: 4px; }
 .apim-native-route-list .router-list-copy small { display: flex; align-items: center; gap: 4px; }
 .apim-native-route-list .router-list-copy small code { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .apim-native-route-list .router-list-copy small i { font-style: normal; }
@@ -105,10 +105,14 @@
 .apim-native-route-hero .runtime-detail-facts > div:nth-child(2n) { border-right: 0; }
 .apim-native-route-hero .runtime-detail-facts > div:nth-child(-n+2) { border-bottom: 1px solid var(--border); }
 .apim-native-route-config-card { padding: 16px; container-type: inline-size; }
-.apim-native-route-quickstart-notes { min-width: 0; display: grid; gap: 6px; padding: 12px 16px 0; }
-.apim-native-route-quickstart-notes > .apim-native-route-quickstart-note { margin: 0; color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
-.apim-native-route-quickstart-notes > .apim-native-route-quickstart-note code { border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; background: var(--muted); color: var(--foreground); font: 11px/16px "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace; }
-.apim-native-route-quickstart-notes > .apim-native-route-quickstart-note[data-affinity="true"] { border-left: 2px solid var(--brand); padding-left: 8px; }
+.apim-native-route-quickstart-card > summary { cursor: pointer; list-style: none; user-select: none; border-bottom: 0; }
+.apim-native-route-quickstart-card > summary::-webkit-details-marker { display: none; }
+.apim-native-route-quickstart-card[open] > summary { border-bottom: 1px solid var(--border); }
+.apim-native-route-quickstart-card > summary > span { display: inline-flex; align-items: center; gap: 4px; }
+.apim-native-route-quickstart-card > summary > span > svg { transition: transform 140ms ease; }
+.apim-native-route-quickstart-card[open] > summary > span > svg { transform: rotate(90deg); }
+.apim-native-route-quickstart-note { margin: 12px 16px 0; color: var(--muted-foreground); font-size: 12px; line-height: 18px; }
+.apim-native-route-quickstart-note code { border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; background: var(--muted); color: var(--foreground); font: 11px/16px "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace; }
 .apim-native-route-quickstart-card .apim-native-route-quickstart-controls { max-width: 360px; }
 @media (max-width: 767px) {
 	.apim-native-route-quickstart-card .apim-native-route-quickstart-controls { max-width: 100%; }

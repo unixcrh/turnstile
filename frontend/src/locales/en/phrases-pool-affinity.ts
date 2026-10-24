@@ -10,7 +10,5 @@ export const POOL_AFFINITY_PHRASES: Record<string, string> = {
   "会话传递": "Session transport",
   "故障行为": "Failure behavior",
   "允许故障切换": "Failover allowed",
-  "客户端调用零改动：继续请求原有的 APIM 网关地址并传入模型标识": "Zero client code changes: continue calling the existing APIM gateway endpoint with model key",
-  "，客户端无需感知后端池存在；APIM 网关会在数据面自动按当前后端池策略执行主备切换、均衡/加权分流与故障熔断重试（同时对直调与所有命中该模型的 Model Intelligent Router 生效）。": "—clients do not need to be aware of the backend pool. APIM automatically performs failover, balanced or weighted distribution, and circuit-breaker retries in the data plane (for both direct calls and any Model Intelligent Router targeting this model).",
-  "已开启会话黏着时，客户端在多轮对话中保留并回传 APIM 下发的 Cookie 即可维持同一后端成员绑定。": "When session affinity is enabled, retain and resend the APIM-issued cookie across multi-turn conversations to keep requests pinned to the same pool member.",
+  "客户端调用零改动，继续使用模型标识": "No client changes needed — continue calling with model key",
 }

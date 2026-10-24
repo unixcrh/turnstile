@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
-import { Code2, LoaderCircle, Network, Plus, RefreshCw, Search, X } from "lucide-react"
+import { ChevronRight, Code2, LoaderCircle, Network, Plus, RefreshCw, Search, X } from "lucide-react"
 
 import { ClientSampleCode } from "../components/finops/application-client-quickstart"
 import {
@@ -320,9 +320,6 @@ export function ApimNativeRoutesPage({
     [selectedModel, selectedRuntime],
   )
   const operation = operations.find((item) => item.id === selectedOperation)?.id ?? defaultOperation
-  const sessionAffinityEnabled = Boolean(
-    selectedPool?.session_affinity || selectedPending?.draft.session_affinity,
-  )
 
   const routeListContent = (closeOnSelect: boolean) => <>
     <div className="router-list-controls apim-native-route-list-controls">
@@ -405,18 +402,12 @@ export function ApimNativeRoutesPage({
                     </dl>
                   </section>
                   <section className="runtime-detail-sidecard apim-native-route-config-card">{editor}</section>
-                  <section className="application-card application-quickstart-card apim-native-route-quickstart-card">
-                    <header className="application-card-head"><div><Code2 size={14} /><h2>客户端接入</h2></div><span>示例代码</span></header>
-                    <div className="apim-native-route-quickstart-notes">
-                      <p className="application-quickstart-contract-note apim-native-route-quickstart-note">
-                        <span>客户端调用零改动：继续请求原有的 APIM 网关地址并传入模型标识</span>{" "}
-                        <code data-no-localize>{selectedModel.model_key}</code>
-                        <span>，客户端无需感知后端池存在；APIM 网关会在数据面自动按当前后端池策略执行主备切换、均衡/加权分流与故障熔断重试（同时对直调与所有命中该模型的 Model Intelligent Router 生效）。</span>
-                      </p>
-                      {sessionAffinityEnabled && <p className="application-quickstart-contract-note apim-native-route-quickstart-note" data-affinity="true">
-                        <span>已开启会话黏着时，客户端在多轮对话中保留并回传 APIM 下发的 Cookie 即可维持同一后端成员绑定。</span>
-                      </p>}
-                    </div>
+                  <details className="application-card application-quickstart-card apim-native-route-quickstart-card">
+                    <summary className="application-card-head"><div><Code2 size={14} /><h2>客户端接入</h2></div><span><span>示例代码</span><ChevronRight size={14} aria-hidden="true" /></span></summary>
+                    <p className="apim-native-route-quickstart-note">
+                      <span>客户端调用零改动，继续使用模型标识</span>{" "}
+                      <code data-no-localize>{selectedModel.model_key}</code>
+                    </p>
                     {baseUrl ? <>
                       <div className="application-quickstart-controls apim-native-route-quickstart-controls">
                         <label><span>接口</span><Select value={operation} items={operations.map((item) => ({ value: item.id, label: `${item.label} · ${item.path}` }))} onValueChange={(value) => { if (value) setSelectedOperation(value) }}>
@@ -426,7 +417,7 @@ export function ApimNativeRoutesPage({
                       </div>
                       <ClientSampleCode endpoint={baseUrl} sampleForLanguage={language => clientSampleFor(language, baseUrl, selectedModel.model_key, operation)} />
                     </> : <div className="application-card-empty"><Code2 size={17} />该 APIM 尚未提供可用的 API Base URL。</div>}
-                  </section>
+                  </details>
                 </div>
               </div>
             </div>
