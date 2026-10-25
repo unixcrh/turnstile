@@ -425,6 +425,10 @@ components:
       $ref: ./openapi/components/common.yaml#/parameters/PinnedReportId
     ConversationId:
       $ref: ./openapi/components/common.yaml#/parameters/ConversationId
+    ProposalId:
+      $ref: ./openapi/components/common.yaml#/parameters/ProposalId
+    RouterId:
+      $ref: ./openapi/components/common.yaml#/parameters/RouterId
     PinnedChartId:
       $ref: ./openapi/components/common.yaml#/parameters/PinnedChartId
     AssistantTimezone:

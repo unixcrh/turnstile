@@ -12,7 +12,11 @@ from backend.services.model_router_service import (
 )
 from backend.services.model_router_v3_service import ModelRouterV3Service
 from turnstile_core.domain.model_router import ModelRouterDefinition, ModelRouterWrite
-from turnstile_core.domain.model_router_v3 import ModelRouterV3Write, RouterSpecV3
+from turnstile_core.domain.model_router_v3 import (
+    ModelRouterV3ValidationResult,
+    ModelRouterV3Write,
+    RouterSpecV3,
+)
 from turnstile_core.persistence.in_memory import InMemoryRepository
 
 OWNER_ID = UUID("00000000-0000-4000-8000-000000000101")
@@ -239,7 +243,9 @@ def test_v3_published_alias_is_immutable_and_lifecycle_is_owner_scoped() -> None
         service.get(created.id, OWNER_ID)
 
 
-def test_v3_publish_rejects_concurrent_draft_modification_after_compilation() -> None:
+def test_v3_publish_rejects_concurrent_draft_modification_after_compilation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     repository = InMemoryRepository()
     model_ids = tuple(
         UUID(str(model["id"])) for model in repository.models if model["enabled"]
@@ -270,13 +276,13 @@ def test_v3_publish_rejects_concurrent_draft_modification_after_compilation() ->
     original_validate = service.validate
 
     def validate_then_concurrent_update(
-        router_id: UUID, owner_id: UUID, owner_email: str, role: str
-    ):
-        result = original_validate(router_id, owner_id, owner_email, role)
-        service.update(router_id, v3_write(model_ids), owner_id, owner_email, role)
+        router_id: UUID, owner_id: UUID, user_email: str, role: str,
+    ) -> ModelRouterV3ValidationResult:
+        result = original_validate(router_id, owner_id, user_email, role)
+        service.update(router_id, v3_write(model_ids), owner_id, user_email, role)
         return result
 
-    service.validate = validate_then_concurrent_update  # type: ignore[method-assign]
+    monkeypatch.setattr(service, "validate", validate_then_concurrent_update)
     with pytest.raises(
         ModelRouterConflictError, match="draft changed during compilation"
     ):

@@ -137,6 +137,7 @@ from turnstile_core.integrations.apim_storage_routes import (
     fixed_program_digest,
 )
 from turnstile_core.integrations.apim_target_client_factory import ApimTargetClientConfig
+from turnstile_core.integrations.route_credential_vault import VaultCheckpoint as _VaultCheckpoint
 from turnstile_core.integrations.storage_route_projection import (
     ModelRouteActivationIntent,
     RouteActivationIntent,
@@ -194,7 +195,6 @@ from turnstile_core.services.storage_route_publisher import (
     _OAuthWriteIntent,
     _PoolWriteIntent,
     _PreparationCheckpoint,
-    _VaultCheckpoint,
     native_gateway_programs,
 )
 

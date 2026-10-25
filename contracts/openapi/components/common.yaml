@@ -122,6 +122,13 @@ parameters:
     schema:
       type: string
       format: uuid
+  RouterId:
+    name: router_id
+    in: path
+    required: true
+    schema:
+      type: string
+      format: uuid
   PinnedChartId:
     name: chart_id
     in: path

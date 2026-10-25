@@ -150,6 +150,28 @@ def test_openapi_root_is_a_small_domain_index() -> None:
     }
 
 
+def test_router_and_proposal_path_parameters_resolve_to_required_uuid_parameters() -> None:
+    root = _yaml_document(CONTRACT.resolve())
+    components = cast(dict[str, object], root["components"])
+    parameters = _resolve_index(cast(dict[str, object], components["parameters"]))
+    for name, field in (("RouterId", "router_id"), ("ProposalId", "proposal_id")):
+        assert parameters[name] == {
+            "name": field, "in": "path", "required": True,
+            "schema": {"type": "string", "format": "uuid"},
+        }
+        operations = [
+            operation
+            for path, methods in _documented_paths().items() if f"{{{field}}}" in path
+            for method, operation in methods.items() if method in METHODS
+        ]
+        assert operations
+        for operation in operations:
+            operation_parameters = cast(
+                list[dict[str, object]], cast(dict[str, object], operation)["parameters"],
+            )
+            assert {"$ref": f"#/components/parameters/{name}"} in operation_parameters
+
+
 def test_model_availability_contract_matches_runtime_constraints_and_owner_routes() -> None:
     documented = _documented_schemas()
     actual = app.openapi()["components"]["schemas"]

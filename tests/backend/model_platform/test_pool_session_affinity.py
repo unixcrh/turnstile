@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from typing import Any
+from unittest.mock import Mock
 from uuid import UUID, uuid4
 
 import httpx
@@ -25,6 +27,7 @@ from turnstile_core.domain.control_plane import (
     GatewayRateLimitResilience,
     PublicationKind,
 )
+from turnstile_core.domain.storage_routes import FixedProgramInstallation
 from turnstile_core.integrations.apim_control_plane_contract import (
     BackendPoolMemberResource,
     BackendPoolResource,
@@ -33,6 +36,7 @@ from turnstile_core.integrations.apim_control_plane_contract import (
 )
 from turnstile_core.integrations.apim_policy_compiler import ApimPolicyCompiler
 from turnstile_core.integrations.apim_publisher_client import AzureApimPublisherClient
+from turnstile_core.integrations.apim_target_client_factory import ApimTargetClientConfigResolver
 from turnstile_core.persistence.in_memory import InMemoryRepository
 
 
@@ -130,9 +134,12 @@ def test_new_pool_members_are_rechecked_even_when_deployment_names_match(
         publication.desired_spec.model_copy(update={"bindings": [updated]}),
     })
     factory = FixedRoutePublisherFactory(
-        InMemoryRepository(), {}, active_fence=lambda _gateway: {},
-        availability_projector=lambda _model: None,
+        InMemoryRepository(), Mock(spec=ApimTargetClientConfigResolver),
+        active_fence=lambda _gateway: {}, availability_projector=Mock(),
     )
+    management = Mock(spec=AzureApimPublisherClient)
+    client = Mock(spec=httpx.Client)
+    installation = Mock(spec=FixedProgramInstallation)
     checked = []
 
     def metadata(*args: Any, binding: Any) -> dict[str, str]:
@@ -143,9 +150,9 @@ def test_new_pool_members_are_rechecked_even_when_deployment_names_match(
     monkeypatch.setattr(factory, "_validate_deployment", metadata)
     if mismatch:
         with pytest.raises(PolicyCompilationError, match="same model and version"):
-            factory._validate_pool_deployments(publication, None, None, None)
+            factory._validate_pool_deployments(publication, management, client, installation)
     else:
-        factory._validate_pool_deployments(publication, None, None, None)
+        factory._validate_pool_deployments(publication, management, client, installation)
     assert checked == [member.runtime_id for member in members]
 
 
@@ -879,9 +886,53 @@ def test_route_reconcile_absorbs_model_add_and_resolves_legacy_member_project_en
             outbox["lease_owner"] = None
             outbox["lease_expires_at"] = None
     assert _route_reconcile_preparation_failed(repository.gateway_publications[-1]) is True
+    failed_publication = deepcopy(repository.gateway_publications[-1])
+    failed_outboxes = deepcopy([
+        outbox for outbox in repository.gateway_publication_outbox
+        if outbox["publication_id"] == removal_pub.id
+    ])
+    failed_audit = deepcopy(repository.gateway_publication_audit)
+
     retried_removal = service.remove_model(absorbed_model["id"], "owner@example.com")
+
     assert retried_removal.id != removal_pub.id
     assert retried_removal.status.value == "queued"
+    assert retried_removal.generation == removal_pub.generation + 1
+    assert retried_removal.base_release_id == reconcile_id
+    assert retried_removal.desired_spec == removal_pub.desired_spec
+    assert retried_removal.desired_spec_sha256 == removal_pub.desired_spec_sha256
+    assert [
+        publication for publication in repository.gateway_publications
+        if publication["id"] == removal_pub.id
+    ] == [failed_publication]
+    assert [
+        outbox for outbox in repository.gateway_publication_outbox
+        if outbox["publication_id"] == removal_pub.id
+    ] == failed_outboxes
+    assert repository.gateway_publication_audit[:len(failed_audit)] == failed_audit
+    assert [
+        outbox for outbox in repository.gateway_publication_outbox
+        if outbox["publication_id"] == retried_removal.id
+    ] == [{
+        "publication_id": retried_removal.id,
+        "status": "queued",
+        "available_at": retried_removal.created_at,
+        "lease_owner": None,
+        "lease_expires_at": None,
+        "attempts": 0,
+        "created_at": retried_removal.created_at,
+        "updated_at": retried_removal.created_at,
+    }]
+    queued_publications = deepcopy(repository.gateway_publications)
+    queued_outboxes = deepcopy(repository.gateway_publication_outbox)
+    queued_audit = deepcopy(repository.gateway_publication_audit)
+
+    repeated_removal = service.remove_model(absorbed_model["id"], "owner@example.com")
+
+    assert repeated_removal == retried_removal
+    assert repository.gateway_publications == queued_publications
+    assert repository.gateway_publication_outbox == queued_outboxes
+    assert repository.gateway_publication_audit == queued_audit
 
     from turnstile_core.services.route_publication import RouteConfigurationExecutor
 

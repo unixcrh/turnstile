@@ -5,7 +5,7 @@ import json
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import Mock, create_autospec
 from uuid import UUID
 
 import pytest
@@ -2542,7 +2542,7 @@ def test_router_table_projection_and_apim_global_policy_are_decoupled_and_parame
     try:
         synced = projector.sync_traces_to_repository(repository)
     finally:
-        httpx.Client = orig_client  # type: ignore[misc,assignment]
+        httpx.Client = orig_client  # type: ignore[misc]
 
     assert synced == 1
     assert "req-stream-101" in repository.model_router_invocations
@@ -3584,7 +3584,7 @@ def test_audit_fixes_start_node_partial_candidates_sub_key_bounds_and_trace_pagi
     try:
         synced_count = projector.sync_traces_to_repository(repository)
     finally:
-        httpx.Client = orig_client  # type: ignore[misc,assignment]
+        httpx.Client = orig_client  # type: ignore[misc]
 
     assert synced_count == 2
     assert len(get_calls) == 2
@@ -3598,6 +3598,7 @@ def test_audit_fixes_start_node_partial_candidates_sub_key_bounds_and_trace_pagi
 
 def test_router_security_audit_spoofing_failclosed_and_same_name_isolation(
     router_repository: tuple[InMemoryRepository, dict[str, SessionIdentity]],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import json as json_mod
 
@@ -4056,7 +4057,7 @@ def test_router_security_audit_spoofing_failclosed_and_same_name_isolation(
         assert router_row_key(str(second_router.id)) not in table_store
         assert router_row_key(str(owner_router.id)) in table_store
     finally:
-        httpx.Client = orig_client  # type: ignore[misc,assignment]
+        httpx.Client = orig_client  # type: ignore[misc]
 
     # 8. Restricted user calling POST /api/v1/model-gateway/decision with forged
     #    metadata.workflow = "model-router-decision" is rejected with 403
@@ -4237,10 +4238,10 @@ def test_router_security_audit_spoofing_failclosed_and_same_name_isolation(
 
     orig_write_usage = repository.write_token_usage
 
-    def failing_write_usage(_record: object) -> None:
-        raise RuntimeError("Simulated DB usage write failure")
-
-    repository.write_token_usage = failing_write_usage  # type: ignore[method-assign]
+    failing_write_usage = create_autospec(
+        orig_write_usage, side_effect=RuntimeError("Simulated DB usage write failure"),
+    )
+    monkeypatch.setattr(repository, "write_token_usage", failing_write_usage)
     httpx.Client = lambda *a, **kw: orig_client(  # type: ignore[misc,assignment]
         transport=httpx.MockTransport(trace_fail_handler)
     )
@@ -4250,7 +4251,8 @@ def test_router_security_audit_spoofing_failclosed_and_same_name_isolation(
         )
         assert projector.sync_traces_to_repository(repository) == 0
         assert trace_deletes == []
+        failing_write_usage.assert_called()
     finally:
-        repository.write_token_usage = orig_write_usage  # type: ignore[method-assign]
-        httpx.Client = orig_client  # type: ignore[misc,assignment]
+        monkeypatch.setattr(repository, "write_token_usage", orig_write_usage)
+        httpx.Client = orig_client  # type: ignore[misc]
 

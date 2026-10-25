@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from backend.services.budget_service import BudgetConflictError, TokenBudgetService
+from turnstile_core.domain.ledger import BudgetReservationFinalization
 from turnstile_core.domain.models import (
     BudgetScopeType,
     TokenBudgetBulkWrite,
@@ -1168,8 +1169,6 @@ def test_model_access_projection_failure_reports_saved_but_not_projected(
 def test_organization_switch_rejects_unpriced_usage_or_unresolved_upper_bound_reservations(
     blocker: str,
 ) -> None:
-    from types import SimpleNamespace
-
     repository = InMemoryRepository()
     service = TokenBudgetService(repository)
     user_id = "test.user01@contoso.com"
@@ -1192,17 +1191,20 @@ def test_organization_switch_rejects_unpriced_usage_or_unresolved_upper_bound_re
         )
         expected_match = "unpriced usage"
     else:
-        repository.budget_reservation_finalizations[("person", user_id, "corr-upper")] = (  # type: ignore[assignment]
-            SimpleNamespace(
+        repository.save_budget_reservation_finalizations([
+            BudgetReservationFinalization(
                 scope_type="person",
                 scope_id=user_id,
                 period_start=date(2026, 7, 1),
                 finalization_kind="unverified_upper_bound",
                 reservation_created_at=datetime(2026, 7, 15, tzinfo=UTC),
                 correlation_id="corr-upper",
+                reservation_tokens=4096,
                 total_tokens=4096,
+                evidence_at=datetime(2026, 7, 16, tzinfo=UTC),
+                source="reservation_timeout",
             )
-        )
+        ])
         expected_match = "unresolved upper-bound reservations"
     before = deepcopy(repository.token_budgets)
     with pytest.raises(BudgetConflictError, match=expected_match):
@@ -1217,7 +1219,6 @@ def test_organization_switch_rejects_unpriced_usage_or_unresolved_upper_bound_re
 
 
 def test_organization_switch_ignores_cancelled_tombstones_and_allows_reverting_torn_unit() -> None:
-    from types import SimpleNamespace
     from uuid import UUID
 
     from turnstile_core.domain.ledger import LedgerAdmissionReceipt, LedgerAttemptIdentity
@@ -1315,18 +1316,20 @@ def test_organization_switch_ignores_cancelled_tombstones_and_allows_reverting_t
             "usage_id": None,
         }
     )
-    repository.budget_reservation_finalizations[("person", user_id, "corr-upper")] = (  # type: ignore[assignment]
-        SimpleNamespace(
+    repository.save_budget_reservation_finalizations([
+        BudgetReservationFinalization(
             scope_type="person",
             scope_id=user_id,
             period_start=period,
             finalization_kind="unverified_upper_bound",
             reservation_created_at=datetime(2026, 7, 15, tzinfo=UTC),
             correlation_id="corr-upper",
+            reservation_tokens=4096,
             total_tokens=4096,
-            budget_mode="tokens",
+            evidence_at=datetime(2026, 7, 16, tzinfo=UTC),
+            source="reservation_timeout",
         )
-    )
+    ])
     service.save(
         "2026-07",
         "organization",
