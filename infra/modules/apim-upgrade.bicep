@@ -17,6 +17,7 @@ param apiProperties object
 param parentPolicy string
 @secure()
 param imageOperationProperties object
+param fixedOperations array = []
 
 resource apim 'Microsoft.ApiManagement/service@2024-05-01' existing = {
   name: apimName
@@ -52,6 +53,28 @@ resource imagePolicy 'Microsoft.ApiManagement/service/apis/operations/policies@2
   }
 }
 
+@batchSize(1)
+resource fixedOperation 'Microsoft.ApiManagement/service/apis/operations@2024-05-01' = [for operation in fixedOperations: if (stage == 'prepare') {
+  parent: candidate
+  name: operation.name
+  properties: {
+    displayName: operation.name
+    method: operation.method
+    urlTemplate: operation.path
+    templateParameters: []
+    responses: []
+  }
+}]
+
+resource fixedOperationPolicy 'Microsoft.ApiManagement/service/apis/operations/policies@2024-05-01' = [for (operation, index) in fixedOperations: if (stage == 'prepare') {
+  parent: fixedOperation[index]
+  name: 'policy'
+  properties: {
+    format: 'rawxml'
+    value: operation.policy
+  }
+}]
+
 resource parent 'Microsoft.ApiManagement/service/apis/policies@2024-05-01' = if (stage == 'prepare') {
   parent: candidate
   name: 'policy'
@@ -61,6 +84,7 @@ resource parent 'Microsoft.ApiManagement/service/apis/policies@2024-05-01' = if 
   }
   dependsOn: [
     imagePolicy
+    fixedOperationPolicy
   ]
 }
 

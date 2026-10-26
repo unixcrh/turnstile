@@ -24,6 +24,7 @@ param eventHubNamespaceName string
 param eventHubName string = 'token-usage'
 param apimName string
 param adapterKeyNamedValueName string = 'turnstile-envoy-adapter-key'
+param publisherPrincipalId string = ''
 
 @secure()
 param adapterSharedKey string
@@ -91,6 +92,16 @@ module apimIntegration 'apim.bicep' = {
     apimName: apimName
     adapterKeyNamedValueName: adapterKeyNamedValueName
     adapterSharedKey: adapterSharedKey
+  }
+}
+
+module publisherObserverKeyAccess '../modules/observer-named-value-rbac.bicep' = if (!empty(publisherPrincipalId)) {
+  name: 'envoy-publisher-key-${uniqueString(resourceGroupName)}'
+  scope: apimResourceGroup
+  params: {
+    apimName: apimName
+    observerKeyNamedValue: apimIntegration.outputs.namedValueName
+    publisherPrincipalId: publisherPrincipalId
   }
 }
 

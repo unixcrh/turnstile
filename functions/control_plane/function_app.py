@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -11,7 +12,7 @@ from functools import partial
 from pathlib import Path
 from time import monotonic
 from typing import cast
-from uuid import UUID
+from uuid import UUID, uuid5
 
 import azure.functions as func
 import httpx
@@ -24,6 +25,7 @@ from turnstile_core.domain.storage_routes import (
     FixedProgramCutover,
     FixedProgramInstallation,
     canonical_document,
+    document_digest,
 )
 from turnstile_core.integrations.apim_control_plane import (
     ApimPolicyCompiler,
@@ -432,6 +434,21 @@ def publish_gateway_changes(timer: func.TimerRequest) -> None:
     resources = ExitStack()
     try:
         configurations = apim_target_client_config_resolver(repository, settings)
+        descriptor = os.environ.get("TURNSTILE_FIXED_BOOTSTRAP_DESCRIPTOR")
+        if descriptor:
+            initialization = importlib.import_module("bootstrap_storage_route")
+            installed = initialization.FixedInstallationDescriptor.model_validate_json(descriptor)
+            target_id = installed.registration.gateway_profile_id
+            recorded = repository.get_gateway_publication(
+                uuid5(target_id, "fixed-program-installation"),
+            )
+            if recorded is None:
+                target_config = configurations.resolve(target_id)
+                initialization.bootstrap(installed, target_config.settings)
+            elif (recorded.get("resource_manifest") or {}).get("installation_request_sha256") != (
+                document_digest(installed.model_dump(mode="json"))
+            ):
+                raise PolicyCompilationError("Fixed installation descriptor changed")
         publisher = AzureApimPublisherClientResolver(configurations)
         cipher = CredentialCipher.from_settings(settings)
         client = resources.enter_context(httpx.Client(timeout=10.0, follow_redirects=False))

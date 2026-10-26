@@ -292,7 +292,7 @@ resource usageEventHub 'Microsoft.EventHub/namespaces/eventhubs@2024-01-01' exis
 
 var rbacAdminRoleDefinitionId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'f58310d9-a9f6-439a-9e8d-f62e7b41a168')
 
-resource routeContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (effectiveEnabled) {
+resource routeContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(routeTable.id, functionApp.id, 'route-table-contributor')
   scope: routeTable
   properties: {
@@ -302,7 +302,7 @@ resource routeContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' =
   }
 }
 
-resource routeCredentialWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (effectiveEnabled) {
+resource routeCredentialWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(credentialVault.id, functionApp.id, 'route-credential-writer')
   scope: credentialVault
   properties: {
@@ -312,7 +312,7 @@ resource routeCredentialWriter 'Microsoft.Authorization/roleAssignments@2022-04-
   }
 }
 
-resource applicationLedgerContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (applicationProvisioningEnabled) {
+resource applicationLedgerContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(ledgerTable.id, functionApp.id, 'application-provisioning-table-contributor')
   scope: ledgerTable
   properties: {
@@ -341,7 +341,7 @@ resource functionCredentialSecretReader 'Microsoft.Authorization/roleAssignments
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')
   }
 }
-resource onboardingEventHubRoleDelegator 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (effectiveReleaseWorkerEnabled && !empty(eventHubNamespaceName)) {
+resource onboardingEventHubRoleDelegator 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(eventHubNamespaceName)) {
   name: guid(usageEventHub.id, functionApp.id, 'onboarding-event-hub-rbac-delegator')
   scope: usageEventHub
   properties: {
@@ -353,7 +353,7 @@ resource onboardingEventHubRoleDelegator 'Microsoft.Authorization/roleAssignment
   }
 }
 
-resource onboardingLedgerRoleDelegator 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (effectiveReleaseWorkerEnabled) {
+resource onboardingLedgerRoleDelegator 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(ledgerTable.id, functionApp.id, 'onboarding-ledger-rbac-delegator')
   scope: ledgerTable
   properties: {
@@ -365,7 +365,7 @@ resource onboardingLedgerRoleDelegator 'Microsoft.Authorization/roleAssignments@
   }
 }
 
-resource onboardingRouteRoleDelegator 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (effectiveReleaseWorkerEnabled) {
+resource onboardingRouteRoleDelegator 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(routeTable.id, functionApp.id, 'onboarding-route-rbac-delegator')
   scope: routeTable
   properties: {
@@ -377,7 +377,7 @@ resource onboardingRouteRoleDelegator 'Microsoft.Authorization/roleAssignments@2
   }
 }
 
-resource onboardingCredentialVaultRoleDelegator 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (effectiveReleaseWorkerEnabled) {
+resource onboardingCredentialVaultRoleDelegator 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(credentialVault.id, functionApp.id, 'onboarding-credential-vault-rbac-delegator')
   scope: credentialVault
   properties: {

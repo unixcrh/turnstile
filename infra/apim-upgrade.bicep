@@ -18,6 +18,7 @@ param apiProperties object = {}
 param parentPolicy string = ''
 @secure()
 param imageOperationProperties object = {}
+param fixedOperations array = []
 
 module upgrade 'modules/apim-upgrade.bicep' = {
   name: 'apim-image-upgrade-${uniqueString(apimName, apiId, revision, stage)}'
@@ -33,5 +34,6 @@ module upgrade 'modules/apim-upgrade.bicep' = {
     apiProperties: apiProperties
     parentPolicy: parentPolicy
     imageOperationProperties: imageOperationProperties
+    fixedOperations: fixedOperations
   }
 }

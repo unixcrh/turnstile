@@ -82,6 +82,7 @@ def _stage_function(root: Path, destination: Path, project: str) -> None:
     _copy_tree(root, "turnstile_core", destination)
 
     if project == "control_plane":
+        _copy_file(root, "backend/bootstrap_storage_route.py", destination)
         policy_dir = destination / "policies"
         policy_dir.mkdir()
         _copy_file(

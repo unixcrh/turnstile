@@ -453,5 +453,6 @@ output telemetryFunctionName string = dataPlane.outputs.functionName
 output apimGatewayUrl string = effectiveApimGatewayUrl
 output gatewayApiPath string = effectiveGatewayApiPath
 output controlPlaneFunctionName string = provisionControlPlane ? controlPlane!.outputs.functionName : ''
+output controlPlanePrincipalId string = provisionControlPlane ? controlPlane!.outputs.principalId : ''
 output controlPlaneFunctionPlanName string = provisionControlPlane ? controlPlane!.outputs.appServicePlanName : ''
 output controlPlaneDeploymentContainerName string = provisionControlPlane ? controlPlane!.outputs.deploymentContainerName : ''

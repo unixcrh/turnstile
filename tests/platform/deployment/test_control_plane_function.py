@@ -233,6 +233,95 @@ def test_disabled_publication_timer_does_not_build_dependencies(monkeypatch: Any
     function_app.publish_gateway_changes(None)
 
 
+@pytest.mark.parametrize("bootstrap_fails", [False, True])
+@pytest.mark.parametrize("already_installed", [False, True])
+def test_initial_fixed_program_uses_resolved_target_before_publication(
+    monkeypatch: pytest.MonkeyPatch, bootstrap_fails: bool, already_installed: bool,
+) -> None:
+    import hashlib
+    import json
+    import sys
+    from types import SimpleNamespace
+
+    from pydantic import SecretStr
+
+    from backend.bootstrap_storage_route import require_runtime
+
+    target_id = UUID(int=971)
+    settings = Settings.model_construct(
+        control_plane_enabled=True, gateway_publication_worker_enabled=True,
+        database_url="postgresql://unit@unit-server.postgres.database.azure.com/turnstile",
+        azure_subscription_id=str(UUID(int=972)),
+        apim_resource_group="unit-rg", apim_service_name="unit-apim", apim_api_id="unit-api",
+        apim_gateway_profile_id=None, apim_probe_subscription_key=SecretStr("offline-key"),
+        ledger_table_endpoint="https://unitstore.table.core.windows.net",
+        ledger_table_name="TurnstileLedger",
+    )
+    scoped_settings = settings.model_copy(update={"apim_gateway_profile_id": target_id})
+    descriptor_type, descriptor = MagicMock(), MagicMock()
+    descriptor_type.model_validate_json.return_value = descriptor
+    descriptor.api_name = "control-test"
+    descriptor.expected_server = "unit-server.postgres.database.azure.com"
+    descriptor.database_name = "turnstile"
+    descriptor.registration.gateway_profile_id = target_id
+    descriptor.registration.subscription_id = UUID(int=972)
+    descriptor.registration.resource_group = "unit-rg"
+    descriptor.registration.service_name = "unit-apim"
+    descriptor.registration.api_id = "unit-api"
+    descriptor.binding.ledger_table_endpoint = settings.ledger_table_endpoint
+    descriptor.binding.ledger_table_name = settings.ledger_table_name
+    descriptor.model_dump.return_value = {"target": str(target_id)}
+
+    def initialize(value: Any, resolved: Settings) -> dict[str, str]:
+        require_runtime(value, resolved)
+        if bootstrap_fails:
+            raise RuntimeError("initial program unverified")
+        return {"status": "FIXED_PROGRAM_INSTALLED"}
+
+    bootstrap = MagicMock(side_effect=initialize)
+    monkeypatch.setitem(sys.modules, "bootstrap_storage_route", SimpleNamespace(
+        FixedInstallationDescriptor=descriptor_type, bootstrap=bootstrap,
+    ))
+    monkeypatch.setenv("TURNSTILE_FIXED_BOOTSTRAP_DESCRIPTOR", "offline-descriptor")
+    monkeypatch.setenv("WEBSITE_SITE_NAME", "control-test")
+    monkeypatch.setattr(function_app, "get_settings", lambda: settings)
+    repository, configurations = MagicMock(), MagicMock()
+    repository.get_gateway_publication.return_value = {
+        "resource_manifest": {"installation_request_sha256": hashlib.sha256(
+            json.dumps({"target": str(target_id)}, separators=(",", ":")).encode(),
+        ).hexdigest()},
+    } if already_installed else None
+    configurations.resolve.return_value = SimpleNamespace(settings=scoped_settings)
+    if already_installed:
+        configurations.resolve.side_effect = AssertionError("Installed target may be retired")
+    publisher = MagicMock(side_effect=RuntimeError("publisher reached"))
+    monkeypatch.setattr(function_app, "create_repository", MagicMock(return_value=repository))
+    monkeypatch.setattr(function_app, "apim_target_client_config_resolver", MagicMock(
+        return_value=configurations,
+    ))
+    monkeypatch.setattr(function_app, "AzureApimPublisherClientResolver", publisher)
+
+    expected = (
+        "initial program unverified"
+        if bootstrap_fails and not already_installed else "publisher reached"
+    )
+    with pytest.raises(RuntimeError, match=expected):
+        function_app.publish_gateway_changes(None)
+
+    descriptor_type.model_validate_json.assert_called_once_with("offline-descriptor")
+    if already_installed:
+        configurations.resolve.assert_not_called()
+        bootstrap.assert_not_called()
+    else:
+        configurations.resolve.assert_called_once_with(target_id)
+        bootstrap.assert_called_once_with(descriptor, scoped_settings)
+    repository.close.assert_called_once()
+    if bootstrap_fails and not already_installed:
+        publisher.assert_not_called()
+    else:
+        publisher.assert_called_once_with(configurations)
+
+
 def test_target_mode_does_not_construct_a_global_publisher(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

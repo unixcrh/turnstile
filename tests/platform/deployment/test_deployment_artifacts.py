@@ -78,6 +78,7 @@ def staging_root(tmp_path: Path) -> Path:
     files = {
         "backend/api.py": "app = object()\n",
         "backend/migrate.py": "def migrate(): return []\n",
+        "backend/bootstrap_storage_route.py": "def bootstrap(): pass\n",
         "turnstile_core/config.py": "class Settings: pass\n",
         "frontend/dist/index.html": "<!doctype html>\n",
         "migrations/001_token_observability.up.sql": "SELECT 1;\n",

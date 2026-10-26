@@ -24,11 +24,16 @@ from dataclasses import dataclass
 from importlib.metadata import distributions
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
+from uuid import UUID, uuid5
+from xml.etree import ElementTree as ET
 
 import httpx
 from cryptography.fernet import Fernet
 
+from backend.bootstrap_storage_route import FixedInstallationDescriptor
 from backend.services.auth_service import hash_password
+from backend.services.gateway_targets import DEFAULT_SEEDED_APIM_GATEWAY_ID
 from scripts.apim_upgrade import (
     UPGRADE_VERSION,
     ApimUpgradeError,
@@ -42,6 +47,23 @@ from scripts.apim_upgrade import (
     validate_upgrade_what_if,
 )
 from scripts.stage_deployment import REPOSITORY_ROOT, stage_deployment, validate_source_snapshot
+from turnstile_core.domain.gateway_targets import (
+    ApimOnboardingConfiguration,
+    native_gateway_scope_for_capability,
+    self_hosted_gateway_capability_for_tier,
+)
+from turnstile_core.domain.storage_routes import RouteScope
+from turnstile_core.domain.storage_routes import document_digest as route_document_digest
+from turnstile_core.integrations.apim_model_availability import compose_availability_parent
+from turnstile_core.integrations.apim_onboarding_policy import onboarding_canonical_parent
+from turnstile_core.integrations.apim_policy_components import parse_policy, serialize_policy
+from turnstile_core.integrations.apim_storage_routes import (
+    FixedRouteBinding,
+    compile_fixed_route_program,
+    fixed_operation_contracts,
+    fixed_policy_digest,
+    fixed_program_digest,
+)
 
 JsonObject = dict[str, Any]
 PasswordReader = Callable[[str], str]
@@ -1117,6 +1139,7 @@ def observer_parameters(
             "eventHubName": "token-usage",
             "apimName": _output_string(platform_outputs, "apimName"),
             "adapterKeyNamedValueName": adapter_key_named_value_name,
+            "publisherPrincipalId": platform_outputs.get("controlPlanePrincipalId", ""),
             "adapterSharedKey": secrets_.values["observerAdapterSharedKey"],
         }
     )
@@ -1128,7 +1151,33 @@ def runtime_release_parameters(
     observer_outputs: Mapping[str, Any],
     current_api_settings: Mapping[str, str],
     current_control_plane_settings: Mapping[str, str],
+    fixed_descriptor: Mapping[str, Any] | None = None,
+    current_telemetry_settings: Mapping[str, str] | None = None,
 ) -> JsonObject:
+    api_settings = dict(current_api_settings)
+    control_plane_settings = dict(current_control_plane_settings)
+    fixed_parameters: JsonObject = {}
+    if fixed_descriptor is not None:
+        api_settings.update({
+            "APIM_PROBE_SUBSCRIPTION_KEY": secrets_.values["apimProbeSubscriptionKey"],
+            "APIM_PROBE_SUBSCRIPTION_ID": str(
+                fixed_descriptor["registration"]["probe_subscription_id"]
+            ),
+            "BUDGET_EXECUTION_ENABLED": "true",
+            "BUDGET_SETTLEMENT_ENABLED": "true",
+        })
+        control_plane_settings.update({
+            "BUDGET_EXECUTION_ENABLED": "true",
+            "TURNSTILE_FIXED_BOOTSTRAP_DESCRIPTOR": json.dumps(fixed_descriptor),
+        })
+        fixed_parameters = {
+            "telemetryFunctionName": _output_string(platform_outputs, "telemetryFunctionName"),
+            "currentTelemetrySettings": {
+                **dict(current_telemetry_settings or {}),
+                "BUDGET_EXECUTION_ENABLED": "true",
+                "BUDGET_SETTLEMENT_ENABLED": "true",
+            },
+        }
     return _arm_parameter_document(
         {
             "apiName": _output_string(platform_outputs, "apiName"),
@@ -1143,8 +1192,9 @@ def runtime_release_parameters(
             ),
             "publicationWorkerEnabled": True,
             "releaseWorkerEnabled": True,
-            "currentApiSettings": dict(current_api_settings),
-            "currentControlPlaneSettings": dict(current_control_plane_settings),
+            "currentApiSettings": api_settings,
+            "currentControlPlaneSettings": control_plane_settings,
+            **fixed_parameters,
         }
     )
 
@@ -1388,8 +1438,7 @@ def load_existing_core(inputs: DeploymentInputs) -> ExistingCore | None:
 
 def _write_outputs(inputs: DeploymentInputs, outputs: Mapping[str, Any]) -> None:
     destination = _outputs_path(inputs)
-    destination.write_text(json.dumps(outputs, indent=2) + "\n", encoding="utf-8")
-    destination.chmod(0o600)
+    _write_private_json(destination, outputs)
     print(f"Deployment outputs: {destination}")
 
 
@@ -1424,6 +1473,47 @@ def _upgrade_lock(directory: Path) -> Iterator[None]:
             yield
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _validate_installed_fixed_program(
+    current: GatewaySnapshot, installed: FixedInstallationDescriptor,
+    inputs: DeploymentInputs, outputs: Mapping[str, Any],
+) -> None:
+    core = ExistingCore.from_outputs(outputs)
+    target = installed.registration
+    contracts = fixed_operation_contracts(
+        installed.binding.models_path, installed.binding.messages_path,
+        installed.binding.retired_operations, decision_enabled=installed.binding.decision_enabled,
+    )
+    if (
+        (str(target.subscription_id), target.resource_group.casefold(),
+         target.service_name.casefold(), target.api_id)
+        != (inputs.subscription, core.apim_resource_group_name.casefold(),
+            core.apim_name.casefold(), _output_string(outputs, "apimApiId"))
+        or installed.api_name != _output_string(outputs, "controlPlaneFunctionName")
+        or target.api_path != current.api_properties.get("path")
+        or installed.binding.api_revision != current.revision
+        or fixed_policy_digest(current.parent_policy) != installed.parent_policy_sha256
+        or set(current.operations) != set(contracts)
+        or set(current.operation_policies) != set(contracts)
+    ):
+        raise DeploymentError("Installed fixed program identity or parent changed")
+    policies: dict[str, str] = {}
+    for name, (method, path) in contracts.items():
+        operation = current.operations[name]
+        policy = current.operation_policies[name]
+        if (
+            operation.get("method") != method or operation.get("urlTemplate") != path
+            or operation.get("templateParameters", []) != [] or policy is None
+            or fixed_policy_digest(policy) != installed.operation_policies_sha256[name]
+        ):
+            raise DeploymentError("Installed fixed program operation changed")
+        policies[name] = policy
+    if fixed_program_digest(
+        current.parent_policy, policies,
+        tuple((name, method, path) for name, (method, path) in contracts.items()),
+    ) != installed.binding.program_sha256:
+        raise DeploymentError("Installed fixed program digest changed")
 
 
 def gateway_upgrade(
@@ -1525,6 +1615,17 @@ def gateway_upgrade(
         if current is None:
             raise DeploymentError("Saved API is absent; an upgrade cannot initialize a new API")
         if action == "check":
+            descriptor = None
+            if parse_policy(current.parent_policy).find(
+                ".//set-variable[@name='storageRouteAbi']",
+            ) is not None:
+                descriptor = current_app_settings(
+                    runner, inputs, _output_string(outputs, "controlPlaneFunctionName"),
+                ).get("TURNSTILE_FIXED_BOOTSTRAP_DESCRIPTOR")
+            if descriptor:
+                installed = FixedInstallationDescriptor.model_validate_json(descriptor)
+                _validate_installed_fixed_program(current, installed, inputs, outputs)
+                return
             if plan_image_upgrade(resource_id, current, canonical).required:
                 raise DeploymentError(
                     "APIM infrastructure upgrade required before package deployment: "
@@ -1581,6 +1682,233 @@ def gateway_upgrade(
         print("API and Control-plane remain stopped; resume through the reviewed package rollout")
 
 
+def initialize_fixed_program(
+    runner: CommandRunner,
+    inputs: DeploymentInputs,
+    outputs: Mapping[str, Any],
+    api_settings: Mapping[str, str],
+) -> JsonObject:
+    pending = outputs.get("pendingFixedBootstrap")
+    template = REPOSITORY_ROOT / "infra/apim-upgrade.bicep"
+    name = f"{inputs.resource_prefix}-fixed-program"
+    core = ExistingCore.from_outputs(outputs)
+    api_id = _output_string(outputs, "apimApiId")
+    service_id = (
+        f"/subscriptions/{inputs.subscription}/resourceGroups/{core.apim_resource_group_name}"
+        f"/providers/Microsoft.ApiManagement/service/{core.apim_name}"
+    )
+    credentials = runner.run_json([
+        "az", "account", "get-access-token", "--subscription", inputs.subscription,
+        "--resource", "https://management.azure.com/", "--output", "json",
+    ])
+    with httpx.Client(
+        headers={"Authorization": f"Bearer {credentials.pop('accessToken')}",
+                 "Accept": "application/json"},
+        timeout=60, trust_env=False,
+    ) as client:
+        service = client.get(
+            "https://management.azure.com" + service_id,
+            params={"api-version": "2024-05-01"},
+        )
+        service.raise_for_status()
+        configuration = None
+        if pending is None:
+            governance = client.get(
+                "https://management.azure.com" + service_id
+                + "/namedValues/turnstile-platform-governance",
+                params={"api-version": "2024-05-01"},
+            )
+            governance.raise_for_status()
+            configuration = ApimOnboardingConfiguration.model_validate_json(
+                governance.json()["properties"]["value"],
+            )
+        application_root = (
+            f"/subscriptions/{inputs.subscription}/resourceGroups/{inputs.resource_group_name}"
+            "/providers/Microsoft.Web/sites/"
+        )
+        snapshot = AzureUpgradeBackend(
+            client, service_id + "/apis/" + api_id,
+            (application_root + _output_string(outputs, "apiName"),
+             application_root + _output_string(outputs, "controlPlaneFunctionName")),
+            lambda *_args: None,
+        ).read()
+        if pending is not None:
+            pending_descriptor = FixedInstallationDescriptor.model_validate_json(
+                json.dumps(pending),
+            )
+            if snapshot is None:
+                raise DeploymentError("Pending fixed installation API is missing")
+            if parse_policy(snapshot.parent_policy).find(
+                ".//set-variable[@name='storageRouteAbi']",
+            ) is not None:
+                _validate_installed_fixed_program(snapshot, pending_descriptor, inputs, outputs)
+                return pending_descriptor.model_dump(mode="json")
+            parameters = outputs["pendingFixedProgramParameters"]
+            values = {key: entry["value"] for key, entry in parameters["parameters"].items()}
+            if (
+                values["apimResourceGroupName"], values["apimName"], values["apiId"],
+                values["sourceRevision"], values["revision"], values["stage"],
+            ) != (
+                core.apim_resource_group_name, core.apim_name, api_id,
+                pending_descriptor.binding.api_revision,
+                pending_descriptor.binding.api_revision, "prepare",
+            ):
+                raise DeploymentError("Pending fixed installation target changed")
+            operations = values["fixedOperations"]
+            expected = GatewaySnapshot(
+                values["revision"], values["apiProperties"], values["parentPolicy"],
+                {item["name"]: {"method": item["method"], "urlTemplate": item["path"]}
+                 for item in operations},
+                {item["name"]: item["policy"] for item in operations},
+            )
+            _validate_installed_fixed_program(expected, pending_descriptor, inputs, outputs)
+            previous = client.get(
+                f"https://management.azure.com/subscriptions/{inputs.subscription}"
+                f"/providers/Microsoft.Resources/deployments/{name}",
+                params={"api-version": "2025-04-01"},
+            )
+            if previous.status_code == 200:
+                if previous.json()["properties"]["provisioningState"] not in {"Failed", "Canceled"}:
+                    raise DeploymentError("Previous fixed program deployment requires readback")
+            elif previous.status_code != 404:
+                previous.raise_for_status()
+            what_if(runner, inputs, template, parameters, name)
+            deploy_template(runner, inputs, template, parameters, name)
+            return pending_descriptor.model_dump(mode="json")
+    if snapshot is None:
+        raise DeploymentError("Initial APIM API is missing")
+    assert configuration is not None
+    target_id = UUID(api_settings.get(
+        "APIM_GATEWAY_PROFILE_ID", str(DEFAULT_SEEDED_APIM_GATEWAY_ID),
+    ))
+    routes = configuration.route_table_resource_id.split("/")
+    ledger = configuration.ledger_table_resource_id.split("/")
+    vault = configuration.credential_vault_resource_id.rsplit("/", 1)[-1]
+    binding = FixedRouteBinding(
+        scope=RouteScope(target_id=str(target_id), api_id=api_id, gateway_id="managed"),
+        api_revision=snapshot.revision,
+        table_endpoint=f"https://{routes[8]}.table.core.windows.net", table_name=routes[-1],
+        ledger_table_endpoint=f"https://{ledger[8]}.table.core.windows.net",
+        ledger_table_name=ledger[-1], trust_binding_sha256=route_document_digest(configuration),
+        trusted_vault_origins=(f"https://{vault}.vault.azure.net",),
+        publisher_subscription_id=_output_string(outputs, "apimProbeSubscriptionId"),
+        observer_key_named_value=_output_string(outputs, "observerAdapterKeyNamedValueName"),
+        model_additions_enabled=True,
+        native_gateway_scope=native_gateway_scope_for_capability(
+            self_hosted_gateway_capability_for_tier(service.json()["sku"]["name"]),
+        ),
+        models_path="/v1/models", messages_path="/v1/messages",
+        retired_operations={"anthropic-models": ("POST", "/_turnstile/retired/anthropic-models")},
+    )
+    canonical = (REPOSITORY_ROOT / "infra/policies/foundry-finops-policy.xml").read_text()
+    parent = parse_policy(compose_availability_parent(
+        onboarding_canonical_parent(snapshot.parent_policy, api_id),
+    ))
+    logger_id = parse_policy(snapshot.parent_policy).findall(".//log-to-eventhub")[0].attrib[
+        "logger-id"
+    ]
+    parameters = {
+        "__GATEWAY_PROFILE_ID__": str(target_id),
+        "__LEDGER_TABLE_ENDPOINT__": binding.ledger_table_endpoint,
+        "__LEDGER_TABLE_NAME__": binding.ledger_table_name,
+        "__LOGGER_ID__": logger_id,
+    }
+    for node in parent.iter():
+        for marker, value in parameters.items():
+            for attribute, content in node.attrib.items():
+                node.set(attribute, content.replace(marker, value))
+            if node.text:
+                node.text = node.text.replace(marker, value)
+    program = compile_fixed_route_program(
+        serialize_policy(parent),
+        binding,
+        canonical_parent=compose_availability_parent(
+            onboarding_canonical_parent(canonical, api_id),
+        ),
+    )
+    installed = program.installation(
+        route_document_digest(configuration), _output_string(outputs, "gatewayApiPath"),
+    )
+    database = urlsplit(api_settings["DATABASE_URL"])
+    descriptor = FixedInstallationDescriptor.model_validate({
+        "database_name": database.path.removeprefix("/"), "expected_server": database.hostname,
+        "api_name": _output_string(outputs, "controlPlaneFunctionName"),
+        "epoch": uuid5(target_id, "initial-budget-execution"),
+        "registration": {
+            "gateway_profile_id": target_id, "name": core.apim_name,
+            "tenant_id": configuration.management_tenant_id,
+            "subscription_id": inputs.subscription, "resource_group": core.apim_resource_group_name,
+            "service_name": core.apim_name, "service_principal_id": core.apim_principal_id,
+            "api_id": api_id, "api_path": snapshot.api_properties["path"],
+            "managed_gateway_url": _output_string(outputs, "gatewayApiPath"),
+            "dashboard_subscription_id": api_settings.get(
+                "APIM_DASHBOARD_SUBSCRIPTION_ID", "turnstile-dashboard",
+            ),
+            "probe_subscription_id": binding.publisher_subscription_id,
+        },
+        "binding": program.binding,
+        "parent_policy_sha256": installed.parent_policy_sha256,
+        "operation_policies_sha256": installed.operation_policies_sha256,
+    })
+    policies = dict(program.operation_policies)
+    operations = [
+        {"name": name, "method": method, "path": path,
+         "policy": ET.tostring(parse_policy(policies[name]), encoding="unicode")}
+        for name, method, path in sorted(
+            program.operation_contracts,
+            key=lambda contract: (contract[0] not in binding.retired_operations, contract[0]),
+        )
+    ]
+    parameters = _arm_parameter_document({
+        "apimResourceGroupName": core.apim_resource_group_name, "apimName": core.apim_name,
+        "apiId": api_id, "sourceRevision": snapshot.revision, "revision": snapshot.revision,
+        "stage": "prepare", "apiProperties": snapshot.api_properties,
+        "parentPolicy": ET.tostring(parse_policy(program.parent_policy), encoding="unicode"),
+        "fixedOperations": operations,
+    })
+    _write_outputs(inputs, {
+        **outputs, "pendingFixedBootstrap": descriptor.model_dump(mode="json"),
+        "pendingFixedProgramParameters": parameters,
+    })
+    what_if(runner, inputs, template, parameters, name)
+    deploy_template(runner, inputs, template, parameters, name)
+    return descriptor.model_dump(mode="json")
+
+
+def verify_initial_fixed_program(
+    api_url: str, owner_email: str, owner_password: str, descriptor: Mapping[str, Any],
+) -> None:
+    target = descriptor["registration"]["gateway_profile_id"]
+    path = f"/api/v1/model-management/gateways/{target}/program-upgrades/preview"
+    deadline = time.monotonic() + 180
+    with httpx.Client(
+        base_url=api_url, timeout=15, follow_redirects=False, trust_env=False,
+    ) as http:
+        login = http.post("/api/v1/auth/login", json={
+            "email": owner_email, "password": owner_password,
+        })
+        login.raise_for_status()
+        try:
+            while time.monotonic() < deadline:
+                response = http.get(path)
+                if response.status_code == 200:
+                    installation = response.json()["current_installation"]
+                    if (
+                        installation["program"]["program_sha256"]
+                        != descriptor["binding"]["program_sha256"]
+                        or installation["program"]["scope"]["target_id"] != str(target)
+                        or installation.get("model_additions_enabled") is not True
+                    ):
+                        raise DeploymentError("Initial fixed program binding differs")
+                    return
+                if response.status_code != 409:
+                    response.raise_for_status()
+                time.sleep(3)
+            raise DeploymentError("Initial fixed program is not ready for model publication")
+        finally:
+            http.post("/api/v1/auth/logout")
+
+
 def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
     inputs = DeploymentInputs.load(
         args.subscription,
@@ -1591,12 +1919,18 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
     if not args.allow_dirty:
         validate_source_snapshot(REPOSITORY_ROOT)
     saved_outputs = load_saved_outputs(inputs)
+    pending_installation = saved_outputs is not None and "pendingFixedBootstrap" in saved_outputs
+    if saved_outputs is not None and (
+        _output_string(saved_outputs, "resourceGroupName").casefold()
+        != inputs.resource_group_name.casefold()
+    ):
+        raise DeploymentError("Saved deployment outputs belong to a different resource group")
     if args.action in {"plan-upgrade", "upgrade", "rollback-upgrade"}:
         if saved_outputs is None:
             raise DeploymentError("An incremental upgrade requires the original deployment outputs")
         gateway_upgrade(runner, inputs, saved_outputs, args.action, assume_yes=args.yes)
         return
-    if saved_outputs is not None:
+    if saved_outputs is not None and not pending_installation:
         gateway_upgrade(runner, inputs, saved_outputs, "check")
     if saved_outputs is None:
         validate_flex_consumption_capabilities(runner, inputs)
@@ -1715,12 +2049,23 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
         inputs,
         _output_string(platform_outputs, "controlPlaneFunctionName"),
     )
+    fixed_descriptor = None
+    telemetry_settings = None
+    if saved_outputs is None or pending_installation:
+        fixed_descriptor = initialize_fixed_program(
+            runner, inputs, {**platform_outputs, **observer_outputs}, api_settings,
+        )
+        telemetry_settings = current_app_settings(
+            runner, inputs, _output_string(platform_outputs, "telemetryFunctionName"),
+        )
     release_parameters = runtime_release_parameters(
         secrets_,
         platform_outputs,
         observer_outputs,
         api_settings,
         control_plane_settings,
+        fixed_descriptor,
+        telemetry_settings,
     )
     what_if_resource_group(
         runner,
@@ -1746,7 +2091,14 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
     verify_owner_login(api_url, inputs.owner_email, secrets_.owner_password)
     verify_function_indexing(runner, inputs, final_outputs)
     verify_telemetry_function_health(final_outputs)
-    _write_outputs(inputs, {**final_outputs, **observer_outputs})
+    if fixed_descriptor is not None:
+        verify_initial_fixed_program(
+            api_url, inputs.owner_email, secrets_.owner_password, fixed_descriptor,
+        )
+    _write_outputs(inputs, {
+        key: value for key, value in {**final_outputs, **observer_outputs}.items()
+        if key not in {"pendingFixedBootstrap", "pendingFixedProgramParameters"}
+    })
     print("Turnstile deployment completed.")
     print(f"Open: {api_url}")
     print(

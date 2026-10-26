@@ -560,7 +560,7 @@ def test_application_creation_is_gated_and_uses_the_exact_platform_ledger() -> N
     role = CONTROL_PLANE.split("resource applicationLedgerContributor", 1)[1].split(
         "resource functionDatabaseSecretReader", 1
     )[0]
-    assert "if (applicationProvisioningEnabled)" in role
+    assert "if (applicationProvisioningEnabled)" not in role
     assert "scope: ledgerTable" in role
     assert "principalId: functionApp.identity.principalId" in role
     assert "0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3" in role
@@ -582,6 +582,34 @@ def test_application_creation_is_gated_and_uses_the_exact_platform_ledger() -> N
     ):
         assert action in CONTROL_PLANE_APIM_RBAC
     assert "listSecrets" not in CONTROL_PLANE_APIM_RBAC
+
+
+def test_control_plane_initialization_roles_do_not_depend_on_worker_activation() -> None:
+    for name in (
+        "routeContributor", "routeCredentialWriter", "applicationLedgerContributor",
+        "onboardingLedgerRoleDelegator", "onboardingRouteRoleDelegator",
+        "onboardingCredentialVaultRoleDelegator",
+    ):
+        declaration = CONTROL_PLANE.split(f"resource {name} ", 1)[1].splitlines()[0]
+        assert " = {" in declaration
+        assert "if (" not in declaration
+    event_hub = CONTROL_PLANE.split("resource onboardingEventHubRoleDelegator ", 1)[1]
+    assert "if (!empty(eventHubNamespaceName))" in event_hub.splitlines()[0]
+    assert "var effectiveEnabled =" in CONTROL_PLANE
+    assert "value: string(effectiveEnabled)" in CONTROL_PLANE
+    assert (
+        "module controlPlane 'modules/control-plane-function.bicep' = if (provisionControlPlane)"
+        in MAIN
+    )
+
+
+def test_observer_stage_prepares_publisher_key_access_after_named_value_creation() -> None:
+    observer = (ROOT / "infra/envoy-cache-adapter/main.bicep").read_text(encoding="utf-8")
+    access = observer.split("module publisherObserverKeyAccess ", 1)[1].split("output ", 1)[0]
+    assert "if (!empty(publisherPrincipalId))" in access
+    assert "apimIntegration.outputs.namedValueName" in access
+    assert "publisherPrincipalId: publisherPrincipalId" in access
+    assert "output controlPlanePrincipalId string = provisionControlPlane ?" in MAIN
 
 
 def test_control_plane_uses_its_own_flex_plan_and_the_platform_vnet() -> None:

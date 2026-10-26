@@ -12,7 +12,9 @@ import urllib.error
 import zipfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from unittest.mock import Mock
 
+import httpx
 import pytest
 from packaging.tags import cpython_tags
 from packaging.utils import parse_wheel_filename
@@ -24,6 +26,7 @@ from scripts.deploy import (
     DeploymentError,
     DeploymentInputs,
     ExistingCore,
+    SecretMaterial,
     _install_linux_dependencies,
     _upgrade_lock,
     _write_private_json,
@@ -35,6 +38,7 @@ from scripts.deploy import (
     deterministic_zip,
     execute,
     frontend_asset,
+    initialize_fixed_program,
     linux_dependency_command,
     load_existing_core,
     load_or_create_secret_material,
@@ -51,6 +55,7 @@ from scripts.deploy import (
     validate_flex_consumption_capabilities,
     validate_packaged_dependencies,
     validate_postgres_capabilities,
+    verify_initial_fixed_program,
     verify_owner_login,
     wait_for_health,
     wait_for_observer_health,
@@ -378,6 +383,68 @@ def test_resume_skips_existing_platform_and_gateway_bootstrap(tmp_path: Path) ->
     assert parameters["deployApimBootstrap"]["value"] is False
 
 
+@pytest.mark.parametrize("existing", [False, True, "pending"])
+def test_deployment_initializes_fixed_program_only_for_a_new_platform(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool | str,
+) -> None:
+    outputs: dict[str, object] = {
+        "resourceGroupName": "turnstile-test",
+        "apiName": "api-test",
+        "apiUrl": "https://api-test.example.test",
+        "controlPlaneFunctionName": "control-test",
+        "telemetryFunctionName": "telemetry-test",
+        "webAppUrl": "https://observer-test.example.test",
+        "apimPrincipalId": "00000000-0000-0000-0000-000000000002",
+    }
+    if existing == "pending":
+        outputs["pendingFixedBootstrap"] = {}
+    arguments = build_parser().parse_args([
+        "deploy", "--subscription", "00000000-0000-0000-0000-000000000001",
+        "--parameters", str(_parameters(tmp_path / "parameters.json")), "--yes",
+    ])
+    for name in (
+        "require_prerequisites", "validate_source_snapshot", "gateway_upgrade",
+        "validate_flex_consumption_capabilities", "validate_postgres_capabilities",
+        "_confirm_deployment", "what_if", "what_if_resource_group", "wait_for_health",
+        "wait_for_observer_health", "verify_frontend_asset", "verify_owner_login",
+        "verify_function_indexing", "verify_telemetry_function_health", "restart_runtime_apps",
+    ):
+        monkeypatch.setattr(f"scripts.deploy.{name}", Mock())
+    monkeypatch.setattr("scripts.deploy.load_saved_outputs", Mock(
+        return_value=outputs if existing else None,
+    ))
+    monkeypatch.setattr("scripts.deploy.ExistingCore.from_outputs", Mock(return_value=None))
+    monkeypatch.setattr("scripts.deploy.load_or_create_secret_material", Mock(
+        return_value=Mock(owner_password="offline-owner-password"),
+    ))
+    for name in (
+        "deployment_parameters", "runtime_release_parameters", "observer_parameters",
+        "deploy_template", "build_packages", "current_app_settings",
+    ):
+        monkeypatch.setattr(f"scripts.deploy.{name}", Mock(return_value={}))
+    monkeypatch.setattr("scripts.deploy.deployment_outputs", Mock(return_value=outputs))
+    for name in ("source_version", "observer_source_version", "frontend_asset"):
+        monkeypatch.setattr(f"scripts.deploy.{name}", Mock(return_value="offline-candidate"))
+    events: list[str] = []
+    for name in (
+        "deploy_packages", "build_and_start_observer", "initialize_fixed_program",
+        "deploy_resource_group_template", "_write_outputs",
+    ):
+        monkeypatch.setattr(
+            f"scripts.deploy.{name}",
+            Mock(side_effect=lambda *args, event=name, **kwargs: events.append(event)),
+            raising=False,
+        )
+
+    execute(arguments, CommandRunner())
+
+    expected = ["deploy_packages", "build_and_start_observer"]
+    if existing is not True:
+        expected.append("initialize_fixed_program")
+    expected.extend(("deploy_resource_group_template", "_write_outputs"))
+    assert events == expected
+
+
 def test_saved_outputs_enable_existing_core_on_rerun(tmp_path: Path) -> None:
     inputs = DeploymentInputs.load(
         "subscription",
@@ -402,6 +469,323 @@ def test_saved_outputs_enable_existing_core_on_rerun(tmp_path: Path) -> None:
     assert core is not None
     assert core.apim_name == "apim-existing"
     assert core.apim_resource_group_name == "turnstile-test"
+
+
+@pytest.mark.parametrize("installation_fails", [False, True])
+def test_initial_fixed_program_binds_compiled_policies_before_registration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    installation_fails: bool,
+) -> None:
+    from backend.bootstrap_storage_route import FixedInstallationDescriptor
+    from scripts.apim_upgrade import GatewaySnapshot
+    from tests.backend.model_platform.test_apim_onboarding import (
+        onboarding_configuration,
+        onboarding_plan,
+    )
+    from turnstile_core.integrations.apim_onboarding_policy import _render_onboarding_parent
+    from turnstile_core.integrations.apim_storage_routes import fixed_policy_digest
+
+    configuration = onboarding_configuration()
+    request = onboarding_plan().request
+    inputs = DeploymentInputs.load(
+        str(request.subscription_id),
+        _parameters(tmp_path / "parameters.json"),
+        tmp_path / "state.json",
+    )
+    outputs = {
+        "resourceGroupName": inputs.resource_group_name,
+        "apiName": "api-test",
+        "controlPlaneFunctionName": "control-test",
+        "telemetryFunctionName": "telemetry-test",
+        "apimName": request.service_name,
+        "apimResourceGroupName": request.resource_group,
+        "apimPrincipalId": "00000000-0000-4000-8000-000000000003",
+        "apimGatewayUrl": f"https://{request.service_name}.azure-api.net",
+        "apimApiId": request.api_id,
+        "apimProbeSubscriptionId": request.probe_subscription_id,
+        "gatewayApiPath": f"https://{request.service_name}.azure-api.net/{request.api_path}",
+        "observerAdapterKeyNamedValueName": "turnstile-observer-key",
+    }
+    settings = {
+        "DATABASE_URL": "postgresql://unit@unit-server.postgres.database.azure.com/turnstile",
+        "APIM_GATEWAY_PROFILE_ID": str(request.gateway_profile_id),
+        "APIM_DASHBOARD_SUBSCRIPTION_ID": request.dashboard_subscription_id,
+    }
+    canonical = (REPOSITORY_ROOT / "infra/policies/foundry-finops-policy.xml").read_text()
+    snapshot = GatewaySnapshot(
+        "1",
+        {"path": request.api_path, "subscriptionRequired": False},
+        _render_onboarding_parent(request, configuration, canonical),
+        {},
+        {},
+    )
+    client_factory = httpx.Client
+
+    def read_arm(arm_request: httpx.Request) -> httpx.Response:
+        if arm_request.url.path.endswith("/namedValues/turnstile-platform-governance"):
+            return httpx.Response(
+                200,
+                json={
+                    "properties": {
+                        "value": configuration.model_dump_json(),
+                    }
+                },
+            )
+        return httpx.Response(200, json={"sku": {"name": "StandardV2"}})
+
+    monkeypatch.setattr(
+        "scripts.deploy.httpx.Client",
+        lambda **kwargs: client_factory(
+            **kwargs,
+            transport=httpx.MockTransport(read_arm),
+        ),
+    )
+    monkeypatch.setattr("scripts.deploy.AzureUpgradeBackend.read", Mock(return_value=snapshot))
+    preview = Mock()
+    apply = Mock(
+        side_effect=DeploymentError("ARM installation failed") if installation_fails else None
+    )
+    monkeypatch.setattr("scripts.deploy.what_if", preview)
+    monkeypatch.setattr("scripts.deploy.deploy_template", apply)
+    runner = Mock(spec=CommandRunner)
+    runner.run_json.return_value = {"accessToken": "offline-token"}
+
+    if installation_fails:
+        with pytest.raises(DeploymentError, match="ARM installation failed"):
+            initialize_fixed_program(runner, inputs, outputs, settings)
+        return
+    descriptor = FixedInstallationDescriptor.model_validate_json(
+        json.dumps(
+            initialize_fixed_program(runner, inputs, outputs, settings),
+        )
+    )
+
+    preview.assert_called_once()
+    apply.assert_called_once_with(*preview.call_args.args)
+    parameters = apply.call_args.args[3]["parameters"]
+    operations = parameters["fixedOperations"]["value"]
+    assert operations[0]["name"] == "anthropic-models"
+    assert operations[0]["method"] == "POST"
+    assert {item["name"]: fixed_policy_digest(item["policy"]) for item in operations} == (
+        descriptor.operation_policies_sha256
+    )
+    assert (
+        fixed_policy_digest(parameters["parentPolicy"]["value"]) == descriptor.parent_policy_sha256
+    )
+    assert descriptor.binding.model_additions_enabled
+    assert descriptor.binding.models_path == "/v1/models"
+    assert descriptor.registration.gateway_profile_id == request.gateway_profile_id
+    assert descriptor.registration.probe_subscription_id == request.probe_subscription_id
+    assert descriptor.api_name == "control-test"
+    assert descriptor.expected_server == "unit-server.postgres.database.azure.com"
+
+    runtime = runtime_release_parameters(
+        SecretMaterial(
+            {"apimSubscriptionKey": "dashboard-key", "apimProbeSubscriptionKey": "probe-key"}, None
+        ),
+        outputs,
+        {
+            "webAppUrl": "https://observer.example.test",
+            "adapterKeyNamedValueName": "turnstile-observer-key",
+        },
+        {"keep": "api"},
+        {"keep": "publisher"},
+        descriptor.model_dump(mode="json"),
+        {"keep": "telemetry"},
+    )["parameters"]
+    assert "TURNSTILE_FIXED_BOOTSTRAP_DESCRIPTOR" not in runtime["currentApiSettings"]["value"]
+    publisher = runtime["currentControlPlaneSettings"]["value"]
+    assert json.loads(publisher["TURNSTILE_FIXED_BOOTSTRAP_DESCRIPTOR"]) == (
+        descriptor.model_dump(mode="json")
+    )
+    assert publisher["keep"] == "publisher"
+    assert runtime["currentTelemetrySettings"]["value"] == {
+        "keep": "telemetry",
+        "BUDGET_EXECUTION_ENABLED": "true",
+        "BUDGET_SETTLEMENT_ENABLED": "true",
+    }
+    saved = json.loads(inputs.state_path.with_suffix(".outputs.json").read_text())
+    assert saved["pendingFixedBootstrap"] == descriptor.model_dump(mode="json")
+
+
+@pytest.mark.parametrize("fault", [
+    None, "parent", "operation", "contract", "missing_policy", "target", "digest",
+    "missing_operation",
+])
+def test_new_fixed_program_can_be_redeployed_without_policy_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str | None,
+) -> None:
+    from typing import cast
+
+    from scripts import deploy
+    from scripts.apim_upgrade import ApimUpgradeError, AzureUpgradeBackend, GatewaySnapshot
+    from turnstile_core.integrations.apim_policy_components import parse_policy, serialize_policy
+
+    runtime = Mock(wraps=runtime_release_parameters)
+    monkeypatch.setattr(sys.modules[__name__], "runtime_release_parameters", runtime)
+    with monkeypatch.context() as initialization:
+        test_initial_fixed_program_binds_compiled_policies_before_registration(
+            tmp_path, initialization, False,
+        )
+        applied = cast(Mock, deploy.deploy_template)
+        inputs = applied.call_args.args[1]
+        outputs = runtime.call_args.args[1]
+        parameters = applied.call_args.args[3]["parameters"]
+        descriptor = runtime.call_args.args[5]
+    values = {name: entry["value"] for name, entry in parameters.items()}
+    operations = values["fixedOperations"]
+    current = GatewaySnapshot(
+        values["revision"], values["apiProperties"], values["parentPolicy"],
+        {operation["name"]: {
+            "displayName": operation["name"], "method": operation["method"],
+            "urlTemplate": operation["path"], "templateParameters": [], "responses": [],
+        } for operation in operations},
+        {operation["name"]: operation["policy"] for operation in operations},
+    )
+    if fault == "parent":
+        from dataclasses import replace
+
+        root = parse_policy(current.parent_policy)
+        trust = root.find(".//set-variable[@name='routeTrust']")
+        assert trust is not None
+        trust.set("value", "f" * 64)
+        current = replace(current, parent_policy=serialize_policy(root))
+    elif fault == "operation":
+        current.operation_policies["chat-completions"] = (
+            "<policies><inbound><return-response /></inbound></policies>"
+        )
+    elif fault == "contract":
+        current.operations["chat-completions"]["method"] = "GET"
+    elif fault == "missing_policy":
+        current.operation_policies["chat-completions"] = None
+    elif fault == "target":
+        descriptor["registration"]["resource_group"] = "other-resource-group"
+    elif fault == "digest":
+        descriptor["binding"]["program_sha256"] = "f" * 64
+    elif fault == "missing_operation":
+        del current.operations["chat-completions"]
+    runner = Mock(spec=CommandRunner)
+    runner.run_json.return_value = {"accessToken": "offline-token"}
+    monkeypatch.setattr(AzureUpgradeBackend, "read", Mock(return_value=current))
+    monkeypatch.setattr(deploy, "current_app_settings", Mock(return_value={
+        "TURNSTILE_FIXED_BOOTSTRAP_DESCRIPTOR": json.dumps(descriptor),
+    }))
+    writes = Mock(side_effect=AssertionError("Redeployment must not rewrite fixed policies"))
+    monkeypatch.setattr(deploy, "deploy_template", writes)
+    monkeypatch.setattr(deploy, "_write_private_json", writes)
+
+    if fault:
+        with pytest.raises((DeploymentError, ApimUpgradeError)):
+            deploy.gateway_upgrade(runner, inputs, outputs, "check")
+    else:
+        deploy.gateway_upgrade(runner, inputs, outputs, "check")
+    writes.assert_not_called()
+    assert runner.run_json.call_count == 1
+
+
+@pytest.mark.parametrize("phase", ["complete", "failed", "running", "changed_target"])
+def test_partial_fixed_installation_reuses_bound_checkpoint_without_policy_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
+) -> None:
+    from scripts import deploy
+    from scripts.apim_upgrade import AzureUpgradeBackend, GatewaySnapshot
+
+    runtime = Mock(wraps=runtime_release_parameters)
+    monkeypatch.setattr(sys.modules[__name__], "runtime_release_parameters", runtime)
+    with monkeypatch.context() as initialization:
+        test_initial_fixed_program_binds_compiled_policies_before_registration(
+            tmp_path, initialization, False,
+        )
+        from typing import cast
+
+        applied = cast(Mock, deploy.deploy_template)
+        inputs = applied.call_args.args[1]
+        parameters = applied.call_args.args[3]["parameters"]
+        descriptor = runtime.call_args.args[5]
+        initial_snapshot = cast(Mock, AzureUpgradeBackend.read).return_value
+    saved = json.loads(inputs.state_path.with_suffix(".outputs.json").read_text())
+    values = {name: entry["value"] for name, entry in parameters.items()}
+    current = GatewaySnapshot(
+        values["revision"], values["apiProperties"], values["parentPolicy"],
+        {item["name"]: {"method": item["method"], "urlTemplate": item["path"],
+                        "templateParameters": []} for item in values["fixedOperations"]},
+        {item["name"]: item["policy"] for item in values["fixedOperations"]},
+    )
+    if phase != "complete":
+        current = initial_snapshot
+    if phase == "changed_target":
+        saved["pendingFixedProgramParameters"]["parameters"]["apimName"]["value"] = "other-apim"
+    monkeypatch.setattr(AzureUpgradeBackend, "read", Mock(return_value=current))
+    writes = Mock()
+    monkeypatch.setattr(deploy, "what_if", writes)
+    monkeypatch.setattr(deploy, "deploy_template", writes)
+    runner = Mock(spec=CommandRunner)
+    runner.run_json.return_value = {"accessToken": "offline-token"}
+    real_client = httpx.Client
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: real_client(
+        **kwargs, transport=httpx.MockTransport(lambda _: httpx.Response(
+            200, json={"sku": {"name": "StandardV2"}, "properties": {
+                "provisioningState": "Running" if phase == "running" else "Failed",
+            }},
+        )),
+    ))
+
+    if phase in {"running", "changed_target"}:
+        with pytest.raises(DeploymentError):
+            initialize_fixed_program(runner, inputs, saved, {})
+    else:
+        assert initialize_fixed_program(runner, inputs, saved, {}) == descriptor
+    assert writes.call_count == (2 if phase == "failed" else 0)
+
+
+@pytest.mark.parametrize("wrong_binding", [False, True])
+def test_initial_fixed_program_readiness_requires_verified_binding_and_logout(
+    monkeypatch: pytest.MonkeyPatch,
+    wrong_binding: bool,
+) -> None:
+    calls: list[str] = []
+    client_factory = httpx.Client
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.method == "POST":
+            return httpx.Response(200, json={})
+        return httpx.Response(
+            200,
+            json={
+                "current_installation": {
+                    "program": {
+                        "program_sha256": "b" * 64 if wrong_binding else "a" * 64,
+                        "scope": {"target_id": "unit-target"},
+                    },
+                    "model_additions_enabled": True,
+                }
+            },
+        )
+
+    monkeypatch.setattr(
+        "scripts.deploy.httpx.Client",
+        lambda **kwargs: client_factory(
+            **kwargs,
+            transport=httpx.MockTransport(respond),
+        ),
+    )
+    descriptor = {
+        "registration": {"gateway_profile_id": "unit-target"},
+        "binding": {"program_sha256": "a" * 64},
+    }
+    arguments = ("https://api.example.test", "owner@example.test", "offline", descriptor)
+    if wrong_binding:
+        with pytest.raises(DeploymentError, match="binding differs"):
+            verify_initial_fixed_program(*arguments)
+    else:
+        verify_initial_fixed_program(*arguments)
+    assert calls == [
+        "/api/v1/auth/login",
+        "/api/v1/model-management/gateways/unit-target/program-upgrades/preview",
+        "/api/v1/auth/logout",
+    ]
 
 
 def test_temporary_parameter_file_is_private_and_deleted(tmp_path: Path) -> None:
@@ -1023,7 +1407,9 @@ def test_rerun_checks_apim_upgrade_before_secrets_or_packages(
     ])
     monkeypatch.setattr(deploy, "require_prerequisites", lambda *_: None)
     monkeypatch.setattr(deploy, "validate_source_snapshot", lambda *_: None)
-    monkeypatch.setattr(deploy, "load_saved_outputs", lambda *_: {"existing": True})
+    monkeypatch.setattr(deploy, "load_saved_outputs", lambda *_: {
+        "existing": True, "resourceGroupName": "turnstile-test",
+    })
 
     def blocked(*args: object, **kwargs: object) -> None:
         assert args[3] == "check"

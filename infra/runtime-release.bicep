@@ -34,6 +34,10 @@ param currentApiSettings object
 @secure()
 param currentControlPlaneSettings object
 
+param telemetryFunctionName string = ''
+@secure()
+param currentTelemetrySettings object = {}
+
 resource api 'Microsoft.Web/sites@2024-11-01' existing = {
   name: apiName
 }
@@ -73,6 +77,16 @@ resource controlPlaneSettings 'Microsoft.Web/sites/config@2024-11-01' = {
     SELF_HOSTED_GATEWAY_PROVISIONING_ENABLED: string(selfHostedGatewayProvisioningEnabled)
     MULTI_APIM_TARGET_ROLLOUT_ENABLED: string(multiApimTargetRolloutEnabled)
   })
+}
+
+resource telemetry 'Microsoft.Web/sites@2024-11-01' existing = if (!empty(telemetryFunctionName)) {
+  name: telemetryFunctionName
+}
+
+resource telemetrySettings 'Microsoft.Web/sites/config@2024-11-01' = if (!empty(telemetryFunctionName)) {
+  parent: telemetry
+  name: 'appsettings'
+  properties: currentTelemetrySettings
 }
 
 output apiName string = api.name
