@@ -368,7 +368,7 @@ def test_arm_reader_pins_revision_checks_maintenance_and_refuses_external_pagina
                 "isOnline": True, "sourceApiId": API_ID + ";rev=old",
             }})
         if path == current_path + "/policies/policy":
-            assert request.url.params["format"] == "rawxml"
+            assert request.url.params["format"] == "xml"
             return httpx.Response(200, json={"properties": {"value": source.parent_policy}})
         if path == current_path + "/operations":
             return httpx.Response(200, json={"value": [{"name": "chat-completions"}]})
@@ -378,6 +378,7 @@ def test_arm_reader_pins_revision_checks_maintenance_and_refuses_external_pagina
                 "policies": source.operation_policies["chat-completions"],
             }})
         if path == current_path + "/operations/chat-completions/policies/policy":
+            assert request.url.params["format"] == "xml"
             return httpx.Response(200, json={"properties": {
                 "value": source.operation_policies["chat-completions"],
             }})

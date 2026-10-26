@@ -277,7 +277,7 @@ class AzureUpgradeBackend:
         if path in self.application_ids:
             parameters["api-version"] = "2024-11-01"
         if policy:
-            parameters["format"] = "rawxml"
+            parameters["format"] = "xml"
         response = self.client.get(
             httpx.URL(url).copy_merge_params(parameters), follow_redirects=False
         )
@@ -296,7 +296,7 @@ class AzureUpgradeBackend:
             return None
         value = document.get("properties", {}).get("value")
         if not isinstance(value, str) or not value:
-            raise ApimUpgradeError("ARM returned an invalid raw XML policy")
+            raise ApimUpgradeError("ARM returned an invalid XML policy")
         parse_policy(value)
         return value
 
