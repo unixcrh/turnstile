@@ -17,6 +17,13 @@ param apiSubnetAddressPrefix string = '10.42.3.64/27'
 @description('Optional existing Free plan to restore to B1 after reviewing cost and all hosted apps. Empty preserves the current plan.')
 param restoreFreePlanName string = ''
 
+param apimName string = ''
+
+@secure()
+param currentApimConfiguration object = {}
+
+param existingNetworkSecurityGroupId string = ''
+
 resource virtualNetwork 'Microsoft.Network/virtualNetworks@2024-05-01' existing = {
   name: virtualNetworkName
 }
@@ -26,6 +33,9 @@ resource apiSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' = {
   name: apiSubnetName
   properties: {
     addressPrefix: apiSubnetAddressPrefix
+    networkSecurityGroup: empty(existingNetworkSecurityGroupId) ? null : {
+      id: existingNetworkSecurityGroupId
+    }
     delegations: [
       {
         name: 'app-service-delegation'
@@ -55,7 +65,7 @@ resource restoredApiPlan 'Microsoft.Web/serverfarms@2024-11-01' = if (!empty(res
   }
 }
 
-resource apiVnetIntegration 'Microsoft.Web/sites/networkConfig@2024-11-01' = {
+resource apiVnetIntegration 'Microsoft.Web/sites/networkConfig@2024-11-01' = if (empty(apimName)) {
   parent: api
   name: 'virtualNetwork'
   properties: {
@@ -65,4 +75,18 @@ resource apiVnetIntegration 'Microsoft.Web/sites/networkConfig@2024-11-01' = {
   dependsOn: [
     restoredApiPlan
   ]
+}
+
+resource apimOutboundIntegration 'Microsoft.ApiManagement/service@2024-05-01' = if (!empty(apimName)) {
+  name: apimName
+  location: location
+  sku: currentApimConfiguration.sku
+  identity: currentApimConfiguration.identity
+  tags: currentApimConfiguration.tags
+  properties: union(currentApimConfiguration.properties, {
+    virtualNetworkType: 'External'
+    virtualNetworkConfiguration: {
+      subnetResourceId: apiSubnet.id
+    }
+  })
 }
