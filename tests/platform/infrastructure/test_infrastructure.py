@@ -807,7 +807,10 @@ def test_runtime_diagnostic_access_is_generic_probe_scoped_and_not_key_managemen
     assert all(value not in source for value in ("xle-", "contoso", "regenerate", "Contributor"))
     assert "module publisherProbeAccess 'runtime-diagnostic-rbac.bicep'" in CONTROL_PLANE_APIM_RBAC
     assert "module runtimeDiagnosticRbac 'modules/runtime-diagnostic-rbac.bicep'" in MAIN
-    assert "probeSubscriptionId: apimIntegration.outputs.probeSubscriptionId" in MAIN
+    diagnostic = MAIN.split("module runtimeDiagnosticRbac", 1)[1].split("\nvar ", 1)[0]
+    assert "probeSubscriptionId: apimProbeSubscriptionId" in diagnostic
+    assert "apimIntegration.outputs" not in diagnostic
+    assert "dependsOn: [\n    apimIntegration\n  ]" in diagnostic
     assert "output runtimeDiagnosticScope string = runtimeDiagnosticRbac.outputs.probeScope" in MAIN
     assert (
         "output publisherProbeScope string = provisionControlPlane ? runtimeDiagnosticRbac"

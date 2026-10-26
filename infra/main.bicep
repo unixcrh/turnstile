@@ -404,11 +404,14 @@ module runtimeDiagnosticRbac 'modules/runtime-diagnostic-rbac.bicep' = {
   scope: resourceGroup(effectiveApimResourceGroupName)
   params: {
     apimName: effectiveApimName
-    probeSubscriptionId: apimIntegration.outputs.probeSubscriptionId
+    probeSubscriptionId: apimProbeSubscriptionId
     apiPrincipalIds: concat([
       dataPlane.outputs.apiPrincipalId
     ], provisionControlPlane ? [controlPlane!.outputs.principalId] : [])
   }
+  dependsOn: [
+    apimIntegration
+  ]
 }
 
 var apimServiceContributorRoleDefinitionId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '312a565d-c81f-4fd8-895a-4e21e48d571c')
