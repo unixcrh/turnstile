@@ -125,6 +125,14 @@ def test_incremental_apim_template_only_prepares_and_promotes_existing_api_revis
     assert "Microsoft.ApiManagement/service/apis@2024-05-01' existing" in module
 
 
+def test_fixed_program_uses_xml_format_for_serialized_policies() -> None:
+    module = (ROOT / "infra/modules/apim-upgrade.bicep").read_text()
+    operation = module.split("resource fixedOperationPolicy", 1)[1].split("resource parent", 1)[0]
+    parent = module.split("resource parent", 1)[1].split("resource promotion", 1)[0]
+    assert "format: 'xml'" in operation
+    assert "format: empty(fixedOperations) ? 'rawxml' : 'xml'" in parent
+
+
 def test_shared_apim_resources_are_environment_isolated() -> None:
     for parameter, resource_name in (
         ("apiId", "apiId"),

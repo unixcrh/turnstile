@@ -70,7 +70,7 @@ resource fixedOperationPolicy 'Microsoft.ApiManagement/service/apis/operations/p
   parent: fixedOperation[index]
   name: 'policy'
   properties: {
-    format: 'rawxml'
+    format: 'xml'
     value: operation.policy
   }
 }]
@@ -79,7 +79,7 @@ resource parent 'Microsoft.ApiManagement/service/apis/policies@2024-05-01' = if 
   parent: candidate
   name: 'policy'
   properties: {
-    format: 'rawxml'
+    format: empty(fixedOperations) ? 'rawxml' : 'xml'
     value: parentPolicy
   }
   dependsOn: [
