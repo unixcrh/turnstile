@@ -1919,6 +1919,9 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
     if not args.allow_dirty:
         validate_source_snapshot(REPOSITORY_ROOT)
     saved_outputs = load_saved_outputs(inputs)
+    complete_installation = args.complete_installation
+    if complete_installation and saved_outputs is None:
+        raise DeploymentError("Completing an installation requires original deployment outputs")
     pending_installation = saved_outputs is not None and "pendingFixedBootstrap" in saved_outputs
     if saved_outputs is not None and (
         _output_string(saved_outputs, "resourceGroupName").casefold()
@@ -1963,7 +1966,7 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
     )
     main_template = REPOSITORY_ROOT / "infra" / "main.bicep"
     release_template = REPOSITORY_ROOT / "infra" / "runtime-release.bicep"
-    if saved_outputs is None:
+    if saved_outputs is None or (complete_installation and not pending_installation):
         what_if(
             runner,
             inputs,
@@ -2051,7 +2054,7 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
     )
     fixed_descriptor = None
     telemetry_settings = None
-    if saved_outputs is None or pending_installation:
+    if saved_outputs is None or pending_installation or complete_installation:
         fixed_descriptor = initialize_fixed_program(
             runner, inputs, {**platform_outputs, **observer_outputs}, api_settings,
         )
@@ -2095,10 +2098,20 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
         verify_initial_fixed_program(
             api_url, inputs.owner_email, secrets_.owner_password, fixed_descriptor,
         )
-    _write_outputs(inputs, {
+    completed_outputs = {
         key: value for key, value in {**final_outputs, **observer_outputs}.items()
         if key not in {"pendingFixedBootstrap", "pendingFixedProgramParameters"}
-    })
+    }
+    if complete_installation:
+        assert saved_outputs is not None
+        original_outputs = {
+            key: value for key, value in saved_outputs.items()
+            if key not in {"pendingFixedBootstrap", "pendingFixedProgramParameters"}
+        }
+        if any(completed_outputs.get(key) != value for key, value in original_outputs.items()):
+            raise DeploymentError("Completing installation changed an existing output binding")
+        completed_outputs = original_outputs
+    _write_outputs(inputs, completed_outputs)
     print("Turnstile deployment completed.")
     print(f"Open: {api_url}")
     print(
@@ -2123,6 +2136,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional private 0600 JSON file containing the Owner email and password.",
     )
     parser.add_argument("--yes", action="store_true")
+    parser.add_argument(
+        "--complete-installation",
+        action="store_true",
+        help="Complete fixed-program installation using the original resources and outputs.",
+    )
     parser.add_argument(
         "--allow-dirty",
         action="store_true",

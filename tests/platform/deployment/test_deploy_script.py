@@ -383,9 +383,13 @@ def test_resume_skips_existing_platform_and_gateway_bootstrap(tmp_path: Path) ->
     assert parameters["deployApimBootstrap"]["value"] is False
 
 
-@pytest.mark.parametrize("existing", [False, True, "pending"])
+@pytest.mark.parametrize(
+    ("existing", "complete_installation"),
+    [(False, False), (True, False), ("pending", False), (True, True), ("pending", True)],
+)
 def test_deployment_initializes_fixed_program_only_for_a_new_platform(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool | str,
+    complete_installation: bool,
 ) -> None:
     outputs: dict[str, object] = {
         "resourceGroupName": "turnstile-test",
@@ -401,6 +405,7 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
     arguments = build_parser().parse_args([
         "deploy", "--subscription", "00000000-0000-0000-0000-000000000001",
         "--parameters", str(_parameters(tmp_path / "parameters.json")), "--yes",
+        *(["--complete-installation"] if complete_installation else []),
     ])
     for name in (
         "require_prerequisites", "validate_source_snapshot", "gateway_upgrade",
@@ -422,7 +427,11 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
         "deploy_template", "build_packages", "current_app_settings",
     ):
         monkeypatch.setattr(f"scripts.deploy.{name}", Mock(return_value={}))
-    monkeypatch.setattr("scripts.deploy.deployment_outputs", Mock(return_value=outputs))
+    monkeypatch.setattr("scripts.deploy.deployment_outputs", Mock(return_value={
+        **outputs,
+        **({"controlPlanePrincipalId": "00000000-0000-4000-8000-000000000011"}
+           if complete_installation else {}),
+    }))
     for name in ("source_version", "observer_source_version", "frontend_asset"):
         monkeypatch.setattr(f"scripts.deploy.{name}", Mock(return_value="offline-candidate"))
     events: list[str] = []
@@ -439,10 +448,14 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
     execute(arguments, CommandRunner())
 
     expected = ["deploy_packages", "build_and_start_observer"]
-    if existing is not True:
+    if existing is not True or complete_installation:
         expected.append("initialize_fixed_program")
     expected.extend(("deploy_resource_group_template", "_write_outputs"))
     assert events == expected
+    if complete_installation:
+        assert execute.__globals__["_write_outputs"].call_args.args[1] == {
+            key: value for key, value in outputs.items() if key != "pendingFixedBootstrap"
+        }
 
 
 def test_saved_outputs_enable_existing_core_on_rerun(tmp_path: Path) -> None:
