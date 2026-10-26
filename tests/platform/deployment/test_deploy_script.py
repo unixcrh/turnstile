@@ -399,6 +399,7 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
         "telemetryFunctionName": "telemetry-test",
         "webAppUrl": "https://observer-test.example.test",
         "apimPrincipalId": "00000000-0000-0000-0000-000000000002",
+        "acrName": "retained-registry",
     }
     if existing == "pending":
         outputs["pendingFixedBootstrap"] = {}
@@ -428,7 +429,8 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
     ):
         monkeypatch.setattr(f"scripts.deploy.{name}", Mock(return_value={}))
     monkeypatch.setattr("scripts.deploy.deployment_outputs", Mock(return_value={
-        **outputs,
+        **{key: value for key, value in outputs.items()
+           if not complete_installation or key != "acrName"},
         **({"controlPlanePrincipalId": "00000000-0000-4000-8000-000000000011"}
            if complete_installation else {}),
     }))
@@ -453,6 +455,8 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
     expected.extend(("deploy_resource_group_template", "_write_outputs"))
     assert events == expected
     if complete_installation:
+        observer = execute.__globals__["observer_parameters"].call_args.kwargs["existing_observer"]
+        assert observer["acrName"] == "retained-registry"
         assert execute.__globals__["_write_outputs"].call_args.args[1] == {
             key: value for key, value in outputs.items() if key != "pendingFixedBootstrap"
         }

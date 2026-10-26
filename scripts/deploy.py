@@ -1985,6 +1985,9 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
             f"{inputs.resource_prefix}-platform",
         )
         platform_outputs = deployment_outputs(base_result)
+        if complete_installation:
+            assert saved_outputs is not None
+            platform_outputs = {**saved_outputs, **platform_outputs}
     else:
         platform_outputs = saved_outputs
         api_settings = current_app_settings(
