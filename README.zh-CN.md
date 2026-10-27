@@ -13,7 +13,7 @@
 <p align="center"><strong>通过一个自托管控制平面统一治理 AI 访问、支出与运营。</strong></p>
 
 <p align="center">
-   <a href="https://github.com/xuleihive/turnstile/releases/tag/v1.2"><img alt="Turnstile v1.2 版本" src="https://img.shields.io/badge/release-v1.2-2f6fdd.svg"></a>
+   <a href="https://github.com/xuleihive/turnstile/releases/tag/v1.3"><img alt="Turnstile v1.3 版本" src="https://img.shields.io/badge/release-v1.3-2f6fdd.svg"></a>
    <a href="LICENSE"><img alt="MIT 许可证" src="https://img.shields.io/badge/license-MIT-2f6fdd.svg"></a>
    <a href="#前置条件"><img alt="Python 3.11 或更高版本" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&amp;logoColor=white"></a>
    <a href="#前置条件"><img alt="Node.js 20.19.x 或 22.12 及更高版本" src="https://img.shields.io/badge/Node.js-20.19.x%20%7C%2022.12%2B-339933?logo=node.js&amp;logoColor=white"></a>
@@ -32,7 +32,7 @@
 Turnstile 是一个用于治理 AI 模型访问的自托管控制平面。它整合了 Azure API Management 网关、Token 与成本遥测、预算、应用访问、模型接入、发布控制和运维 Web 控制台。
 
 > [!NOTE]
-> **Turnstile v1.2** 是当前公开版本。项目正在快速迭代，API、配置项和部署流程可能会随着项目成熟而变化。升级生产部署前，请仔细审阅相关变更。
+> **Turnstile v1.3** 是当前公开版本。本版本新增模型智能路由，并扩展后端池操作、请求诊断与安装恢复能力。升级生产部署前，请核对迁移、基础设施要求和提供商兼容性。
 
 > [!IMPORTANT]
 > 本仓库包含的基础设施模板只部署 Turnstile 平台，不会创建 Azure AI Foundry 项目、部署提供商模型，也不会预置客户连接和模型。平台运行后，运维人员需要连接自己的 Foundry 或其他兼容提供商资源。
@@ -42,7 +42,7 @@ Turnstile 是一个用于治理 AI 模型访问的自托管控制平面。它整
       <img src="docs/assets/product-overview.png" width="100%" alt="Turnstile 管理层概览，展示用量、成本、延迟与治理信号">
    </a>
 </p>
-<p align="center"><sub>涵盖用量、成本、可靠性与治理的管理层概览。此产品截图已经过脱敏，可用于公开发布。</sub></p>
+<p align="center"><sub>涵盖用量、成本、可靠性与治理的管理层概览。</sub></p>
 
 ## 核心能力
 
@@ -52,6 +52,7 @@ Turnstile 是一个用于治理 AI 模型访问的自托管控制平面。它整
 - 月度预算、模型访问策略与应用归因
 - 提供商连接管理与模型注册表 API
 - 使用 APIM 原生后端池实现故障转移、均衡或加权分发
+- 可视化模型智能路由，支持条件、优先级及权重策略、模型决策、失败转移和人员级访问策略
 - 支持完整性检查、回滚和受保护发布的版本化网关发布流程
 - 仅限所有者的应用订阅预配与密钥管理
 - 基于密码的身份验证和 Microsoft Entra 身份验证
@@ -61,18 +62,19 @@ Turnstile 是一个用于治理 AI 模型访问的自托管控制平面。它整
 > [!WARNING]
 > GitHub 数据源和 GitHub Copilot 集成功能仍在积极开发中，尚未达到生产就绪状态。请谨慎启用，并在将相关用量、成本或治理数据用于运营或财务决策前进行独立核验。如果你只需要 GitHub Copilot FinOps 功能，请参考 [OctoFinance](https://github.com/satomic/OctoFinance)。
 
-- **模型智能路由（Model Intelligent Router）：** 支持可视化画布与常规配置模式，提供按优先级、按权重与模型判路由（Model-based）策略，支持条件分支、失败转移策略、人员级路由器授权及两阶段 Request Trace 决策归因。
+## v1.3 新增特性
 
-## v1.2 新增特性
+- **模型智能路由（Model Intelligent Router）：** 可视化画布和配置编辑器，支持条件路由、优先级与权重策略、
+   模型决策和失败转移。通过版本化发布、人员级路由器授权以及决策和尝试级 Trace，明确路由行为与访问范围。
+- **后端池操作：** 独立创建后端池，检查成员兼容性，配置优先级、权重、会话亲和性和弹性策略。
+   离开表单后后台发布仍可继续，详情页提供进度恢复和客户端接入示例。
+- **用量与请求诊断：** 原生 APIM 客户端路由、准确的 Runtime 归因、尝试级诊断，以及扩展的 Chat、Responses
+   和 Anthropic 流式用量处理。缺失或不完整的用量仍与实测零消耗明确区分。
+- **安装与恢复：** 自动安装并登记初始固定程序，准备受限的 Publisher 依赖权限，为新建 StandardV2 APIM
+   接通私网出站链路，并通过检查点恢复中断的安装。启动检查在原有期限内同时要求 API 健康和前端版本匹配。
 
-- **模型价格管理：** 提供商目录与手工定价、连接及模型折扣、区域价格引用、明确的长短上下文分档、
-   需审阅的价格同步，以及保留适用价格快照的历史请求成本。
-- **网关管理：** 分开的模型、连接、自托管网关和 APIM 工作区；网关注册、初始化、创建与启动配置、
-   诊断，以及每个模型独立的服务网关范围。
-- **发布与请求诊断：** 明确展示目标 Gateway、验证 API Revision、恢复凭据，
-   通过调用尝试记录区分失败、用量未知与已确认的提供商遥测。
-- **模型操作：** 清单筛选、独立编辑器、连接诊断，以及跨托管网关与自托管网关独立版本化的模型启停控制。
-- **原子级 USD 与 Token 预算执行：** 实时准入预扣、USD 与 Token 月度限额控制，以及自动结算对账。
+现有能力还包括提供商目录与手工定价、连接及模型折扣、区域与上下文分档价格、历史价格快照、
+版本化模型启停、应用订阅管理，以及 USD/Token 预算预扣和结算。
 
 开关不可用表示该部署尚未建立所需的网关覆盖证明，并不表示模型已经停用。不要绕过此检查。
 启停协议需要兼容的工作进程、迁移 016、所有保留 Revision 的策略、主 Table 访问、
@@ -182,10 +184,13 @@ git diff --check
 
 Bicep 模板会创建 PostgreSQL、Event Hubs、Storage、Key Vault、Application Insights、Web App、Functions 和 APIM 集成等 Turnstile 平台资源，但不会创建 Azure AI Foundry 项目或提供商模型部署。
 
-对于 **Turnstile v1.2**，请先选择对应路径：
+对于 **Turnstile v1.3**，请先选择对应路径：
 
-- **升级已有安装：**按照[升级指南](docs/deployment.md#prepare-for-v12)操作。保留原部署状态、数据库、账本、APIM、身份和历史；除应用包外，还需补齐必要的基础设施配置。
+- **升级已有安装：**核对[基础设施与协议升级要求](docs/deployment.md#prepare-for-v12)。保留原部署状态、数据库、账本、APIM、身份和历史；除应用包外，还需应用待执行迁移和必要的基础设施配置。
 - **完全从零安装：**按照[全新部署指南](docs/deployment.md#deploy-v11-from-zero)操作。使用独立前缀和新状态，默认新建 StandardV2 APIM；提供商模型与凭据需要另行准备。
+
+StandardV2 不支持自托管网关。该可选功能需要兼容的 Developer 或经典 Premium APIM 实例，并完成相应网络配置。
+Developer 用于评估，没有生产 SLA，且自托管网关限单节点。平台不会创建或代管自托管网关容器的宿主机。
 
 以下快速步骤用于新安装。已有安装不能用新生成的文件替换原部署状态。
 
@@ -206,7 +211,11 @@ uv run python -m scripts.deploy deploy \
    --parameters .turnstile/main.parameters.json
 ```
 
-脚本会交互读取首个Owner密码，先执行subscription-scope what-if，并要求输入精确确认词 `deploy`；任何Delete变更都会终止。随后它会部署平台与observer、构建Linux x86-64不可变包、部署API和两个Functions、在observer就绪后启用worker，并验证health、Function索引和Owner密码登录。生成的secret只保存在权限为 `0600` 的 `.turnstile/deployments/<resource-group>.json`，该文件被Git忽略，应备份到获批的secret store。
+脚本会交互读取首个 Owner 密码，先执行 subscription-scope what-if，并要求输入精确确认词 `deploy`；任何 Delete 变更都会终止。随后部署平台与 observer、构建 Linux x86-64 不可变包、部署 API 和两个 Functions、安装初始固定路由程序，并在依赖就绪后启用 worker。完成检查包括前端版本匹配、Function 索引、Owner 密码登录及首个模型发布所需的程序基线。这些启动检查不能代替当前环境中的提供商调用、路由和财务验收。生成的 secret 只保存在权限为 `0600` 的 `.turnstile/deployments/<resource-group>.json`，该文件被 Git 忽略，应备份到获批的 secret store。
+
+自动化部署时，可将 `infra/owner.credentials.example.json` 复制为 `.turnstile/owner.credentials.json`，填写相同的
+`bootstrapOwnerEmail` 对应邮箱与密码，将权限设为 `0600`，并传入 `--owner-credentials .turnstile/owner.credentials.json`。
+明文密码不会进入 Bicep 或部署状态，部署时只使用其 scrypt 哈希。
 
 只预览不创建资源时使用 `scripts.deploy plan`。重跑和恢复说明见[部署文档](docs/deployment.md)。
 
@@ -215,7 +224,7 @@ uv run python -m scripts.deploy deploy \
 全新 Turnstile 部署会在首次启动时自动注册平台预配的初始 APIM 实例，但不预置客户提供商连接、运行时或业务模型。
 
 1. 使用部署脚本创建的密码Owner登录。
-2. 在 **Model Management → APIM instances** 中确认初始 APIM 实例已就绪（如需接入更多 APIM 实例，点击 **Add APIM instance** 即可；同订阅 APIM 已自动具备管理权限，且平台会自动为新 APIM 的托管身份授予访问平台 Ledger 账本表、路由表、Event Hub 与凭据 Key Vault 的权限）。
+2. 在 **Model Management → APIM instances** 中确认初始 APIM 的固定程序已就绪，再发布模型。如需接入更多 APIM 实例，可在配置身份具备受限授权、平台前置条件就绪后使用 **Add APIM instance** 初始化。初始化会为目标 APIM 的托管身份授予访问平台 Ledger 账本表、路由表、Event Hub 与凭据 Key Vault 的权限；还需配置实际网络可达性。
 3. 在Model Management中添加指向现有Foundry项目或受支持提供商的连接，再通过Add Model选择已有的provider deployment。
 4. 根据需要配置 APIM 原生后端池，以实现故障转移、均衡或加权路由。
 5. 发布并等待candidate验证。同tenant的Foundry managed identity若缺少授权，发布对话框会显示准确的APIM principal、`Cognitive Services User`角色和Foundry资源scope；由有权限的Azure用户完成IAM授权后，在对话框中继续验证。
@@ -239,6 +248,7 @@ Turnstile不会创建或修改客户的Foundry项目；执行IAM授权的Azure�
 
 - 必须使用 PostgreSQL；不支持将本地或嵌入式数据存储用于生产环境。
 - APIM 与 Azure 资源预配可能需要数分钟。
+- 每个部署都需核验私网、区域容量、订阅配额、提供商授权和自托管网关连接。仅凭应用上传成功或 health 返回正常，不能认定模型调用或预算链路可用。
 - 对于 APIM 策略无法捕获用量明细的流式响应，Token 与成本记录最初并不完整。当网关日志可用时，对账流程会补全提示词和补全 Token 数，但无法恢复单请求缓存用量，因此相应成本可能仍只是下限估算。
 
 ## 故障排除

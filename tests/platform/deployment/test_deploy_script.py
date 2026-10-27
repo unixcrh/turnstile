@@ -387,9 +387,10 @@ def test_resume_skips_existing_platform_and_gateway_bootstrap(tmp_path: Path) ->
     ("existing", "complete_installation"),
     [(False, False), (True, False), ("pending", False), (True, True), ("pending", True)],
 )
+@pytest.mark.parametrize("program_ready", [True, False])
 def test_deployment_initializes_fixed_program_only_for_a_new_platform(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool | str,
-    complete_installation: bool,
+    complete_installation: bool, program_ready: bool, capsys: pytest.CaptureFixture[str],
 ) -> None:
     outputs: dict[str, object] = {
         "resourceGroupName": "turnstile-test",
@@ -438,7 +439,7 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
         monkeypatch.setattr(f"scripts.deploy.{name}", Mock(return_value="offline-candidate"))
     events: list[str] = []
     for name in (
-        "deploy_packages", "build_and_start_observer", "initialize_fixed_program",
+        "deploy_packages", "build_and_start_observer",
         "deploy_resource_group_template", "_write_outputs",
     ):
         monkeypatch.setattr(
@@ -447,24 +448,64 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
             raising=False,
         )
 
+    descriptor = {
+        "registration": {"gateway_profile_id": "unit-target"},
+        "binding": {"program_sha256": "a" * 64},
+    }
+
+    def initialize_program(*args: object) -> dict[str, dict[str, str]]:
+        events.append("initialize_fixed_program")
+        return descriptor
+
+    monkeypatch.setattr("scripts.deploy.initialize_fixed_program", Mock(
+        side_effect=initialize_program,
+    ))
+
+    def verify_program(*args: object) -> None:
+        events.append("verify_initial_fixed_program")
+        if not program_ready:
+            raise DeploymentError("Initial fixed program is not ready for model publication")
+
+    program_readiness = Mock(side_effect=verify_program)
+    monkeypatch.setattr("scripts.deploy.verify_initial_fixed_program", program_readiness)
     readiness = Mock()
     isolated_frontend_read = Mock(side_effect=AssertionError(
         "Frontend must share startup deadline",
     ))
     monkeypatch.setattr("scripts.deploy.wait_for_health", readiness)
     monkeypatch.setattr("scripts.deploy.verify_frontend_asset", isolated_frontend_read)
-    execute(arguments, CommandRunner())
+    initializes_program = existing is not True or complete_installation
+    if initializes_program and not program_ready:
+        with pytest.raises(DeploymentError, match="not ready for model publication"):
+            execute(arguments, CommandRunner())
+    else:
+        execute(arguments, CommandRunner())
 
     readiness.assert_called_once_with(
         "https://api-test.example.test", timeout_seconds=1800, expected_asset="offline-candidate",
     )
     isolated_frontend_read.assert_not_called()
     expected = ["deploy_packages", "build_and_start_observer"]
-    if existing is not True or complete_installation:
+    if initializes_program:
         expected.append("initialize_fixed_program")
-    expected.extend(("deploy_resource_group_template", "_write_outputs"))
+    expected.append("deploy_resource_group_template")
+    if initializes_program:
+        expected.append("verify_initial_fixed_program")
+        owner_email = json.loads(arguments.parameters.read_text())["parameters"][
+            "bootstrapOwnerEmail"
+        ]["value"]
+        program_readiness.assert_called_once_with(
+            "https://api-test.example.test", owner_email, "offline-owner-password", descriptor,
+        )
+    else:
+        program_readiness.assert_not_called()
+    if not initializes_program or program_ready:
+        expected.append("_write_outputs")
     assert events == expected
-    if complete_installation:
+    assert ("Turnstile deployment completed." in capsys.readouterr().out) == (
+        not initializes_program or program_ready
+    )
+    if complete_installation and program_ready:
         observer = execute.__globals__["observer_parameters"].call_args.kwargs["existing_observer"]
         assert observer["acrName"] == "retained-registry"
         assert execute.__globals__["_write_outputs"].call_args.args[1] == {
