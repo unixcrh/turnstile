@@ -447,8 +447,18 @@ def test_deployment_initializes_fixed_program_only_for_a_new_platform(
             raising=False,
         )
 
+    readiness = Mock()
+    isolated_frontend_read = Mock(side_effect=AssertionError(
+        "Frontend must share startup deadline",
+    ))
+    monkeypatch.setattr("scripts.deploy.wait_for_health", readiness)
+    monkeypatch.setattr("scripts.deploy.verify_frontend_asset", isolated_frontend_read)
     execute(arguments, CommandRunner())
 
+    readiness.assert_called_once_with(
+        "https://api-test.example.test", timeout_seconds=1800, expected_asset="offline-candidate",
+    )
+    isolated_frontend_read.assert_not_called()
     expected = ["deploy_packages", "build_and_start_observer"]
     if existing is not True or complete_installation:
         expected.append("initialize_fixed_program")
@@ -1170,6 +1180,59 @@ def test_function_package_deployment_restarts_and_retries_after_failure(
     assert len(commands) == 1
     assert commands[0][:3] == ["az", "functionapp", "restart"]
     assert commands[0][commands[0].index("--name") + 1] == "telemetry"
+
+
+@pytest.mark.parametrize("scenario", [
+    "frontend_recovers", "frontend_unreachable", "frontend_wrong_version", "health_recovers",
+])
+def test_runtime_readiness_requires_the_expected_frontend_within_one_deadline(
+    monkeypatch: pytest.MonkeyPatch, scenario: str,
+) -> None:
+    from scripts import deploy
+
+    expected = "assets/index-new-build.js"
+    elapsed = [0.0]
+    attempts: dict[str, int] = {}
+    timeouts: list[float] = []
+
+    def request_page(request: urllib.request.Request, timeout: float) -> bytes:
+        path = request.full_url.removeprefix("https://api.example.test")
+        attempts[path] = attempts.get(path, 0) + 1
+        timeouts.append(timeout)
+        unavailable = "/health" if scenario == "health_recovers" else "/"
+        if scenario != "frontend_wrong_version" and path == unavailable and (
+            attempts[path] == 1 or scenario == "frontend_unreachable"
+        ):
+            elapsed[0] += 1
+            raise TimeoutError("read timed out")
+        if path == "/health":
+            return b'{"status":"ok"}'
+        asset = "assets/index-old-build.js" if scenario == "frontend_wrong_version" else expected
+        return f'<script type="module" src="/{asset}"></script>'.encode()
+
+    def advance(seconds: float) -> None:
+        elapsed[0] += seconds
+
+    monkeypatch.setattr(deploy, "_open_without_proxy", request_page)
+    monkeypatch.setattr("scripts.deploy.time.monotonic", lambda: elapsed[0])
+    monkeypatch.setattr("scripts.deploy.time.sleep", advance)
+    if scenario in {"frontend_unreachable", "frontend_wrong_version"}:
+        with pytest.raises(DeploymentError) as failure:
+            wait_for_health("https://api.example.test", timeout_seconds=6, expected_asset=expected)
+        message = str(failure.value)
+        assert "Frontend" in message and expected in message
+        if scenario == "frontend_wrong_version":
+            assert "assets/index-old-build.js" in message
+            assert attempts["/"] == 1 and elapsed[0] == 0
+        else:
+            assert "read timed out" in message and "6" in message
+    else:
+        assert wait_for_health(
+            "https://api.example.test", timeout_seconds=6, expected_asset=expected,
+        ) == '{"status":"ok"}'
+        assert attempts["/"] >= 1
+    assert elapsed[0] <= 6
+    assert all(0 < timeout <= 6 for timeout in timeouts)
 
 
 def test_health_gate_accepts_successful_empty_response(

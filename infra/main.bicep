@@ -227,6 +227,7 @@ resource platformResourceGroup 'Microsoft.Resources/resourceGroups@2024-11-01' =
 }
 
 var effectiveApimResourceGroupName = provisionApimService ? platformResourceGroup.name : existingApimResourceGroupName
+var provisionApimOutboundNetwork = provisionApimService && apimSkuName == 'StandardV2'
 
 module apim 'modules/apim-service.bicep' = if (provisionApimService) {
   name: 'turnstile-apim'
@@ -251,6 +252,7 @@ module dataPlane 'modules/data-plane.bicep' = {
   scope: platformResourceGroup
   params: {
     location: location
+    provisionApimOutboundNetwork: provisionApimOutboundNetwork
     postgresLocation: postgresLocation
     resourcePrefix: resourcePrefix
     suffix: suffix
@@ -283,9 +285,26 @@ module dataPlane 'modules/data-plane.bicep' = {
   }
 }
 
+module apimOutboundNetwork 'modules/apim-service.bicep' = if (provisionApimOutboundNetwork) {
+  name: 'turnstile-apim-outbound-network'
+  scope: platformResourceGroup
+  params: {
+    name: effectiveApimName
+    location: location
+    publisherEmail: apimPublisherEmail
+    publisherName: apimPublisherName
+    skuName: apimSkuName
+    capacity: apimCapacity
+    outboundSubnetResourceId: dataPlane.outputs.apimOutboundSubnetId
+  }
+}
+
 module apimIntegration 'modules/apim-integration.bicep' = if (deployApimBootstrap) {
   name: 'turnstile-apim-integration-${take(suffix, 13)}'
   scope: resourceGroup(effectiveApimResourceGroupName)
+  dependsOn: [
+    apimOutboundNetwork
+  ]
   params: {
     apimName: effectiveApimName
     apiId: apimApiId

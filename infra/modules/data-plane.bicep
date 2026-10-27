@@ -1,6 +1,7 @@
 targetScope = 'resourceGroup'
 
 param location string
+param provisionApimOutboundNetwork bool = false
 param postgresLocation string
 param resourcePrefix string
 param suffix string
@@ -409,6 +410,50 @@ resource apiSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' = {
   }
   dependsOn: [
     privateEndpointSubnet
+  ]
+}
+
+resource apimOutboundSecurityGroup 'Microsoft.Network/networkSecurityGroups@2024-05-01' = if (provisionApimOutboundNetwork) {
+  name: 'nsg-${resourcePrefix}-apim-outbound-${suffix}'
+  location: location
+  properties: {
+    securityRules: [
+      {
+        name: 'allow-key-vault-outbound'
+        properties: {
+          priority: 100
+          direction: 'Outbound'
+          access: 'Allow'
+          protocol: 'Tcp'
+          sourceAddressPrefix: 'VirtualNetwork'
+          sourcePortRange: '*'
+          destinationAddressPrefix: 'AzureKeyVault'
+          destinationPortRange: '443'
+        }
+      }
+    ]
+  }
+}
+
+resource apimOutboundSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' = if (provisionApimOutboundNetwork) {
+  parent: virtualNetwork
+  name: 'snet-apim-outbound'
+  properties: {
+    addressPrefix: '10.42.3.96/27'
+    networkSecurityGroup: {
+      id: apimOutboundSecurityGroup!.id
+    }
+    delegations: [
+      {
+        name: 'apim-outbound-delegation'
+        properties: {
+          serviceName: 'Microsoft.Web/serverFarms'
+        }
+      }
+    ]
+  }
+  dependsOn: [
+    apiSubnet
   ]
 }
 
@@ -1037,6 +1082,7 @@ output eventHubName string = usageEventHub.name
 output applicationInsightsName string = appInsights.name
 output applicationInsightsConnectionString string = appInsights.properties.ConnectionString
 output ledgerStorageName string = ledgerStorage.name
+output apimOutboundSubnetId string = provisionApimOutboundNetwork ? apimOutboundSubnet!.id : ''
 output ledgerTableEndpoint string = ledgerTableEndpoint
 output ledgerTableResourceId string = ledgerTable.id
 output routeTableResourceId string = routeTable.id

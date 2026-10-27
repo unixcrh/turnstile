@@ -66,6 +66,62 @@ def test_new_apim_defaults_to_standard_v2() -> None:
     assert PARAMETERS["apimSkuName"]["value"] == "StandardV2"
 
 
+def test_fresh_standard_v2_private_egress_is_bound_after_the_data_plane() -> None:
+    assert (
+        "var provisionApimOutboundNetwork = provisionApimService && apimSkuName == 'StandardV2'"
+        in MAIN
+    )
+    initial = MAIN.split("module apim 'modules/apim-service.bicep'", 1)[1].split(
+        "var effectiveApimName", 1,
+    )[0]
+    assert "if (provisionApimService)" in initial
+    assert "dataPlane.outputs" not in initial
+    binding = MAIN.split("module apimOutboundNetwork ", 1)[1].split(
+        "module apimIntegration ", 1,
+    )[0]
+    assert "if (provisionApimOutboundNetwork)" in binding
+    assert "name: effectiveApimName" in binding
+    assert "outboundSubnetResourceId: dataPlane.outputs.apimOutboundSubnetId" in binding
+    integration = MAIN.split("module apimIntegration ", 1)[1].split("module controlPlane ", 1)[0]
+    assert "apimOutboundNetwork" in integration.split("dependsOn: [", 1)[1].split("]", 1)[0]
+    assert "virtualNetworkType: 'External'" in APIM_SERVICE
+    assert "subnetResourceId: outboundSubnetResourceId" in APIM_SERVICE
+    assert "empty(outboundSubnetResourceId) ? {}" in APIM_SERVICE
+
+
+def test_apim_outbound_subnet_preserves_private_dns_and_storage_restrictions() -> None:
+    import re
+    from ipaddress import ip_network
+
+    subnet = DATA_PLANE.split("resource apimOutboundSubnet ", 1)[1].split(
+        "resource blobPrivateDnsZone ", 1,
+    )[0]
+    assert "if (provisionApimOutboundNetwork)" in subnet
+    assert "parent: virtualNetwork" in subnet
+    assert "serviceName: 'Microsoft.Web/serverFarms'" in subnet
+    assert "id: apimOutboundSecurityGroup!.id" in subnet
+    assert "apiSubnet" in subnet.split("dependsOn: [", 1)[1].split("]", 1)[0]
+    network = ip_network("10.42.3.96/27")
+    for prefix in re.findall(r"addressPrefix: '([^']+)'", DATA_PLANE):
+        if prefix != str(network):
+            assert not network.overlaps(ip_network(prefix))
+    nsg = DATA_PLANE.split("resource apimOutboundSecurityGroup ", 1)[1].split(
+        "resource apimOutboundSubnet ", 1,
+    )[0]
+    assert "destinationAddressPrefix: 'AzureKeyVault'" in nsg
+    assert "destinationPortRange: '443'" in nsg
+    dns = DATA_PLANE.split("resource tablePrivateDnsLink ", 1)[1].split("resource ", 1)[0]
+    assert "id: virtualNetwork.id" in dns
+    ledger = DATA_PLANE.split("resource ledgerStorage ", 1)[1].split(
+        "resource ledgerTableService", 1,
+    )[0]
+    for restriction in (
+        "allowSharedKeyAccess: false", "defaultAction: 'Deny'", "ipRules: []",
+        "virtualNetworkRules: []",
+    ):
+        assert restriction in ledger
+
+
 def test_apim_exposes_the_turnstile_gateway_path() -> None:
     assert "param apimApiId string = 'turnstile-llm'" in MAIN
     assert "param gatewayApiRelativePath string = 'turnstile/llm'" in MAIN

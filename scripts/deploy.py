@@ -1296,19 +1296,37 @@ def _open_without_proxy(request: urllib.request.Request, timeout: float) -> byte
     return body
 
 
-def wait_for_health(api_url: str, timeout_seconds: int = 180) -> str:
+def wait_for_health(
+    api_url: str, timeout_seconds: int = 180, *, expected_asset: str | None = None,
+) -> str:
     deadline = time.monotonic() + timeout_seconds
     last_error = "no response"
+    stage = "API health"
     while time.monotonic() < deadline:
         try:
+            stage = "API health"
             body = _open_without_proxy(
-                urllib.request.Request(f"{api_url.rstrip('/')}/health"), 15
+                urllib.request.Request(f"{api_url.rstrip('/')}/health"),
+                min(15, deadline - time.monotonic()),
             ).decode("utf-8")
+            if expected_asset is not None:
+                stage = "Frontend readiness"
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    last_error = "homepage was not checked before the startup deadline"
+                    break
+                verify_frontend_asset(api_url, expected_asset, timeout_seconds=min(30, remaining))
             return body
         except (OSError, urllib.error.URLError) as error:
-            last_error = str(error)
-        time.sleep(3)
-    raise DeploymentError(f"API health check did not recover: {last_error}")
+            last_error = f"{type(error).__name__}: {error}"
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(3, remaining))
+    expected = expected_asset if stage == "Frontend readiness" else "HTTP 200 from /health"
+    raise DeploymentError(
+        f"{stage} check did not recover within {timeout_seconds}s: "
+        f"expected {expected}; actual {last_error}"
+    )
 
 
 def wait_for_observer_health(observer_url: str) -> str:
@@ -1354,13 +1372,17 @@ def frontend_asset(index_path: Path = REPOSITORY_ROOT / "frontend" / "dist" / "i
     return match.group(0)
 
 
-def verify_frontend_asset(api_url: str, expected_asset: str) -> None:
-    body = _open_without_proxy(urllib.request.Request(f"{api_url.rstrip('/')}/"), 30).decode(
-        "utf-8"
-    )
+def verify_frontend_asset(
+    api_url: str, expected_asset: str, *, timeout_seconds: float = 30,
+) -> None:
+    body = _open_without_proxy(
+        urllib.request.Request(f"{api_url.rstrip('/')}/"), timeout_seconds,
+    ).decode("utf-8")
     if expected_asset not in body:
+        actual = re.search(r"assets/index-[A-Za-z0-9_-]+\.js", body)
         raise DeploymentError(
-            f"Served frontend asset does not match the package: expected {expected_asset}"
+            f"Frontend version check failed: expected {expected_asset}; "
+            f"actual {actual.group(0) if actual else 'no hashed frontend entry'}"
         )
     print(f"Frontend asset verified: {expected_asset}")
 
@@ -2090,8 +2112,7 @@ def execute(args: argparse.Namespace, runner: CommandRunner) -> None:
     final_outputs = platform_outputs
     restart_runtime_apps(runner, inputs, final_outputs)
     api_url = _output_string(final_outputs, "apiUrl")
-    wait_for_health(api_url, timeout_seconds=1800)
-    verify_frontend_asset(api_url, expected_asset)
+    wait_for_health(api_url, timeout_seconds=1800, expected_asset=expected_asset)
     if secrets_.owner_password is None:
         raise DeploymentError("Initial Owner password is required for verification")
     verify_owner_login(api_url, inputs.owner_email, secrets_.owner_password)
